@@ -2,6 +2,7 @@ use std::{
     env, path::PathBuf, sync::Arc, sync::atomic::AtomicBool, sync::mpsc, thread, time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand};
 use color_eyre::{
     Result,
@@ -282,9 +283,10 @@ fn run_list_credentials() -> Result<()> {
             management::value_get(result, "credentials").and_then(|v| v.as_array())
     {
         for cred in credentials {
-            let id = management::value_get(cred, "id")
+            let id_hex = management::value_get(cred, "id")
                 .and_then(|v| v.as_text())
                 .unwrap_or("");
+            let id = base64_credential_id(id_hex)?;
             let rp_id = management::value_get(cred, "rp_id")
                 .and_then(|v| v.as_text())
                 .unwrap_or("");
@@ -304,6 +306,11 @@ fn run_list_credentials() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn base64_credential_id(id_hex: &str) -> Result<String> {
+    Ok(STANDARD
+        .encode(hex::decode(id_hex).wrap_err("decoding credential ID from daemon response")?))
 }
 
 fn run_update_passphrase() -> Result<()> {
@@ -510,6 +517,11 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["linux-tpm-fido2", "set-default-pcr-policy", "7"]).is_err());
+    }
+
+    #[test]
+    fn credential_ids_are_printed_as_standard_base64() {
+        assert_eq!(base64_credential_id("0001feff").unwrap(), "AAH+/w==");
     }
 
     #[test]

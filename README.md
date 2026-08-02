@@ -36,7 +36,8 @@ linux-tpm-fido2 config set default-pcr-policy 1 7
 linux-tpm-fido2 config set recovery-passphrase
 ```
 
-`list-credentials` prints tab-separated credential ID, RP ID, user name,
+`list-credentials` prints the base64 credential ID accepted by
+`fido2-manage -credential`, followed by tab-separated RP ID, user name,
 registration time, last-use time, and bound PCR indices. `config show` reports
 the effective default PCR policy and whether recovery passphrase material is
 configured. Setting the recovery passphrase also updates each credential's

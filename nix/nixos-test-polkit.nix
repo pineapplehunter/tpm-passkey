@@ -51,8 +51,6 @@
         };
 
         testScript = ''
-          import base64
-
           def login_alice():
               machine.send_key("ctrl-alt-f1")
               machine.wait_until_tty_matches("1", "login:")
@@ -312,10 +310,9 @@
               for row in before_delete.strip().splitlines()
               if "compliance.example.test" in row
           )
-          credential_b64 = base64.b64encode(bytes.fromhex(delete_row[0])).decode()
           machine.succeed(
               "expect -c '"
-              + f"spawn fido2-manage -delete -device 1 -credential {credential_b64}; "
+              + f"spawn fido2-manage -delete -device 1 -credential {delete_row[0]}; "
               + 'expect "Are you sure you want to proceed?"; '
               + 'send "Y\\r"; '
               + 'expect "Enter PIN"; '
