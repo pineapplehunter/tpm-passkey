@@ -324,6 +324,22 @@
           assert after_delete.count("compliance.example.test") == 1, (
               f"Expected one compliance credential after deletion, got: {after_delete}"
           )
+
+          # -- reset is accepted only just after a new authenticator generation --
+          machine.succeed("systemctl restart linux-tpm-fido2")
+          machine.wait_for_unit("linux-tpm-fido2")
+          reset_output = machine.succeed(
+              "expect -c '"
+              'spawn fido2-manage -reset -device 1; '
+              'expect "Are you sure you want to proceed?"; '
+              'send "Y\\r"; '
+              'expect eof'
+              "'"
+          )
+          assert "Factory reset completed" in reset_output, reset_output
+          assert mgmt("list-credentials").strip() == "", (
+              "factory reset did not remove all credentials"
+          )
         '';
       };
     };

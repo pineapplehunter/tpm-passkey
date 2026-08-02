@@ -253,11 +253,33 @@ exists.
 
 Audit status: **complete for implemented credential-management fields**.
 
+## Reset, selection, and unsupported commands
+
+`authenticatorReset` (`0x07`, section 6.6) and `authenticatorSelection` (`0x0b`,
+section 6.9) have no input parameters and return only the `CTAP2_OK` status byte
+on success. Both collect fresh user presence and fail with
+`CTAP2_ERR_OPERATION_DENIED` when it is denied. Because this USB authenticator
+has no physical display, reset is accepted only during the first 10 seconds of
+a new daemon/UHID authenticator generation; a later request returns
+`CTAP2_ERR_NOT_ALLOWED` without prompting.
+
+Reset deletes all credentials and client-PIN state and clears ephemeral token,
+key-agreement, assertion, and credential-management state. Persistence failures
+fail closed with `CTAP2_ERR_OPERATION_DENIED`. Selection does not cache presence
+for a later command.
+
+Recognized but unimplemented bio-enrollment, large-blob, configuration, and
+preview command codes return `CTAP1_ERR_INVALID_COMMAND`. In particular,
+credential-management preview (`0x41`) is rejected because only the final
+`credMgmt` feature is advertised. Unknown command bytes have the same status.
+
+Audit status: **complete**.
+
 ## Remaining Audit Order
 
 1. Complete ClientPIN inputs, errors, permissions, and retry state.
 2. Complete makeCredential and getAssertion request/response tables.
 3. Audit getInfo capability claims against implemented behavior.
 4. Complete credential management and stateful continuation commands.
-5. Audit reset, selection, and unsupported command behavior.
+5. Complete reset, selection, and unsupported command behavior.
 6. Audit CTAPHID framing, channels, cancellation, keepalive, and errors.

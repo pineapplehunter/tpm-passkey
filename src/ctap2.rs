@@ -70,6 +70,7 @@ pub struct Authenticator {
     pin_uv_auth_token: Option<PinUvAuthToken>,
     consecutive_pin_mismatches: u8,
     management: Option<ManagementState>,
+    powered_up_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,7 @@ impl Authenticator {
             pin_uv_auth_token: None,
             consecutive_pin_mismatches: 0,
             management: None,
+            powered_up_at: Instant::now(),
         }
     }
 
@@ -238,11 +240,22 @@ impl Authenticator {
             Ctap2Command::MakeCredential => self.make_credential(body),
             Ctap2Command::GetAssertion => self.get_assertion(body),
             Ctap2Command::GetNextAssertion => self.get_next_assertion(body),
-            Ctap2Command::CredentialManagement | Ctap2Command::CredentialManagementPreview => {
-                self.credential_management(body)
+            Ctap2Command::CredentialManagement => self.credential_management(body),
+            Ctap2Command::CredentialManagementPreview => Err(ErrorStatus::InvalidCommand),
+            Ctap2Command::Reset => {
+                if body.is_empty() {
+                    self.reset()
+                } else {
+                    Err(ErrorStatus::InvalidCbor)
+                }
             }
-            Ctap2Command::Reset => self.reset(),
-            Ctap2Command::Selection => self.selection(),
+            Ctap2Command::Selection => {
+                if body.is_empty() {
+                    self.selection()
+                } else {
+                    Err(ErrorStatus::InvalidCbor)
+                }
+            }
             Ctap2Command::BioEnrollment | Ctap2Command::BioEnrollmentPreview => {
                 self.bio_enrollment(body)
             }
@@ -280,32 +293,42 @@ impl Authenticator {
     /// credentials and clearing the configured PIN. CTAP2.2 §6.6 requires user
     /// presence (and, when set, alwaysUv) before performing the reset.
     fn reset(&mut self) -> Result<Vec<u8>, ErrorStatus> {
-        if !self.assertion_approved("reset") {
+        if self.powered_up_at.elapsed() > Duration::from_secs(10) {
+            return Err(ErrorStatus::NotAllowed);
+        }
+        if !self.user_presence_approved("Reset FIDO authenticator and delete all passkeys", "reset")
+        {
             return Err(ErrorStatus::OperationDenied);
         }
-        if !self.client_pin.is_none() {
-            let _ = store::delete_client_pin_state_from_dir(&self.store_dir);
-            self.client_pin = None;
-            self.key_agreement = None;
-            self.pin_uv_auth_token = None;
-        }
+        store::delete_client_pin_state_from_dir(&self.store_dir).map_err(|error| {
+            log::warn!("failed to delete client PIN state during reset: {error:?}");
+            ErrorStatus::OperationDenied
+        })?;
         for credential in &self.credentials {
-            let _ = store::delete_ctap2_credential_from_dir(&self.store_dir, &credential.id);
+            store::delete_ctap2_credential_from_dir(&self.store_dir, &credential.id).map_err(
+                |error| {
+                    log::warn!("failed to delete credential during reset: {error:?}");
+                    ErrorStatus::OperationDenied
+                },
+            )?;
         }
         self.credentials.clear();
+        self.client_pin = None;
+        self.key_agreement = None;
+        self.pin_uv_auth_token = None;
         self.pending_assertion = None;
         self.management = None;
-        Ok(encode_response(Value::Map(Vec::new())))
+        Ok(vec![0x00])
     }
 
-    /// authenticatorSelection (0x11/0x0B): returns an empty success response once
+    /// authenticatorSelection (0x0B): returns success once
     /// the user has given consent. CTAP2.2 §6.9. The actual user gesture is
     /// collected by the transport/UI; here we just confirm approval.
     fn selection(&mut self) -> Result<Vec<u8>, ErrorStatus> {
-        if !self.assertion_approved("selection") {
+        if !self.user_presence_approved("Select this FIDO authenticator", "selection") {
             return Err(ErrorStatus::OperationDenied);
         }
-        Ok(encode_response(Value::Map(Vec::new())))
+        Ok(vec![0x00])
     }
 
     /// authenticatorBioEnrollment (0x09): biometric enrollment management.
@@ -1455,23 +1478,24 @@ impl Authenticator {
     }
 
     fn assertion_approved(&mut self, rp_id: &str) -> bool {
-        if !self.session.verify_matches_current() {
-            log::error!("session changed before assertion approval for {rp_id}");
-            return false;
-        }
-
-        if !self.approval.approve(
+        self.user_presence_approved(
             &format!("Authenticate with passkey for {rp_id}"),
-            &self.session,
-        ) {
-            return false;
-        }
+            &format!("assertion for {rp_id}"),
+        )
+    }
 
+    fn user_presence_approved(&self, prompt: &str, operation: &str) -> bool {
         if !self.session.verify_matches_current() {
-            log::error!("session changed during assertion approval for {rp_id}");
+            log::error!("session changed before {operation} approval");
             return false;
         }
-
+        if !self.approval.approve(prompt, &self.session) {
+            return false;
+        }
+        if !self.session.verify_matches_current() {
+            log::error!("session changed during {operation} approval");
+            return false;
+        }
         true
     }
 

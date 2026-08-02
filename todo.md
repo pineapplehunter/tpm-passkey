@@ -64,6 +64,6 @@
 - [x] Audit makeCredential and getAssertion.
 - [x] Audit getInfo capability claims.
 - [x] Audit credential management and stateful continuation commands.
-- [ ] Audit reset, selection, and unsupported commands.
+- [x] Audit reset, selection, and unsupported commands.
 - [ ] Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
 - [ ] Run final Rust and NixOS validation.

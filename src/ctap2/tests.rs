@@ -135,12 +135,67 @@ fn unknown_command_is_rejected() {
 #[test]
 fn unsupported_commands_do_not_panic() {
     let mut authenticator = Authenticator::default();
-    for command in [0x09, 0x0c, 0x0d, 0x40] {
+    for command in [0x09, 0x0c, 0x0d, 0x40, 0x41] {
         assert_eq!(
             authenticator.handle_cbor(&[command]),
             error_response(ErrorStatus::InvalidCommand)
         );
     }
+}
+
+#[test]
+fn selection_and_reset_have_no_parameters_or_response_map() {
+    let mut authenticator = authenticator_with_credential("example.com", vec![1, 2, 3]);
+    authenticator.client_pin = Some(ClientPinState {
+        pin_salt: vec![0; 32],
+        pin_verifier: vec![0; 32],
+        retries: PIN_RETRIES,
+    });
+
+    for command in [Ctap2Command::Selection, Ctap2Command::Reset] {
+        assert_eq!(
+            authenticator.handle_cbor(&ctap_request(
+                command,
+                cbor!({}).expect("unexpected parameters"),
+            )),
+            error_response(ErrorStatus::InvalidCbor)
+        );
+    }
+
+    assert_eq!(
+        authenticator.handle_cbor(&[Ctap2Command::Selection.into()]),
+        vec![0x00]
+    );
+    assert_eq!(
+        authenticator.handle_cbor(&[Ctap2Command::Reset.into()]),
+        vec![0x00]
+    );
+    assert!(authenticator.credentials.is_empty());
+    assert!(authenticator.client_pin.is_none());
+    assert!(
+        store::load_ctap2_credentials_from_dir(&authenticator.store_dir, None)
+            .expect("load credentials after reset")
+            .is_empty()
+    );
+}
+
+#[test]
+fn reset_is_only_allowed_during_the_power_up_window() {
+    let approval_count = Arc::new(AtomicUsize::new(0));
+    let store_dir = test_store_dir("late-reset");
+    let mut authenticator = Authenticator::new_with_approval(
+        store_dir.clone(),
+        None,
+        Box::new(CountingApproval(approval_count.clone())),
+    );
+    authenticator.powered_up_at = Instant::now() - Duration::from_secs(11);
+
+    assert_eq!(
+        authenticator.handle_cbor(&[Ctap2Command::Reset.into()]),
+        error_response(ErrorStatus::NotAllowed)
+    );
+    assert_eq!(approval_count.load(Ordering::SeqCst), 0);
+    let _ = std::fs::remove_dir_all(store_dir);
 }
 
 #[test]
@@ -1428,6 +1483,7 @@ fn authenticator_with_credentials(
         pin_uv_auth_token: None,
         consecutive_pin_mismatches: 0,
         management: None,
+        powered_up_at: Instant::now(),
     }
 }
 
