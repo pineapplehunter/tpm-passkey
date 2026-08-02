@@ -8,4 +8,4 @@
 - [x] Inject user approval through a testable interface.
 - [x] Extract shared credential domain conversions.
 - [x] Refresh the architecture documentation.
-- [ ] Run the full Rust and NixOS validation suites.
+- [x] Run the full Rust and NixOS validation suites.
