@@ -965,6 +965,14 @@ fn unsupported_policy_version_rejects_assertion() {
     assert_eq!(response[0], 0x27);
 }
 
+struct AlwaysApprove;
+
+impl approval::UserApproval for AlwaysApprove {
+    fn approve(&self, _prompt: &str, _session: &session::SessionContext) -> bool {
+        true
+    }
+}
+
 fn authenticator_with_credential(rp_id: &str, credential_id: Vec<u8>) -> Authenticator {
     authenticator_with_credentials(rp_id, vec![test_credential(credential_id, rp_id, 0)])
 }
@@ -1004,6 +1012,7 @@ fn authenticator_with_credentials(
         tpm_path: None,
         tpm: None,
         session: session::SessionContext::detect(),
+        approval: Box::new(AlwaysApprove),
         credentials: credentials
             .into_iter()
             .map(|credential| Credential {

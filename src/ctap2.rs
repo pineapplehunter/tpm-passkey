@@ -55,6 +55,7 @@ pub struct Authenticator {
     tpm_path: Option<PathBuf>,
     tpm: Option<tpm::Tpm>,
     session: session::SessionContext,
+    approval: Box<dyn approval::UserApproval>,
     credentials: Vec<Credential>,
     pending_assertion: Option<PendingAssertion>,
     client_pin: Option<ClientPinState>,
@@ -120,6 +121,14 @@ struct Credential {
 
 impl Authenticator {
     pub fn new(store_dir: PathBuf, tpm_path: Option<PathBuf>) -> Self {
+        Self::new_with_approval(store_dir, tpm_path, Box::new(approval::SystemApproval))
+    }
+
+    pub fn new_with_approval(
+        store_dir: PathBuf,
+        tpm_path: Option<PathBuf>,
+        approval: Box<dyn approval::UserApproval>,
+    ) -> Self {
         let session = session::SessionContext::detect();
         let tpm = None;
         let credentials = Self::load_credentials_from_disk(&store_dir, session.uid);
@@ -142,6 +151,7 @@ impl Authenticator {
             tpm_path,
             tpm,
             session,
+            approval,
             credentials,
             pending_assertion: None,
             client_pin,
@@ -371,7 +381,7 @@ impl Authenticator {
             return Err(ErrorStatus::OperationDenied);
         }
 
-        if !approval::approve(
+        if !self.approval.approve(
             &format!(
                 "Register a new passkey for {} as {}",
                 display_rp_label(rp_name, rp_id),
@@ -1172,7 +1182,9 @@ impl Authenticator {
             return Err(ErrorStatus::InvalidParameter);
         }
         if !self.session.verify_matches_current()
-            || !approval::approve("Verify identity for a FIDO2 operation", &self.session)
+            || !self
+                .approval
+                .approve("Verify identity for a FIDO2 operation", &self.session)
             || !self.session.verify_matches_current()
         {
             return Err(ErrorStatus::OperationDenied);
@@ -1340,7 +1352,7 @@ impl Authenticator {
             return false;
         }
 
-        if !approval::approve(
+        if !self.approval.approve(
             &format!("Authenticate with passkey for {rp_id}"),
             &self.session,
         ) {
