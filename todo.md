@@ -7,5 +7,5 @@
 - [x] Separate management protocol, service, and socket layers.
 - [x] Inject user approval through a testable interface.
 - [x] Extract shared credential domain conversions.
-- [ ] Refresh the architecture documentation.
+- [x] Refresh the architecture documentation.
 - [ ] Run the full Rust and NixOS validation suites.

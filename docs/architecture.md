@@ -2,47 +2,109 @@
 
 ## Overview
 
-`linux-tpm-fido2` is a system daemon that exposes a virtual FIDO2 authenticator to browsers through Linux UHID. The daemon owns the TPM-backed credential store, protocol handling, and approval flow. Approval prompts fall back to stdin/stdout; future versions will integrate polkit for authorization.
+`linux-tpm-fido2` is a blocking system daemon that exposes a virtual FIDO2
+authenticator through Linux UHID. The daemon owns the CTAPHID channels, CTAP2
+state machines, TPM context, credential store, active-session identity, and
+transaction approval flow.
 
-## Components
+## Runtime Request Flow
 
-- Browser
-- UHID virtual HID device
-- `ctaphid`
-- `ctap2`
-- `store`
-- `tpm`
-- Daemon/session model
-- Polkit authorization
-- Unix-socket IPC
+1. The browser writes 64-byte reports to the UHID device.
+2. `ctaphid` validates the channel and packet sequence, assembles the request,
+   and dispatches complete commands.
+3. `ctap2::Authenticator` decodes the CTAP command and coordinates its state
+   machine.
+4. The command handler scopes credentials to the active UID, obtains approval
+   through `approval::UserApproval`, and asks `tpm` to create or use keys.
+5. `store` persists credential, PIN, policy, and recovery state in SQLite.
+6. The CTAP response is encoded canonically, fragmented by `ctaphid`, and sent
+   to the browser through UHID.
 
-## Request Flow
+Management requests use a Unix socket. Socket threads perform validation and
+storage work, while TPM operations are sent to the daemon thread because the
+NixOS test TPM exposes only one usable `/dev/tpm0` opener.
 
-1. The browser talks to the authenticator over the virtual HID device.
-2. `ctaphid` assembles HID packets into CTAPHID commands and dispatches them.
-3. `ctap2` parses CBOR requests and performs credential selection, approval, and response assembly.
-4. `tpm` creates signing keys, PCR-bound policies, and recovery material, then signs digests through the TPM.
-5. `store` persists credential metadata, TPM key blobs, policy metadata, and recovery slots in SQLite.
-6. The daemon records the active graphical session at startup and uses that context when it asks for approval.
-7. *(Reserved for polkit integration)*
+## Source Boundaries
 
-## Data Flow
+```text
+src/
+├── main.rs                 daemon lifecycle, UHID loop, and CLI
+├── hid.rs                  HID descriptor and virtual-device identity
+├── ctaphid.rs              CTAPHID channels, framing, and transport errors
+├── ctap2.rs                authenticator facade and command orchestration
+├── ctap2/
+│   ├── protocol.rs         CTAP commands, status values, and command names
+│   ├── cbor_codec.rs       CBOR decoding, lookup, and canonical encoding
+│   ├── authenticator_data.rs
+│   │                       authenticatorData and COSE encoding
+│   └── tests.rs            protocol-level unit tests
+├── credential.rs           runtime credential model and store conversion
+├── store.rs                SQLite schema access and integrity metadata
+├── tpm.rs                  TPM object, PCR policy, and signing operations
+├── approval.rs             injectable approval boundary and polkit fallback
+├── management.rs           management socket server and client transport
+├── management/
+│   ├── protocol.rs         serialized management API
+│   └── service.rs          management operations and TPM command dispatch
+├── session.rs              captured daemon session identity
+├── systemd_logind.rs       active-session discovery
+└── polkit.rs               polkit authorization request
+```
 
-- Browser-visible data: RP ID, user handle, sign counter, attestation/authenticator data, signatures.
-- TPM data: P-256 key blobs, PCR policy binding, recovery key material.
-- Store data: credential metadata, keyslots, tokens, and UI preferences.
+## State Ownership
 
+`ctap2::Authenticator` owns state that must survive across CTAP commands:
 
-## Current Boundaries
+- loaded credentials and signature counters;
+- pending `getNextAssertion` enumeration;
+- credential-management enumeration state;
+- Client PIN verifier and retry state;
+- ephemeral key agreement and PIN/UV token state;
+- transaction UV state;
+- the lazily opened TPM context.
 
-- `hid` owns the report descriptor and device identity.
-- `ctaphid` owns transport framing.
-- `ctap2` owns WebAuthn/CTAP2 semantics.
-- `tpm` owns TPM operations.
-- `store` owns persistent credential state.
-- `session` owns daemon session identity.
-- `ipc` owns the Unix-socket seam for communication with external authorizers.
+`ctaphid::PacketHandler` owns transport state independently:
 
-## Future Integration
+- allocated channel IDs;
+- incomplete messages and expected sequence numbers;
+- the next channel ID to allocate.
 
-- A later architecture pass should decide whether user scoping stays session-based or becomes per-user/per-session daemon instances.
+Persistent state belongs to `store`; TPM handles and policy sessions belong to
+`tpm` and are flushed by their guards.
+
+## Effect Boundaries
+
+Interactive authorization is injected through `approval::UserApproval`.
+Production uses `SystemApproval`, while protocol tests provide an explicit fake
+provider. This avoids making production behavior depend on `cfg(test)`.
+
+The runtime credential model is distinct from the SQLite representation.
+Conversions live in `credential.rs`, preventing CTAP handlers from depending on
+storage encoding details.
+
+TPM and store access are not yet injected interfaces. They remain the next
+useful seams if protocol tests need deterministic signing, failure injection,
+or an in-memory repository.
+
+## Testing Layers
+
+- Unit tests cover CTAP parsing, state transitions, authenticator data,
+  Client PIN, CTAPHID framing, storage, and PCR selection.
+- The NixOS VM test exercises UHID discovery, polkit approval, a software TPM,
+  credential creation/assertion, PIN management, PCR recovery, reboot
+  persistence, and CTAP compliance through `python-fido2`.
+
+The NixOS VM uses `/dev/tpm0`, so all management TPM operations must pass
+through the daemon-owned TPM command channel.
+
+## Remaining Architectural Work
+
+- Introduce repository and signer interfaces when tests require deterministic
+  persistence or TPM failures.
+- Keep splitting CTAP command families only when they can expose narrow inputs
+  and outputs; moving large `impl Authenticator` blocks without reducing
+  coupling would provide little benefit.
+- Give the SQLite store a long-lived connection/runtime rather than opening a
+  pool and checking migrations for individual operations.
+- Move daemon lifecycle and session-change handling out of `main.rs` when UHID
+  device recreation is implemented.
