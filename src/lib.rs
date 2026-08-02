@@ -1,4 +1,5 @@
 pub mod approval;
+mod credential;
 pub mod ctap2;
 pub mod ctaphid;
 pub mod hid;

@@ -9,7 +9,7 @@ use bitflags::bitflags;
 use color_eyre::eyre::WrapErr;
 use zeroize::Zeroize;
 
-use crate::{approval, session, store, tpm};
+use crate::{approval, credential::Credential, session, store, tpm};
 use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt};
 use cbc::cipher::{KeyIvInit, block_padding::NoPadding};
@@ -105,20 +105,6 @@ struct PendingAssertion {
     user_verified: bool,
 }
 
-struct Credential {
-    id: Vec<u8>,
-    rp_id: String,
-    discoverable: bool,
-    user_id: Option<u32>,
-    user_handle: Vec<u8>,
-    user_name: Option<String>,
-    user_display_name: Option<String>,
-    key: tpm::TpmCredential,
-    policy: Option<store::StoredPcrPolicy>,
-    recovery: Option<store::StoredRecoverySlot>,
-    sign_count: u32,
-}
-
 impl Authenticator {
     pub fn new(store_dir: PathBuf, tpm_path: Option<PathBuf>) -> Self {
         Self::new_with_approval(store_dir, tpm_path, Box::new(approval::SystemApproval))
@@ -164,28 +150,7 @@ impl Authenticator {
 
     fn load_credentials_from_disk(store_dir: &PathBuf, uid: Option<u32>) -> Vec<Credential> {
         match store::load_ctap2_credentials_from_dir(store_dir, uid) {
-            Ok(credentials) => credentials
-                .into_iter()
-                .map(|credential| Credential {
-                    id: credential.id,
-                    rp_id: credential.rp_id,
-                    discoverable: credential.discoverable,
-                    user_id: credential.user_id,
-                    user_handle: credential.user_handle,
-                    user_name: credential.user_name,
-                    user_display_name: credential.user_display_name,
-                    key: tpm::TpmCredential {
-                        private: credential.key.private,
-                        public: credential.key.public,
-                        public_key_x: credential.key.public_key_x,
-                        public_key_y: credential.key.public_key_y,
-                        auth_value: credential.key.auth_value,
-                    },
-                    policy: credential.policy,
-                    recovery: credential.recovery,
-                    sign_count: credential.sign_count,
-                })
-                .collect(),
+            Ok(credentials) => credentials.into_iter().map(Credential::from).collect(),
             Err(error) => {
                 log::warn!("failed to reload CTAP2 credential store: {error:?}");
                 Vec::new()
@@ -1273,29 +1238,10 @@ impl Authenticator {
     }
 
     fn save_credentials(&self) {
-        let credentials: Vec<_> = self
+        let credentials: Vec<store::StoredCtap2Credential> = self
             .credentials
             .iter()
-            .map(|credential| store::StoredCtap2Credential {
-                id: credential.id.clone(),
-                rp_id: credential.rp_id.clone(),
-                discoverable: credential.discoverable,
-                user_id: credential.user_id,
-                user_handle: credential.user_handle.clone(),
-                user_name: credential.user_name.clone(),
-                user_display_name: credential.user_display_name.clone(),
-                key: store::StoredTpmKey {
-                    private: credential.key.private.clone(),
-                    public: credential.key.public.clone(),
-                    public_key_x: credential.key.public_key_x.clone(),
-                    public_key_y: credential.key.public_key_y.clone(),
-                    auth_value: credential.key.auth_value.clone(),
-                },
-                policy: credential.policy.clone(),
-                recovery: credential.recovery.clone(),
-                sign_count: credential.sign_count,
-                integrity_mac: None,
-            })
+            .map(store::StoredCtap2Credential::from)
             .collect();
 
         let path = store::credentials_database_path_in_dir(&self.store_dir);

@@ -5,6 +5,6 @@
 - [x] Extract CTAP CBOR codec helpers.
 - [x] Separate management protocol, service, and socket layers.
 - [x] Inject user approval through a testable interface.
-- [ ] Extract shared credential domain conversions.
+- [x] Extract shared credential domain conversions.
 - [ ] Refresh the architecture documentation.
 - [ ] Run the full Rust and NixOS validation suites.
