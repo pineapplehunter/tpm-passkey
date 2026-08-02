@@ -1,0 +1,97 @@
+use ciborium::value::Value;
+
+use super::ErrorStatus;
+
+pub(super) fn decode_map(body: &[u8]) -> Result<Vec<(Value, Value)>, ErrorStatus> {
+    match ciborium::from_reader::<Value, _>(body) {
+        Ok(Value::Map(map)) => Ok(map),
+        Ok(_) | Err(_) => Err(ErrorStatus::InvalidCbor),
+    }
+}
+
+pub(super) trait MapKey {
+    fn matches(&self, value: &Value) -> bool;
+}
+
+impl MapKey for i128 {
+    fn matches(&self, value: &Value) -> bool {
+        value.as_integer().map(i128::from) == Some(*self)
+    }
+}
+
+impl MapKey for &str {
+    fn matches(&self, value: &Value) -> bool {
+        value.as_text() == Some(*self)
+    }
+}
+
+pub(super) fn map_value<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&Value> {
+    map.iter()
+        .find_map(|(candidate, value)| key.matches(candidate).then_some(value))
+}
+
+pub(super) fn map_bytes<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&[u8]> {
+    map_value(map, key)
+        .and_then(Value::as_bytes)
+        .map(Vec::as_slice)
+}
+
+pub(super) fn map_integer<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<i128> {
+    map_value(map, key)
+        .and_then(Value::as_integer)
+        .map(i128::from)
+}
+
+pub(super) fn map_text<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&str> {
+    map_value(map, key).and_then(Value::as_text)
+}
+
+pub(super) fn map_bool<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<bool> {
+    map_value(map, key).and_then(Value::as_bool)
+}
+
+pub(super) fn map_array<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&[Value]> {
+    map_value(map, key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+}
+
+pub(super) fn map_map<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&[(Value, Value)]> {
+    map_value(map, key)
+        .and_then(Value::as_map)
+        .map(Vec::as_slice)
+}
+
+pub(super) fn encode_response(response: Value) -> Vec<u8> {
+    let mut payload = vec![0x00];
+    let response = canonicalize_value(response);
+    ciborium::into_writer(&response, &mut payload).expect("serializing CTAP2 response");
+    payload
+}
+
+pub(super) fn canonicalize_value(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_value).collect()),
+        Value::Map(entries) => {
+            let mut entries: Vec<_> = entries
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_value(value)))
+                .collect();
+            entries.sort_by(|(left_key, _), (right_key, _)| {
+                canonical_key_bytes(left_key).cmp(&canonical_key_bytes(right_key))
+            });
+            Value::Map(entries)
+        }
+        other => other,
+    }
+}
+
+fn canonical_key_bytes(value: &Value) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(value, &mut encoded).expect("serializing CTAP2 map key");
+    encoded
+}
+
+pub(super) fn error_response(status: ErrorStatus) -> Vec<u8> {
+    vec![status.into()]
+}
