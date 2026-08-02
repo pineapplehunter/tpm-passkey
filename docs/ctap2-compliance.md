@@ -181,6 +181,29 @@ optional `largeBlobKey=0x07`, and optional `unsignedExtensionOutputs=0x08`.
 
 Audit status: **complete for implemented algorithms and extensions**.
 
+## `authenticatorGetInfo` (`0x04`)
+
+Normative section: 6.4. The command has no input parameters. Current advertised
+members are:
+
+- versions: `FIDO_2_1`, then `FIDO_2_0`;
+- extension: `credProps`;
+- the project AAGUID (16 bytes);
+- options: `plat=false`, `rk=true`, `up=true`, `uv=true`, `clientPin` reflecting
+  whether a PIN is configured, `pinUvAuthToken=true`, `credMgmt=true`, and
+  `makeCredUvNotRqd=true`;
+- maximum message size 1200 bytes;
+- PIN/UV Auth Protocol 2;
+- transport `usb`;
+- ES256 public-key credential creation;
+- minimum PIN length of four Unicode code points.
+
+Every advertised option must have a working command path. Unsupported options,
+extensions, preview features, enterprise attestation, large blobs, and bio
+enrollment are omitted. Lists are non-empty and contain no duplicates.
+
+Audit status: **complete**.
+
 ## Remaining Audit Order
 
 1. Complete ClientPIN inputs, errors, permissions, and retry state.

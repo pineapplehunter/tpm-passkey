@@ -218,7 +218,10 @@ impl Authenticator {
         }
 
         let result = match command {
-            Ctap2Command::GetInfo => Ok(get_info_response(self.client_pin.is_some())),
+            Ctap2Command::GetInfo => body
+                .is_empty()
+                .then(|| get_info_response(self.client_pin.is_some()))
+                .ok_or(ErrorStatus::InvalidCbor),
             Ctap2Command::ClientPin => self.client_pin(body),
             Ctap2Command::MakeCredential => self.make_credential(body),
             Ctap2Command::GetAssertion => self.get_assertion(body),
@@ -1549,9 +1552,8 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
                 "plat" => false,
                 "rk" => true,
                 "up" => true,
-                // The polkit approval prompt is this authenticator's user
-                // verification method; authenticatorSelection is the CTAP2.1
-                // UV gesture. Advertise `uv` so browsers route UV through it.
+                // The polkit approval prompt is this authenticator's built-in
+                // user-verification method.
                 "uv" => true,
                 "clientPin" => client_pin,
                 // CTAP 2.2 §6.4 requires pinUvAuthToken when either clientPin
@@ -1565,6 +1567,7 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
             5 => 1200,
             9 => ["usb"],
             10 => [{"type" => "public-key", "alg" => COSE_ALG_ES256}],
+            13 => 4,
         })
         .unwrap(),
     )

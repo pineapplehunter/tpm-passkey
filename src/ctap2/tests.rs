@@ -61,6 +61,7 @@ fn get_info_advertises_a_consistent_ctap21_configuration() {
     assert_eq!(map_bool(options, "uv"), Some(true));
     assert_eq!(map_bool(options, "pinUvAuthToken"), Some(true));
     assert_eq!(map_bool(options, "credMgmt"), Some(true));
+    assert_eq!(map_value(&map, 13), Some(&Value::Integer(4.into())));
 
     let algorithms = map_value(&map, 10)
         .and_then(Value::as_array)
@@ -86,6 +87,10 @@ fn empty_and_malformed_cbor_requests_return_ctap_errors() {
     );
     assert_eq!(
         authenticator.handle_cbor(&[Ctap2Command::GetNextAssertion.into(), 0xa0]),
+        error_response(ErrorStatus::InvalidCbor)
+    );
+    assert_eq!(
+        authenticator.handle_cbor(&[Ctap2Command::GetInfo.into(), 0xa0]),
         error_response(ErrorStatus::InvalidCbor)
     );
 }

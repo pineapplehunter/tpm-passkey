@@ -49,7 +49,7 @@
 - [x] Create and maintain `docs/ctap2-compliance.md` from the normative specification.
 - [x] Complete the ClientPIN wire-format, cryptography, permission, and retry audit.
 - [x] Audit makeCredential and getAssertion.
-- [ ] Audit getInfo capability claims.
+- [x] Audit getInfo capability claims.
 - [ ] Audit credential management and stateful continuation commands.
 - [ ] Audit reset, selection, and unsupported commands.
 - [ ] Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
