@@ -34,4 +34,4 @@
 
 - [x] Verify `pinUvAuthParam` over `clientDataHash` only.
 - [x] Exercise token-authenticated makeCredential through the CTAP handler and VM.
-- [ ] Run Rust and NixOS validation.
+- [x] Run Rust and NixOS validation.
