@@ -86,6 +86,20 @@ TPM and store access are not yet injected interfaces. They remain the next
 useful seams if protocol tests need deterministic signing, failure injection,
 or an in-memory repository.
 
+## Logging
+
+Logs use consistent `key=value` context and avoid raw CTAP payloads:
+
+- `info`: daemon/UHID lifecycle, complete CTAP commands, approvals, and credential outcomes;
+- `debug`: CTAPHID packet flow, command options, ClientPIN subcommands, status codes, and TPM policy diagnostics;
+- `trace`: individual UHID report writes.
+
+For focused diagnostics, use:
+
+```sh
+RUST_LOG=linux_tpm_fido2=debug,sqlx=warn,zbus=warn
+```
+
 ## Testing Layers
 
 - Unit tests cover CTAP parsing, state transitions, authenticator data,

@@ -16,3 +16,10 @@
 - [x] Add UV retry and browser-shaped UV token tests.
 - [x] Log CTAP status codes for failed commands.
 - [x] Run Rust and NixOS validation.
+
+## Debug logging
+
+- [x] Separate lifecycle, command, packet, and trace-level messages.
+- [x] Use consistent key-value context and name ClientPIN subcommands.
+- [x] Remove sensitive or misleading payload/write diagnostics.
+- [ ] Document log levels and validate the changes.

@@ -200,6 +200,11 @@ impl PacketHandler {
     }
 
     fn dispatch(&mut self, cid: u32, command: CtapHidCommand, payload: &[u8]) -> Response {
+        log::debug!(
+            "ctaphid request cid={cid:#010x} command={} payload_len={}",
+            command_name(command),
+            payload.len()
+        );
         match command {
             CtapHidCommand::Init => {
                 let allocated_cid = if cid == BROADCAST_CID {
@@ -314,6 +319,10 @@ fn handle_init(cid: u32, allocated_cid: u32, payload: &[u8]) -> Response {
 }
 
 fn error(cid: u32, code: CtapHidError) -> Response {
+    log::debug!(
+        "ctaphid error cid={cid:#010x} code={code:?} value={:#04x}",
+        code as u8
+    );
     Response {
         cid,
         command: CtapHidCommand::Error,

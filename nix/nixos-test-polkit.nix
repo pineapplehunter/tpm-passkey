@@ -28,7 +28,7 @@
           };
 
           systemd.services.linux-tpm-fido2.wantedBy = lib.mkForce [ ];
-          systemd.services.linux-tpm-fido2.environment.RUST_LOG = "debug";
+          systemd.services.linux-tpm-fido2.environment.RUST_LOG = "linux_tpm_fido2=debug,sqlx=warn,zbus=warn";
 
           security.polkit.extraConfig = ''
             polkit.addRule(function(action, subject) {

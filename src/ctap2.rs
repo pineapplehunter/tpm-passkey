@@ -166,8 +166,9 @@ impl Authenticator {
             return error_response(ErrorStatus::InvalidCommand);
         };
 
-        let Ok(command) = Ctap2Command::try_from(command) else {
-            log::info!("ctap2 command: unknown");
+        let command_byte = command;
+        let Ok(command) = Ctap2Command::try_from(command_byte) else {
+            log::info!("ctap2 request command=unknown code={command_byte:#04x}");
             return error_response(ErrorStatus::InvalidCommand);
         };
 
@@ -181,7 +182,11 @@ impl Authenticator {
             self.management = None;
         }
 
-        log::info!("ctap2 command: {}", command_name(command));
+        log::info!(
+            "ctap2 request command={} code={command_byte:#04x} body_len={}",
+            command_name(command),
+            body.len()
+        );
 
         #[cfg(not(test))]
         {
@@ -230,10 +235,17 @@ impl Authenticator {
             Ctap2Command::Config => self.config(body),
         };
         match result {
-            Ok(response) => response,
+            Ok(response) => {
+                log::debug!(
+                    "ctap2 response command={} status=success response_len={}",
+                    command_name(command),
+                    response.len()
+                );
+                response
+            }
             Err(status) => {
                 log::info!(
-                    "ctap2 command {} failed: {status:?} ({:#04x})",
+                    "ctap2 response command={} status={status:?} code={:#04x}",
                     command_name(command),
                     u8::from(status)
                 );
@@ -493,11 +505,7 @@ impl Authenticator {
             })
             .unwrap(),
         );
-        log::debug!(
-            "makeCredential response ({} bytes): {}",
-            response.len(),
-            hex::encode(&response)
-        );
+        log::debug!("makeCredential response response_len={}", response.len());
         Ok(response)
     }
 
@@ -740,7 +748,10 @@ impl Authenticator {
         let request = decode_map(body)?;
         validate_pin_uv_protocol(map_integer(&request, 1))?;
         let sub_command = map_integer(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
-        log::debug!("authenticatorClientPIN subcommand={sub_command:#04x}");
+        log::debug!(
+            "clientPIN request subcommand={} code={sub_command:#04x}",
+            client_pin_subcommand_name(sub_command)
+        );
         let key_agreement = map_map(&request, 3);
 
         match sub_command {
@@ -1513,6 +1524,20 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
     )
 }
 
+fn client_pin_subcommand_name(sub_command: i128) -> &'static str {
+    match sub_command {
+        1 => "getPinRetries",
+        2 => "getKeyAgreement",
+        3 => "setPin",
+        4 => "changePin",
+        5 => "getPinTokenLegacy",
+        6 => "getPinUvAuthTokenUsingUvWithPermissions",
+        7 => "getUvRetries",
+        9 => "getPinUvAuthTokenUsingPinWithPermissions",
+        _ => "unknown",
+    }
+}
+
 fn pin_uv_permissions(
     request: &[(Value, Value)],
 ) -> (Option<Ctap2PermissionFlags>, Option<String>) {
@@ -1727,14 +1752,12 @@ fn validate_common_options(
     };
 
     if map_bool(options, "uv") == Some(true) {
-        log::info!("request requires user verification; continuing with local approval flow");
+        log::debug!("ctap2 option uv=true approval=local");
     }
     if map_bool(options, "up") == Some(false) {
-        log::info!("request disables user presence");
+        log::debug!("ctap2 option up=false");
         if reject_user_presence_false && map_bool(options, "uv") != Some(true) {
-            log::info!(
-                "request disables user presence without user verification, which is not supported"
-            );
+            log::debug!("ctap2 option rejected reason=up_false_without_uv");
             return Err(ErrorStatus::UnsupportedOption);
         }
     }
@@ -1748,13 +1771,13 @@ fn validate_resident_key_options(options: Option<&[(Value, Value)]>) -> Result<(
     };
 
     if let Some(require_resident_key) = map_bool(options, "requireResidentKey") {
-        log::info!("request sets requireResidentKey={require_resident_key}");
+        log::debug!("ctap2 option requireResidentKey={require_resident_key}");
     }
 
     if let Some(resident_key) = map_text(options, "residentKey") {
         match resident_key {
             "discouraged" | "preferred" | "required" => {
-                log::info!("request sets residentKey={resident_key}");
+                log::debug!("ctap2 option residentKey={resident_key}");
             }
             _ => return Err(ErrorStatus::InvalidCbor),
         }
@@ -1770,7 +1793,7 @@ fn validate_attestation_conveyance(attestation: Option<&str>) -> Result<(), Erro
 
     match attestation {
         "none" | "indirect" | "direct" | "enterprise" => {
-            log::info!("request sets attestation={attestation}");
+            log::debug!("ctap2 option attestation={attestation}");
             Ok(())
         }
         _ => Err(ErrorStatus::InvalidCbor),
@@ -1806,8 +1829,8 @@ fn allow_list_allows(allow_list: Option<&[Value]>, credential_id: &[u8]) -> bool
 
 fn validate_client_data_hash(client_data_hash: &[u8]) -> Result<(), ErrorStatus> {
     if client_data_hash.len() != 32 {
-        log::info!(
-            "request provided invalid clientDataHash length {}; expected 32 bytes",
+        log::debug!(
+            "ctap2 validation field=clientDataHash actual_len={} expected_len=32",
             client_data_hash.len()
         );
         return Err(ErrorStatus::InvalidCbor);

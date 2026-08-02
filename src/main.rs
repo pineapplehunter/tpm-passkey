@@ -175,8 +175,8 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
                     continue;
                 };
 
-                log::info!(
-                    "host -> authenticator: {}{}",
+                log::debug!(
+                    "uhid rx report={}{}",
                     ctaphid::describe_report(report),
                     if has_report_id_prefix {
                         " report_id=0"
@@ -186,27 +186,26 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
                 );
                 if let Some(outcome) = ctaphid.handle_packet(report) {
                     let ctaphid::PacketOutcome::Response(response) = outcome else {
-                        log::debug!("waiting for continuation packet");
                         continue;
                     };
-                    log::info!(
-                        "authenticator -> host: cid={:#010x} cmd={} payload_len={}",
+                    log::debug!(
+                        "uhid tx cid={:#010x} command={} payload_len={}",
                         response.cid,
                         ctaphid::command_name(response.command),
                         response.payload.len()
                     );
                     for packet in response.packets() {
-                        let written = device
+                        device
                             .write(&packet)
                             .wrap_err("writing UHID input report")?;
-                        log::debug!("wrote UHID input report len={written}");
+                        log::trace!("uhid tx packet_len={}", packet.len());
                     }
                 }
             }
-            Ok(OutputEvent::Start { .. }) => log::info!("uhid start"),
-            Ok(OutputEvent::Stop) => log::info!("uhid stop"),
-            Ok(OutputEvent::Open) => log::info!("uhid open"),
-            Ok(OutputEvent::Close) => log::info!("uhid close"),
+            Ok(OutputEvent::Start { .. }) => log::info!("uhid lifecycle event=start"),
+            Ok(OutputEvent::Stop) => log::info!("uhid lifecycle event=stop"),
+            Ok(OutputEvent::Open) => log::info!("uhid lifecycle event=open"),
+            Ok(OutputEvent::Close) => log::info!("uhid lifecycle event=close"),
             Ok(OutputEvent::GetReport {
                 id,
                 report_number,
