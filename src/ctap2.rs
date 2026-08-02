@@ -339,11 +339,10 @@ impl Authenticator {
         let user_handle = map_bytes(user, "id").ok_or(ErrorStatus::MissingParameter)?;
         let user_name = map_text(user, "name");
         let user_display_name = map_text(user, "displayName");
-        let make_credential_message = [client_data_hash, rp_id.as_bytes()].concat();
         let user_verified = self.validate_pin_uv_auth(
             map_integer(&request, 9),
             map_bytes(&request, 8),
-            &make_credential_message,
+            client_data_hash,
             Ctap2PermissionFlags::MAKE_CREDENTIAL,
             Some(rp_id),
         )?;

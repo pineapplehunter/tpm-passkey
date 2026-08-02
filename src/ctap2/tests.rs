@@ -327,27 +327,13 @@ fn protocol2_aes_and_hmac_use_separate_derived_keys() {
 
 #[test]
 fn make_credential_with_pin_uv_auth_token_regression() {
-    // Regression test for three related CTAP 2.1 PinUvAuthProtocol 2 bugs in the
-    // pinUvAuthToken flow that broke browser (Chrome/Firefox) makeCredential and
-    // getAssertion operations after a ClientPIN token exchange.
-    //
-    // Bug 1 — Missing key 3 in getPinUvAuthToken response (src/ctap2.rs ~1109):
-    //   CTAP 2.1 Protocol 2 requires pinUvAuthParam (key 3) in the token response:
-    //   HMAC-SHA256(hmac_key, encrypted_token)[0..16]. Before the fix, only key 2
-    //   (encrypted token) was returned, which broke browser integrity verification.
-    //
-    // Bug 2 — Wrong HMAC message for makeCredential (src/ctap2.rs ~329):
-    //   CTAP 2.1 §6.1.1 defines the pinUvAuthParam HMAC message for makeCredential as
-    //   `clientDataHash || rpId`, not just `clientDataHash`. The old code only passed
-    //   `client_data_hash`, so the HMAC never matched what the browser computed.
-    //
-    // Bug 3 — rp_id=None in makeCredential token check (src/ctap2.rs ~331):
-    //   validate_pin_uv_auth compares the token's rp_id against the passed rp_id via
-    //   `is_some_and(|token_rp_id| Some(token_rp_id) != rp_id)`. When rp_id=None,
-    //   `Some(token_rp_id) != None` is always true, so every token with a scoped rp_id
-    //   was rejected, even for the correct RP.
+    // Exercise the browser flow from PIN setup through scoped token issuance
+    // and makeCredential authentication. The pinUvAuthParam message for
+    // makeCredential is exactly clientDataHash; RP scoping is checked against
+    // the token separately.
     let store_dir = test_store_dir("make-credential-token-regression");
-    let mut authenticator = Authenticator::new(store_dir.clone(), None);
+    let mut authenticator =
+        Authenticator::new_with_approval(store_dir.clone(), None, Box::new(AlwaysApprove));
 
     // ── Setup: set PIN and get a token ──────────────────────────────────
 
@@ -428,47 +414,77 @@ fn make_credential_with_pin_uv_auth_token_regression() {
     let token = decrypt_aes(&aes_key2, encrypted_token).expect("decrypt token");
     assert_eq!(token.len(), 32, "pinUvAuthToken must be 32 bytes");
 
-    // ── REGRESSION 2+3: validate_pin_uv_auth for makeCredential ─────────
     let client_data_hash = [0xcc; 32];
-
-    // CTAP 2.1 §6.1.1: makeCredential message = clientDataHash || rpId
-    let make_cred_message = [client_data_hash.as_slice(), rp_id.as_bytes()].concat();
     let mut mac = HmacSha256::new_from_slice(&token).expect("HMAC key");
-    mac.update(&make_cred_message);
-    // PIN/UV Auth Protocol 2 returns the full 32-byte HMAC (libfido2
-    // cbor_encode_pin_auth: outlen = dgst_len for protocol 2).
+    mac.update(&client_data_hash);
     let correct_auth_param = mac.finalize().into_bytes().to_vec();
 
-    // Should succeed: correct HMAC message + Some(rp_id)
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
         Some(&correct_auth_param),
-        &make_cred_message,
+        &client_data_hash,
         Ctap2PermissionFlags::MAKE_CREDENTIAL,
         Some(rp_id),
     );
+    assert_eq!(result, Ok(true));
+
+    // Exercise the public CTAP handler too. With no TPM test context, a valid
+    // request reaches key creation and fails with OperationDenied rather than
+    // being rejected as PinAuthInvalid.
+    let make_credential_response = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::MakeCredential,
+        Value::Map(vec![
+            (
+                Value::Integer(1.into()),
+                Value::Bytes(client_data_hash.to_vec()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Map(vec![(
+                    Value::Text("id".to_owned()),
+                    Value::Text(rp_id.to_owned()),
+                )]),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Map(vec![(
+                    Value::Text("id".to_owned()),
+                    Value::Bytes(vec![0x42; 16]),
+                )]),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        Value::Text("type".to_owned()),
+                        Value::Text("public-key".to_owned()),
+                    ),
+                    (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
+                ])]),
+            ),
+            (
+                Value::Integer(8.into()),
+                Value::Bytes(correct_auth_param.clone()),
+            ),
+            (Value::Integer(9.into()), Value::Integer(2.into())),
+        ]),
+    ));
     assert_eq!(
-        result,
-        Ok(true),
-        "REGRESSION 2+3: clientDataHash||rpId + Some(rp_id) should pass"
+        make_credential_response[0],
+        u8::from(ErrorStatus::OperationDenied)
     );
 
-    // Simulate the old buggy server behavior: browser sends HMAC over
-    // clientDataHash || rpId (CTAP 2.1 §6.1.1), but the server (before the
-    // fix) only verified HMAC over clientDataHash. Since the HMAC messages
-    // differ, the comparison should fail.
+    // Appending rpId changes the HMAC message and must fail. Browsers send an
+    // HMAC over clientDataHash only.
+    let incorrect_message = [client_data_hash.as_slice(), rp_id.as_bytes()].concat();
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
-        Some(&correct_auth_param), // browser's HMAC = HMAC(token, clientDataHash || rpId)
-        &client_data_hash,         // OLD server message = clientDataHash only (BUG)
+        Some(&correct_auth_param),
+        &incorrect_message,
         Ctap2PermissionFlags::MAKE_CREDENTIAL,
         Some(rp_id),
     );
-    assert_eq!(
-        result,
-        Err(ErrorStatus::PinAuthInvalid),
-        "REGRESSION 2: old server message (clientDataHash) vs browser's (clientDataHash||rpId)"
-    );
+    assert_eq!(result, Err(ErrorStatus::PinAuthInvalid));
 
     // Re-inject token (was cleared by the previous error return)
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
@@ -482,7 +498,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
         Some(&correct_auth_param),
-        &make_cred_message,
+        &client_data_hash,
         Ctap2PermissionFlags::MAKE_CREDENTIAL,
         None,
     );
@@ -502,7 +518,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
         Some(&correct_auth_param),
-        &make_cred_message,
+        &client_data_hash,
         Ctap2PermissionFlags::MAKE_CREDENTIAL,
         Some(rp_id),
     );

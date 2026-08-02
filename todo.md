@@ -29,3 +29,9 @@
 - [x] Return only the defined `pinUvAuthToken` field for token responses.
 - [x] Add strict response-shape regression coverage.
 - [x] Run Rust and NixOS validation.
+
+## makeCredential PIN/UV authentication
+
+- [x] Verify `pinUvAuthParam` over `clientDataHash` only.
+- [x] Exercise token-authenticated makeCredential through the CTAP handler and VM.
+- [ ] Run Rust and NixOS validation.

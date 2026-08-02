@@ -24,9 +24,16 @@ def challenge(label):
     return hashlib.sha256(label.encode()).digest()
 
 
-def register(ctap, rp_id, user_id):
+def register(ctap, rp_id, user_id, client_pin=None, uv_token=None):
+    client_data_hash = challenge(f"register-{user_id}")
+    pin_uv_param = None
+    pin_uv_protocol = None
+    if client_pin is not None and uv_token is not None:
+        pin_uv_param = client_pin.protocol.authenticate(uv_token, client_data_hash)
+        pin_uv_protocol = client_pin.protocol.VERSION
+
     return ctap.make_credential(
-        challenge(f"register-{user_id}"),
+        client_data_hash,
         {"id": rp_id, "name": "CTAP compliance test"},
         {
             "id": user_id.encode(),
@@ -35,7 +42,9 @@ def register(ctap, rp_id, user_id):
         },
         [{"type": "public-key", "alg": -7}],
         extensions={"credProps": True},
-        options={"rk": True, "up": True, "uv": False},
+        options={"rk": True, "up": True, "uv": uv_token is not None},
+        pin_uv_param=pin_uv_param,
+        pin_uv_protocol=pin_uv_protocol,
     )
 
 
@@ -78,7 +87,7 @@ def main():
     )
     assert len(uv_token) == 32
 
-    first = register(ctap, rp_id, "resident-user-1")
+    first = register(ctap, rp_id, "resident-user-1", client_pin, uv_token)
     second = register(ctap, rp_id, "resident-user-2")
     credentials = [first.auth_data.credential_data, second.auth_data.credential_data]
 
