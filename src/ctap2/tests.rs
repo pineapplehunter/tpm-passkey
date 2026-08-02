@@ -290,7 +290,8 @@ fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
             .len(),
         32
     );
-    assert_eq!(map_bytes(&response, 3).map(<[u8]>::len), Some(32));
+    assert_eq!(response.len(), 1);
+    assert!(map_value(&response, 3).is_none());
 
     let retries = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
@@ -420,27 +421,12 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         panic!("expected token response map");
     };
 
-    // Decrypt the token from key 2 for HMAC computations
+    // ClientPIN token responses contain only key 2. Key 3 is pinRetries in
+    // the response schema and strict browser decoders reject a byte string there.
+    assert_eq!(token_map.len(), 1);
     let encrypted_token = map_bytes(&token_map, 2).expect("encrypted token (key 2)");
     let token = decrypt_aes(&aes_key2, encrypted_token).expect("decrypt token");
     assert_eq!(token.len(), 32, "pinUvAuthToken must be 32 bytes");
-
-    // key 3 (pinUvAuthParam) MUST equal HMAC-SHA256(token,
-    // encryptedToken) over the full 32-byte digest (PIN/UV Auth
-    // Protocol 2). This is exactly what libfido2 / browsers verify,
-    // so a mismatch here is what makes a browser reject the token
-    // and close the device.
-    let expected_pin_uv_auth_param = {
-        let mut mac = HmacSha256::new_from_slice(&token).expect("HMAC key");
-        mac.update(encrypted_token);
-        mac.finalize().into_bytes().to_vec()
-    };
-    let pin_uv_auth_param = map_bytes(&token_map, 3).expect("pinUvAuthParam (key 3)");
-    assert_eq!(
-        pin_uv_auth_param,
-        expected_pin_uv_auth_param.as_slice(),
-        "key 3 must be HMAC-SHA256(token, encryptedToken)"
-    );
 
     // ── REGRESSION 2+3: validate_pin_uv_auth for makeCredential ─────────
     let client_data_hash = [0xcc; 32];

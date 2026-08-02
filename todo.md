@@ -23,3 +23,9 @@
 - [x] Use consistent key-value context and name ClientPIN subcommands.
 - [x] Remove sensitive or misleading payload/write diagnostics.
 - [x] Document log levels and validate the changes.
+
+## ClientPIN token response interoperability
+
+- [x] Return only the defined `pinUvAuthToken` field for token responses.
+- [x] Add strict response-shape regression coverage.
+- [ ] Run Rust and NixOS validation.

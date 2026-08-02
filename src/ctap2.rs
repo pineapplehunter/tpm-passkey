@@ -1139,11 +1139,9 @@ impl Authenticator {
             issued_at: Instant::now(),
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
-        let pin_uv_auth_param = compute_pin_uv_auth_param(&token, &encrypted_token)?;
         Ok(encode_response(
             cbor!({
                 2 => Value::Bytes(encrypted_token),
-                3 => Value::Bytes(pin_uv_auth_param),
             })
             .unwrap(),
         ))
@@ -1179,11 +1177,9 @@ impl Authenticator {
             issued_at: Instant::now(),
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
-        let pin_uv_auth_param = compute_pin_uv_auth_param(&token, &encrypted_token)?;
         Ok(encode_response(
             cbor!({
                 2 => Value::Bytes(encrypted_token),
-                3 => Value::Bytes(pin_uv_auth_param),
             })
             .unwrap(),
         ))
@@ -1615,19 +1611,6 @@ fn verify_pin_uv_auth_param(
     constant_time_equal(&expected[..auth_param.len()], auth_param)
         .then_some(())
         .ok_or(ErrorStatus::PinAuthInvalid)
-}
-
-/// Compute `pinUvAuthParam` (response key 3) for a `getPinUvAuthToken`
-/// response. Per CTAP 2.2 §6.5.5.7, this is
-/// HMAC-SHA256(token, encryptedToken), where `token` is the issued
-/// pinUvAuthToken (used as the MAC key). For PIN/UV Auth Protocol 2 the
-/// full 32-byte digest is returned (libfido2 `cbor_encode_pin_auth`).
-/// This mirrors `verify_pin_uv_auth_param` on the client side.
-fn compute_pin_uv_auth_param(token: &[u8], message: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
-    let mut mac = HmacSha256::new_from_slice(token).map_err(|_| ErrorStatus::OperationDenied)?;
-    mac.update(message);
-    let result = mac.finalize().into_bytes();
-    Ok(result.to_vec())
 }
 
 fn encrypt_aes(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
