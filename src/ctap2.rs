@@ -451,22 +451,20 @@ impl Authenticator {
             });
         }
 
-        if !self.session.verify_matches_current() {
-            log::error!("session changed before registration approval");
+        if self.operation_is_cancelled() || !self.session.verify_matches_current() {
+            log::error!("session changed or operation cancelled before registration approval");
             return Err(ErrorStatus::OperationDenied);
         }
 
         let cached_user_presence =
             user_verified && self.pin_uv_auth_token_has_cached_user_presence();
+        let prompt = format!(
+            "Register a new passkey for {} as {}",
+            display_rp_label(rp_name, rp_id),
+            user_display_name.or(user_name).unwrap_or("unknown user")
+        );
         if !cached_user_presence
-            && !self.approval.approve(
-                &format!(
-                    "Register a new passkey for {} as {}",
-                    display_rp_label(rp_name, rp_id),
-                    user_display_name.or(user_name).unwrap_or("unknown user")
-                ),
-                &self.session,
-            )
+            && !self.user_presence_approved(&prompt, &format!("registration for {rp_id}"))
         {
             return Err(ErrorStatus::OperationDenied);
         }
@@ -478,8 +476,8 @@ impl Authenticator {
             return Err(ErrorStatus::CredentialExcluded);
         }
 
-        if !self.session.verify_matches_current() {
-            log::error!("session changed during registration approval");
+        if self.operation_is_cancelled() || !self.session.verify_matches_current() {
+            log::error!("session changed or operation cancelled during registration approval");
             return Err(ErrorStatus::OperationDenied);
         }
 
@@ -600,7 +598,7 @@ impl Authenticator {
         let response = encode_response(
             cbor!({
                 1 => "none",
-                2 => Value::Bytes(auth_data),
+                2 => byte_string(auth_data),
                 3 => {},
             })
             .unwrap(),
@@ -687,21 +685,7 @@ impl Authenticator {
                 None,
             );
 
-            let mut user = vec![(
-                Value::Text("id".to_owned()),
-                Value::Bytes(credential.user_handle.clone()),
-            )];
-            if user_verified {
-                if let Some(name) = &credential.user_name {
-                    user.push((Value::Text("name".to_owned()), Value::Text(name.clone())));
-                }
-                if let Some(display_name) = &credential.user_display_name {
-                    user.push((
-                        Value::Text("displayName".to_owned()),
-                        Value::Text(display_name.clone()),
-                    ));
-                }
-            }
+            let user = credential_user_entity(credential, user_verified);
 
             (
                 auth_data,
@@ -812,21 +796,7 @@ impl Authenticator {
         let credential_key = credential.key.clone();
         let credential_policy = credential.policy.clone();
         let credential_authority = credential.recovery.clone();
-        let user_handle = credential.user_handle.clone();
-        let user_name = credential.user_name.clone();
-        let user_display_name = credential.user_display_name.clone();
-        let mut user = vec![(Value::Text("id".to_owned()), Value::Bytes(user_handle))];
-        if pending.user_verified {
-            if let Some(name) = &user_name {
-                user.push((Value::Text("name".to_owned()), Value::Text(name.clone())));
-            }
-            if let Some(display_name) = &user_display_name {
-                user.push((
-                    Value::Text("displayName".to_owned()),
-                    Value::Text(display_name.clone()),
-                ));
-            }
-        }
+        let user = credential_user_entity(credential, pending.user_verified);
 
         let mut signed_data = auth_data.clone();
         signed_data.extend_from_slice(&pending.client_data_hash);
@@ -892,11 +862,13 @@ impl Authenticator {
                         .as_ref()
                         .map_or(PIN_RETRIES, |pin| pin.retries),
                 );
-                let mut response = vec![(Value::Integer(3.into()), Value::Integer(retries.into()))];
-                if self.consecutive_pin_mismatches >= 3 {
-                    response.push((Value::Integer(4.into()), Value::Bool(true)));
+                let response = if self.consecutive_pin_mismatches >= 3 {
+                    cbor!({ 3 => retries, 4 => true })
+                } else {
+                    cbor!({ 3 => retries })
                 }
-                Ok(encode_response(Value::Map(response)))
+                .expect("PIN retries response");
+                Ok(encode_response(response))
             }
             2 => {
                 self.key_agreement = Some(EphemeralSecret::generate());
@@ -1175,7 +1147,7 @@ impl Authenticator {
         })?;
         self.credentials.remove(index);
         self.management = None;
-        Ok(encode_response(Value::Map(Vec::new())))
+        Ok(encode_empty_response())
     }
 
     fn update_user_information(
@@ -1201,7 +1173,7 @@ impl Authenticator {
             .map(str::to_owned);
         self.save_credentials();
         self.management = None;
-        Ok(encode_response(Value::Map(Vec::new())))
+        Ok(encode_empty_response())
     }
 
     fn set_pin(
@@ -1232,7 +1204,7 @@ impl Authenticator {
         };
         self.persist_client_pin(&state)?;
         self.client_pin = Some(state);
-        Ok(encode_response(Value::Map(Vec::new())))
+        Ok(encode_empty_response())
     }
 
     fn change_pin(
@@ -1271,7 +1243,7 @@ impl Authenticator {
         self.persist_client_pin(&state)?;
         self.client_pin = Some(state);
         self.pin_uv_auth_token = None;
-        Ok(encode_response(Value::Map(Vec::new())))
+        Ok(encode_empty_response())
     }
 
     fn get_pin_uv_auth_token(
@@ -1303,7 +1275,7 @@ impl Authenticator {
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
         Ok(encode_response(
             cbor!({
-                2 => Value::Bytes(encrypted_token),
+                2 => byte_string(encrypted_token),
             })
             .unwrap(),
         ))
@@ -1320,10 +1292,7 @@ impl Authenticator {
             || "Verify identity for a FIDO2 operation".to_owned(),
             |rp_id| format!("Verify identity for FIDO2 operations at {rp_id}"),
         );
-        if !self.session.verify_matches_current()
-            || !self.approval.approve(&prompt, &self.session)
-            || !self.session.verify_matches_current()
-        {
+        if !self.user_presence_approved(&prompt, "UV token issuance") {
             return Err(ErrorStatus::OperationDenied);
         }
         let (aes_key, _mac_key) = self.pin_uv_keys(key_agreement)?;
@@ -1343,7 +1312,7 @@ impl Authenticator {
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
         Ok(encode_response(
             cbor!({
-                2 => Value::Bytes(encrypted_token),
+                2 => byte_string(encrypted_token),
             })
             .unwrap(),
         ))
@@ -1473,10 +1442,7 @@ impl Authenticator {
     }
 
     fn zero_length_pin_uv_auth(&self, prompt: &str) -> Result<Vec<u8>, ErrorStatus> {
-        if !self.session.verify_matches_current()
-            || !self.approval.approve(prompt, &self.session)
-            || !self.session.verify_matches_current()
-        {
+        if !self.user_presence_approved(prompt, "authenticator selection") {
             return Err(ErrorStatus::OperationDenied);
         }
         Err(if self.client_pin.is_some() {
@@ -1729,7 +1695,7 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
         cbor!({
             1 => ["FIDO_2_1", "FIDO_2_0"],
             2 => ["credProps"],
-            3 => Value::Bytes(AAGUID.to_vec()),
+            3 => byte_string(AAGUID.to_vec()),
             4 => {
                 "plat" => false,
                 "rk" => true,
@@ -2204,107 +2170,100 @@ fn validate_management_user(
     Ok(user)
 }
 
-fn encode_rp_response(credential: &Credential, total: Option<usize>) -> Vec<u8> {
-    let mut rp = vec![(
-        Value::Text("id".to_owned()),
-        Value::Text(credential.rp_id.clone()),
-    )];
-    rp.push((
-        Value::Text("name".to_owned()),
-        Value::Text(credential.rp_id.clone()),
-    ));
-    let mut response = vec![
-        (Value::Integer(3.into()), Value::Map(rp)),
-        (
-            Value::Integer(4.into()),
-            Value::Bytes(Sha256::digest(credential.rp_id.as_bytes()).to_vec()),
-        ),
-    ];
-    if let Some(total) = total {
-        response.push((
-            Value::Integer(5.into()),
-            Value::Integer((total as u64).into()),
-        ));
+fn credential_user_entity(credential: &Credential, include_names: bool) -> Value {
+    match (
+        include_names
+            .then_some(credential.user_name.as_deref())
+            .flatten(),
+        include_names
+            .then_some(credential.user_display_name.as_deref())
+            .flatten(),
+    ) {
+        (Some(name), Some(display_name)) => cbor!({
+            "id" => byte_string(credential.user_handle.clone()),
+            "name" => name,
+            "displayName" => display_name,
+        }),
+        (Some(name), None) => cbor!({
+            "id" => byte_string(credential.user_handle.clone()),
+            "name" => name,
+        }),
+        (None, Some(display_name)) => cbor!({
+            "id" => byte_string(credential.user_handle.clone()),
+            "displayName" => display_name,
+        }),
+        (None, None) => cbor!({ "id" => byte_string(credential.user_handle.clone()) }),
     }
-    encode_response(Value::Map(response))
+    .expect("credential user entity")
+}
+
+fn encode_rp_response(credential: &Credential, total: Option<usize>) -> Vec<u8> {
+    let response = match total {
+        Some(total) => cbor!({
+            3 => { "id" => credential.rp_id.as_str(), "name" => credential.rp_id.as_str() },
+            4 => byte_string(Sha256::digest(credential.rp_id.as_bytes()).to_vec()),
+            5 => total as u64,
+        }),
+        None => cbor!({
+            3 => { "id" => credential.rp_id.as_str(), "name" => credential.rp_id.as_str() },
+            4 => byte_string(Sha256::digest(credential.rp_id.as_bytes()).to_vec()),
+        }),
+    }
+    .expect("credential-management RP response");
+    encode_response(response)
 }
 
 fn encode_credential_management_response(credential: &Credential, total: Option<usize>) -> Vec<u8> {
-    let mut user = vec![(
-        Value::Text("id".to_owned()),
-        Value::Bytes(credential.user_handle.clone()),
-    )];
-    if let Some(name) = &credential.user_name {
-        user.push((Value::Text("name".to_owned()), Value::Text(name.clone())));
+    let user = credential_user_entity(credential, true);
+    let public_key = cose_credential_public_key(&credential.key);
+    let response = match total {
+        Some(total) => cbor!({
+            6 => user,
+            7 => { "type" => "public-key", "id" => byte_string(credential.id.clone()) },
+            8 => public_key,
+            9 => total as u64,
+        }),
+        None => cbor!({
+            6 => user,
+            7 => { "type" => "public-key", "id" => byte_string(credential.id.clone()) },
+            8 => public_key,
+        }),
     }
-    if let Some(display_name) = &credential.user_display_name {
-        user.push((
-            Value::Text("displayName".to_owned()),
-            Value::Text(display_name.clone()),
-        ));
-    }
-    let mut response = vec![
-        (Value::Integer(6.into()), Value::Map(user)),
-        (
-            Value::Integer(7.into()),
-            Value::Map(vec![
-                (
-                    Value::Text("type".to_owned()),
-                    Value::Text("public-key".to_owned()),
-                ),
-                (
-                    Value::Text("id".to_owned()),
-                    Value::Bytes(credential.id.clone()),
-                ),
-            ]),
-        ),
-        (
-            Value::Integer(8.into()),
-            cose_credential_public_key(&credential.key),
-        ),
-    ];
-    if let Some(total) = total {
-        response.push((
-            Value::Integer(9.into()),
-            Value::Integer((total as u64).into()),
-        ));
-    }
-    encode_response(Value::Map(response))
+    .expect("credential-management credential response");
+    encode_response(response)
 }
 
 fn encode_assertion_response(
     credential_id: Vec<u8>,
     auth_data: Vec<u8>,
     signature: Vec<u8>,
-    user: Option<Vec<(Value, Value)>>,
+    user: Option<Value>,
     total_credentials: usize,
 ) -> Vec<u8> {
-    let mut response = vec![
-        (
-            Value::Integer(1.into()),
-            Value::Map(vec![
-                (
-                    Value::Text("type".to_owned()),
-                    Value::Text("public-key".to_owned()),
-                ),
-                (Value::Text("id".to_owned()), Value::Bytes(credential_id)),
-            ]),
-        ),
-        (Value::Integer(2.into()), Value::Bytes(auth_data)),
-        (Value::Integer(3.into()), Value::Bytes(signature)),
-    ];
-
+    let descriptor = cbor!({
+        "type" => "public-key",
+        "id" => byte_string(credential_id),
+    })
+    .expect("assertion credential descriptor");
+    let mut response = cbor_map_entries(
+        cbor!({
+            1 => descriptor,
+            2 => byte_string(auth_data),
+            3 => byte_string(signature),
+        })
+        .expect("assertion response"),
+    );
     if let Some(user) = user {
-        response.push((Value::Integer(4.into()), Value::Map(user)));
-    }
-    if total_credentials > 1 {
-        response.push((
-            Value::Integer(5.into()),
-            Value::Integer((total_credentials as u64).into()),
+        response.extend(cbor_map_entries(
+            cbor!({ 4 => user }).expect("assertion user"),
         ));
     }
-
-    encode_response(Value::Map(response))
+    if total_credentials > 1 {
+        response.extend(cbor_map_entries(
+            cbor!({ 5 => total_credentials as u64 }).expect("assertion credential count"),
+        ));
+    }
+    encode_response(map(response))
 }
 
 fn sign_credential(
@@ -2372,7 +2331,7 @@ fn fill_random(bytes: &mut [u8]) {
 fn management_auth_message(sub_command: i128, params: Option<&[(Value, Value)]>) -> Vec<u8> {
     let mut encoded = vec![sub_command as u8];
     if let Some(params) = params {
-        let value = canonicalize_value(Value::Map(params.to_vec()));
+        let value = canonicalize_value(map(params.to_vec()));
         ciborium::into_writer(&value, &mut encoded).expect("serializing management parameters");
     }
     encoded

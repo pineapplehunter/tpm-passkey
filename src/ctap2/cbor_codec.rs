@@ -1,4 +1,4 @@
-use ciborium::value::Value;
+use ciborium::{cbor, value::Value};
 
 use super::ErrorStatus;
 
@@ -116,6 +116,25 @@ pub(super) fn optional_map(
                 .ok_or(ErrorStatus::InvalidCbor)
         })
         .transpose()
+}
+
+pub(super) fn byte_string(bytes: impl Into<Vec<u8>>) -> Value {
+    Value::Bytes(bytes.into())
+}
+
+pub(super) fn map(entries: Vec<(Value, Value)>) -> Value {
+    Value::Map(entries)
+}
+
+pub(super) fn cbor_map_entries(value: Value) -> Vec<(Value, Value)> {
+    let Value::Map(entries) = value else {
+        unreachable!("cbor! map expression returned a non-map value");
+    };
+    entries
+}
+
+pub(super) fn encode_empty_response() -> Vec<u8> {
+    encode_response(cbor!({}).expect("empty response map"))
 }
 
 pub(super) fn encode_response(response: Value) -> Vec<u8> {

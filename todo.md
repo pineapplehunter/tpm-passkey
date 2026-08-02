@@ -55,10 +55,10 @@
 
 - [x] Replace hand-built `Value::Map`/`Value::Array` CTAP test data with the `cbor!` macro.
 - [x] Keep dynamic request helpers concise and preserve strict wire-shape assertions.
-- [ ] Replace remaining hand-built CBOR `Value::` construction with `cbor!` where the macro is clearer.
-- [ ] Remove tests without a useful behavioral assertion.
-- [ ] Deduplicate and merge overlapping tests where one focused test communicates the behavior better.
-- [ ] Run formatting, Rust checks, clippy, and the NixOS VM test after cleanup.
+- [x] Replace remaining hand-built CBOR `Value::` construction with `cbor!` where the macro is clearer.
+- [x] Remove tests without a useful behavioral assertion.
+- [x] Deduplicate and merge overlapping tests where one focused test communicates the behavior better.
+- [x] Run formatting, Rust checks, clippy, and the NixOS VM test after cleanup.
 
 ## CTAP 2.2 systematic audit
 
@@ -72,4 +72,4 @@
   - [x] Choose an asynchronous command-execution design so the UHID loop can emit keepalives and receive cancellation while approval/TPM work is blocked.
   - [x] Enforce global transaction arbitration, timeout, resynchronization, packet sequencing, and transport errors.
   - [x] Implement status-only CANCEL handling and `CTAP2_ERR_KEEPALIVE_CANCEL` for cancelled CBOR work.
-- [ ] Run final Rust and NixOS validation.
+- [x] Run final Rust and NixOS validation.

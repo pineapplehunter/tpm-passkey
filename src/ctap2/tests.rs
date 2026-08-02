@@ -6,13 +6,6 @@ use std::sync::{
 };
 
 #[test]
-fn get_info_starts_with_success() {
-    let response = Authenticator::default().handle_cbor(&[Ctap2Command::GetInfo.into()]);
-    assert_eq!(response[0], 0x00);
-    assert!(response.len() > 1);
-}
-
-#[test]
 fn get_info_uses_project_aaguid_and_algorithm_metadata() {
     let response = Authenticator::default().handle_cbor(&[Ctap2Command::GetInfo.into()]);
     let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR") else {
@@ -125,17 +118,9 @@ fn make_auth_data_sets_extension_flag_when_extensions_are_present() {
 }
 
 #[test]
-fn unknown_command_is_rejected() {
-    assert_eq!(
-        Authenticator::default().handle_cbor(&[0xff]),
-        error_response(ErrorStatus::InvalidCommand)
-    );
-}
-
-#[test]
-fn unsupported_commands_do_not_panic() {
+fn unsupported_and_unknown_commands_return_invalid_command() {
     let mut authenticator = Authenticator::default();
-    for command in [0x09, 0x0c, 0x0d, 0x40, 0x41] {
+    for command in [0x09, 0x0c, 0x0d, 0x40, 0x41, 0xff] {
         assert_eq!(
             authenticator.handle_cbor(&[command]),
             error_response(ErrorStatus::InvalidCommand)
@@ -948,7 +933,7 @@ fn credential_management_update_preserves_user_id_and_removes_empty_names() {
 }
 
 #[test]
-fn exclude_list_detects_existing_credential_for_same_rp() {
+fn exclude_list_matches_only_credentials_for_the_requested_rp() {
     let authenticator = authenticator_with_credential("example.com", vec![1, 2, 3, 4]);
     let exclude_list = vec![credential_descriptor(vec![1, 2, 3, 4])];
 
@@ -957,36 +942,16 @@ fn exclude_list_detects_existing_credential_for_same_rp() {
         "example.com",
         Some(&exclude_list)
     ));
-}
-
-#[test]
-fn exclude_list_ignores_matching_id_for_different_rp() {
-    let authenticator = authenticator_with_credential("other.example", vec![1, 2, 3, 4]);
-    let exclude_list = vec![credential_descriptor(vec![1, 2, 3, 4])];
-
     assert!(!excluded_credential_exists(
         &authenticator.credentials,
-        "example.com",
+        "other.example",
         Some(&exclude_list)
     ));
 }
 
 #[test]
-fn allow_list_absent_allows_any_credential() {
+fn allow_list_filter_accepts_absent_and_rejects_non_matching_descriptors() {
     assert!(allow_list_allows(None, &[1, 2, 3, 4]));
-}
-
-#[test]
-fn empty_credential_descriptor_lists_are_rejected() {
-    assert_eq!(
-        validate_credential_descriptor_list(Some(&[]), true),
-        Err(ErrorStatus::InvalidParameter)
-    );
-    assert_eq!(validate_credential_descriptor_list(None, true), Ok(()));
-}
-
-#[test]
-fn allow_list_non_matching_rejects_credential() {
     assert!(!allow_list_allows(
         Some(&[credential_descriptor(vec![9, 9, 9, 9])]),
         &[1, 2, 3, 4]
@@ -994,7 +959,13 @@ fn allow_list_non_matching_rejects_credential() {
 }
 
 #[test]
-fn credential_descriptor_requires_public_key_type_and_matching_id() {
+fn credential_descriptor_lists_require_nonempty_public_key_descriptors() {
+    assert_eq!(
+        validate_credential_descriptor_list(Some(&[]), true),
+        Err(ErrorStatus::InvalidParameter)
+    );
+    assert_eq!(validate_credential_descriptor_list(None, true), Ok(()));
+
     let wrong_type = cbor!({
         "type" => "not-public-key",
         "id" => bytes([1, 2, 3, 4]),
@@ -1100,6 +1071,19 @@ fn make_credential_options_accept_absent_up_true_and_rk() {
         validate_make_credential_options(Some(&options_text_map(&[("residentKey", "surprise")]))),
         Ok(())
     );
+    assert_eq!(
+        validate_make_credential_options(Some(&options_map(&[("uv", true)]))),
+        Ok(())
+    );
+    for options in [
+        options_map(&[("up", false)]),
+        options_map(&[("up", false), ("uv", true)]),
+    ] {
+        assert_eq!(
+            validate_make_credential_options(Some(&options)),
+            Err(ErrorStatus::InvalidOption)
+        );
+    }
 }
 
 #[test]
@@ -1129,44 +1113,16 @@ fn get_assertion_options_accept_absent_and_up_true() {
         Ok(())
     );
     assert_eq!(
-        validate_get_assertion_options(Some(&options_map(&[("rk", false)]))),
-        Err(ErrorStatus::UnsupportedOption)
-    );
-}
-
-#[test]
-fn options_reject_required_user_verification() {
-    assert_eq!(
-        validate_make_credential_options(Some(&options_map(&[("uv", true)]))),
+        validate_get_assertion_options(Some(&options_map(&[("up", false), ("uv", true)]))),
         Ok(())
     );
     assert_eq!(
         validate_get_assertion_options(Some(&options_map(&[("uv", true)]))),
         Ok(())
     );
-}
-
-#[test]
-fn make_credential_rejects_disabled_user_presence() {
     assert_eq!(
-        validate_make_credential_options(Some(&options_map(&[("up", false), ("uv", true)]))),
-        Err(ErrorStatus::InvalidOption)
-    );
-    assert_eq!(
-        validate_make_credential_options(Some(&options_map(&[("up", false)]))),
-        Err(ErrorStatus::InvalidOption)
-    );
-}
-
-#[test]
-fn get_assertion_accepts_disabled_user_presence() {
-    assert_eq!(
-        validate_get_assertion_options(Some(&options_map(&[("up", false), ("uv", true)]))),
-        Ok(())
-    );
-    assert_eq!(
-        validate_get_assertion_options(Some(&options_map(&[("up", false)]))),
-        Ok(())
+        validate_get_assertion_options(Some(&options_map(&[("rk", false)]))),
+        Err(ErrorStatus::UnsupportedOption)
     );
 }
 

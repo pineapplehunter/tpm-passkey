@@ -1,4 +1,6 @@
-use ciborium::value::Value;
+use ciborium::{cbor, value::Value};
+
+use super::cbor_codec::byte_string;
 use sha2::{Digest, Sha256};
 
 use super::{AAGUID, COSE_ALG_ES256};
@@ -31,13 +33,7 @@ pub(super) fn make_auth_data(
 }
 
 pub(super) fn cred_props_extension(discoverable: bool) -> Value {
-    Value::Map(vec![(
-        Value::Text("credProps".to_owned()),
-        Value::Map(vec![(
-            Value::Text("rk".to_owned()),
-            Value::Bool(discoverable),
-        )]),
-    )])
+    cbor!({ "credProps" => { "rk" => discoverable } }).expect("credProps extension")
 }
 
 pub(super) fn cose_credential_public_key(key: &tpm::TpmCredential) -> Value {
@@ -45,24 +41,23 @@ pub(super) fn cose_credential_public_key(key: &tpm::TpmCredential) -> Value {
 }
 
 pub(super) fn cose_public_key_coordinates(x: Vec<u8>, y: Vec<u8>) -> Value {
-    Value::Map(vec![
-        (Value::Integer(1.into()), Value::Integer(2.into())),
-        (
-            Value::Integer(3.into()),
-            Value::Integer(COSE_ALG_ES256.into()),
-        ),
-        (Value::Integer((-1).into()), Value::Integer(1.into())),
-        (Value::Integer((-2).into()), Value::Bytes(x)),
-        (Value::Integer((-3).into()), Value::Bytes(y)),
-    ])
+    cbor!({
+        1 => 2,
+        3 => COSE_ALG_ES256,
+        -1 => 1,
+        -2 => byte_string(x),
+        -3 => byte_string(y),
+    })
+    .expect("COSE credential public key")
 }
 
 pub(super) fn cose_key_agreement_coordinates(x: Vec<u8>, y: Vec<u8>) -> Value {
-    Value::Map(vec![
-        (Value::Integer(1.into()), Value::Integer(2.into())),
-        (Value::Integer(3.into()), Value::Integer((-25).into())),
-        (Value::Integer((-1).into()), Value::Integer(1.into())),
-        (Value::Integer((-2).into()), Value::Bytes(x)),
-        (Value::Integer((-3).into()), Value::Bytes(y)),
-    ])
+    cbor!({
+        1 => 2,
+        3 => -25,
+        -1 => 1,
+        -2 => byte_string(x),
+        -3 => byte_string(y),
+    })
+    .expect("COSE key agreement")
 }

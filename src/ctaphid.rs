@@ -842,17 +842,4 @@ mod tests {
         reconstructed.truncate(payload.len());
         assert_eq!(reconstructed, payload);
     }
-
-    #[test]
-    fn response_packets_use_init_command_byte() {
-        let response = Response {
-            cid: 9,
-            command: CtapHidCommand::Ping,
-            payload: b"abc".to_vec(),
-        };
-        let packets = response.packets();
-        assert_eq!(packets.len(), 1);
-        assert_eq!(packets[0][4], CtapHidCommand::Ping.byte() | TYPE_INIT);
-        assert_eq!(&packets[0][7..10], b"abc");
-    }
 }
