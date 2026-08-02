@@ -22,4 +22,4 @@
 - [x] Separate lifecycle, command, packet, and trace-level messages.
 - [x] Use consistent key-value context and name ClientPIN subcommands.
 - [x] Remove sensitive or misleading payload/write diagnostics.
-- [ ] Document log levels and validate the changes.
+- [x] Document log levels and validate the changes.
