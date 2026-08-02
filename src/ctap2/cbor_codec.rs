@@ -62,6 +62,62 @@ pub(super) fn map_map<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&[(Va
         .map(Vec::as_slice)
 }
 
+pub(super) fn optional_bytes(
+    map: &[(Value, Value)],
+    key: i128,
+) -> Result<Option<&[u8]>, ErrorStatus> {
+    map_value(map, key)
+        .map(|value| {
+            value
+                .as_bytes()
+                .map(Vec::as_slice)
+                .ok_or(ErrorStatus::InvalidCbor)
+        })
+        .transpose()
+}
+
+pub(super) fn optional_integer(
+    map: &[(Value, Value)],
+    key: i128,
+) -> Result<Option<i128>, ErrorStatus> {
+    map_value(map, key)
+        .map(|value| {
+            value
+                .as_integer()
+                .map(i128::from)
+                .ok_or(ErrorStatus::InvalidCbor)
+        })
+        .transpose()
+}
+
+pub(super) fn optional_array(
+    map: &[(Value, Value)],
+    key: i128,
+) -> Result<Option<&[Value]>, ErrorStatus> {
+    map_value(map, key)
+        .map(|value| {
+            value
+                .as_array()
+                .map(Vec::as_slice)
+                .ok_or(ErrorStatus::InvalidCbor)
+        })
+        .transpose()
+}
+
+pub(super) fn optional_map(
+    map: &[(Value, Value)],
+    key: i128,
+) -> Result<Option<&[(Value, Value)]>, ErrorStatus> {
+    map_value(map, key)
+        .map(|value| {
+            value
+                .as_map()
+                .map(Vec::as_slice)
+                .ok_or(ErrorStatus::InvalidCbor)
+        })
+        .transpose()
+}
+
 pub(super) fn encode_response(response: Value) -> Vec<u8> {
     let mut payload = vec![0x00];
     let response = canonicalize_value(response);

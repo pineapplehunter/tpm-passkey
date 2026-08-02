@@ -69,12 +69,6 @@ pub struct Authenticator {
     key_agreement: Option<EphemeralSecret>,
     pin_uv_auth_token: Option<PinUvAuthToken>,
     consecutive_pin_mismatches: u8,
-    /// Set when `authenticatorSelection` (or a UV gesture) satisfied user
-    /// verification for the current transaction. CTAP2.1 routes UV through
-    /// `authenticatorSelection` when the authenticator advertises `uv` but
-    /// has no clientPIN; the resulting UV must be reflected in the auth-data
-    /// flags of the following makeCredential / getAssertion.
-    uv_satisfied: bool,
     management: Option<ManagementState>,
 }
 
@@ -153,7 +147,6 @@ impl Authenticator {
             key_agreement: None,
             pin_uv_auth_token: None,
             consecutive_pin_mismatches: 0,
-            uv_satisfied: false,
             management: None,
         }
     }
@@ -266,7 +259,6 @@ impl Authenticator {
         self.management = None;
         self.pin_uv_auth_token = None;
         self.key_agreement = None;
-        self.uv_satisfied = false;
     }
 
     /// authenticatorReset (0x07): factory-resets the authenticator, deleting all
@@ -298,11 +290,6 @@ impl Authenticator {
         if !self.assertion_approved("selection") {
             return Err(ErrorStatus::OperationDenied);
         }
-        // CTAP2.1 uses authenticatorSelection as the UV gesture when the
-        // authenticator advertises `uv` but has no clientPIN. Record that UV
-        // was satisfied so the following makeCredential / getAssertion can set
-        // the UV flag in their auth-data.
-        self.uv_satisfied = true;
         Ok(encode_response(Value::Map(Vec::new())))
     }
 
@@ -333,12 +320,15 @@ impl Authenticator {
         let rp = map_map(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
         let user = map_map(&request, 3).ok_or(ErrorStatus::MissingParameter)?;
         let params = map_array(&request, 4).ok_or(ErrorStatus::MissingParameter)?;
-        let cred_props_requested = map_map(&request, 6)
-            .is_some_and(|extensions| map_bool(extensions, "credProps") == Some(true));
-        validate_attestation_conveyance(map_text(&request, 8))?;
-
-        if !params.iter().any(supports_es256) {
-            return Err(ErrorStatus::UnsupportedAlgorithm);
+        validate_pub_key_cred_params(params)?;
+        let exclude_list = optional_array(&request, 5)?;
+        let extensions = optional_map(&request, 6)?;
+        validate_cred_props_extension(extensions)?;
+        let cred_props_requested =
+            extensions.is_some_and(|extensions| map_bool(extensions, "credProps") == Some(true));
+        validate_attestation_formats(optional_array(&request, 11)?)?;
+        if map_value(&request, 10).is_some() {
+            return Err(ErrorStatus::InvalidParameter);
         }
 
         let rp_id = map_text(rp, "id").ok_or(ErrorStatus::MissingParameter)?;
@@ -346,28 +336,34 @@ impl Authenticator {
         let user_handle = map_bytes(user, "id").ok_or(ErrorStatus::MissingParameter)?;
         let user_name = map_text(user, "name");
         let user_display_name = map_text(user, "displayName");
+        let pin_uv_auth_param = optional_bytes(&request, 8)?;
+        let pin_uv_auth_protocol = optional_integer(&request, 9)?;
+        if pin_uv_auth_param == Some(&[]) {
+            return self.zero_length_pin_uv_auth("Select authenticator for registration");
+        }
+        let pin_uv_auth_present = pin_uv_auth_param.is_some();
         let user_verified = self.validate_pin_uv_auth(
-            map_integer(&request, 9),
-            map_bytes(&request, 8),
+            pin_uv_auth_protocol,
+            pin_uv_auth_param,
             client_data_hash,
             Ctap2PermissionFlags::MAKE_CREDENTIAL,
             Some(rp_id),
         )?;
-        let options = map_map(&request, 7);
+        let options = optional_map(&request, 7)?;
         if let Some(options) = options {
             log::debug!("makeCredential options: {options:?}");
         }
         validate_make_credential_options(options)?;
-        let uv_requested = options.is_some_and(|options| map_bool(options, "uv") == Some(true));
-        let discoverable = options.and_then(|options| map_bool(options, "rk")) == Some(true)
-            || options.and_then(|options| map_bool(options, "requireResidentKey")) == Some(true)
-            || options
-                .and_then(|options| map_text(options, "residentKey"))
-                .is_some_and(|value| value != "discouraged");
-        validate_credential_descriptor_list(map_array(&request, 5))?;
-        if excluded_credential_exists(&self.credentials, rp_id, map_array(&request, 5)) {
-            log::info!("makeCredential excluded existing credential for rp_id={rp_id}");
-            return Err(ErrorStatus::CredentialExcluded);
+        let uv_requested = !pin_uv_auth_present
+            && options.is_some_and(|options| map_bool(options, "uv") == Some(true));
+        let discoverable = options.and_then(|options| map_bool(options, "rk")) == Some(true);
+        validate_credential_descriptor_list(exclude_list, true)?;
+        if discoverable && !user_verified && !uv_requested {
+            return Err(if self.client_pin.is_some() {
+                ErrorStatus::PuatRequired
+            } else {
+                ErrorStatus::OperationDenied
+            });
         }
 
         if !self.session.verify_matches_current() {
@@ -385,7 +381,13 @@ impl Authenticator {
         ) {
             return Err(ErrorStatus::OperationDenied);
         }
-        let user_verified = user_verified || uv_requested || self.uv_satisfied;
+        let user_verified = user_verified || uv_requested;
+        self.consume_pin_uv_auth_token_after_user_presence();
+
+        if excluded_credential_exists(&self.credentials, rp_id, exclude_list) {
+            log::info!("makeCredential excluded existing credential for rp_id={rp_id}");
+            return Err(ErrorStatus::CredentialExcluded);
+        }
 
         if !self.session.verify_matches_current() {
             log::error!("session changed during registration approval");
@@ -521,19 +523,27 @@ impl Authenticator {
         let rp_id = map_text(&request, 1).ok_or(ErrorStatus::MissingParameter)?;
         let client_data_hash = map_bytes(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
         validate_client_data_hash(client_data_hash)?;
+        let pin_uv_auth_param = optional_bytes(&request, 6)?;
+        let pin_uv_auth_protocol = optional_integer(&request, 7)?;
+        if pin_uv_auth_param == Some(&[]) {
+            return self.zero_length_pin_uv_auth("Select authenticator for assertion");
+        }
+        let pin_uv_auth_present = pin_uv_auth_param.is_some();
         let user_verified = self.validate_pin_uv_auth(
-            map_integer(&request, 7),
-            map_bytes(&request, 6),
+            pin_uv_auth_protocol,
+            pin_uv_auth_param,
             client_data_hash,
             Ctap2PermissionFlags::GET_ASSERTION,
             Some(rp_id),
         )?;
-        let allow_list = map_array(&request, 3);
-        let options = map_map(&request, 5);
+        let allow_list = optional_array(&request, 3)?;
+        let _extensions = optional_map(&request, 4)?;
+        let options = optional_map(&request, 5)?;
         validate_get_assertion_options(options)?;
-        let uv_requested = options.is_some_and(|options| map_bool(options, "uv") == Some(true));
+        let uv_requested = !pin_uv_auth_present
+            && options.is_some_and(|options| map_bool(options, "uv") == Some(true));
         let user_presence = options.and_then(|options| map_bool(options, "up")) != Some(false);
-        validate_credential_descriptor_list(allow_list)?;
+        validate_credential_descriptor_list(allow_list, true)?;
 
         // Reload credentials from disk when running as daemon (tpm_path is set)
         // to pick up management-side modifications (e.g., update-pcr-reference).
@@ -548,9 +558,13 @@ impl Authenticator {
         if (user_presence || uv_requested) && !self.assertion_approved(rp_id) {
             return Err(ErrorStatus::OperationDenied);
         }
-        let user_verified = user_verified || uv_requested || self.uv_satisfied;
+        let user_verified = user_verified || uv_requested;
+        let user_presence = user_presence || uv_requested;
+        if user_presence {
+            self.consume_pin_uv_auth_token_after_user_presence();
+        }
 
-        self.pending_assertion = if remaining_indexes.is_empty() {
+        self.pending_assertion = if remaining_indexes.is_empty() || allow_list.is_some() {
             None
         } else {
             Some(PendingAssertion {
@@ -641,8 +655,12 @@ impl Authenticator {
             credential_id,
             auth_data,
             signature,
-            user,
-            credential_indexes.len(),
+            allow_list.is_none().then_some(user),
+            if allow_list.is_none() {
+                credential_indexes.len()
+            } else {
+                0
+            },
         ))
     }
 
@@ -652,19 +670,19 @@ impl Authenticator {
         }
 
         let Some(pending) = self.pending_assertion.take() else {
-            return Err(ErrorStatus::NoCredentials);
+            return Err(ErrorStatus::NotAllowed);
         };
 
         if pending.created_at.elapsed() > Duration::from_secs(30)
             || pending.session_uid != self.session.uid
             || !self.session.verify_matches_current()
         {
-            return Err(ErrorStatus::OperationDenied);
+            return Err(ErrorStatus::NotAllowed);
         }
 
         let Some((&credential_index, remaining_indexes)) = pending.credential_indexes.split_first()
         else {
-            return Err(ErrorStatus::NoCredentials);
+            return Err(ErrorStatus::NotAllowed);
         };
 
         self.pending_assertion = if remaining_indexes.is_empty() {
@@ -675,7 +693,7 @@ impl Authenticator {
                 client_data_hash: pending.client_data_hash.clone(),
                 credential_indexes: remaining_indexes.to_vec(),
                 total_credentials: pending.total_credentials,
-                created_at: pending.created_at,
+                created_at: Instant::now(),
                 session_uid: pending.session_uid,
                 user_presence: pending.user_presence,
                 user_verified: pending.user_verified,
@@ -745,7 +763,7 @@ impl Authenticator {
             credential_id,
             auth_data,
             signature,
-            user,
+            Some(user),
             0,
         ))
     }
@@ -1275,6 +1293,26 @@ impl Authenticator {
         self.tpm.as_mut()
     }
 
+    fn zero_length_pin_uv_auth(&self, prompt: &str) -> Result<Vec<u8>, ErrorStatus> {
+        if !self.session.verify_matches_current()
+            || !self.approval.approve(prompt, &self.session)
+            || !self.session.verify_matches_current()
+        {
+            return Err(ErrorStatus::OperationDenied);
+        }
+        Err(if self.client_pin.is_some() {
+            ErrorStatus::PinInvalid
+        } else {
+            ErrorStatus::PinNotSet
+        })
+    }
+
+    fn consume_pin_uv_auth_token_after_user_presence(&mut self) {
+        if let Some(token) = &mut self.pin_uv_auth_token {
+            token.permissions &= Ctap2PermissionFlags::LARGE_BLOB_WRITE;
+        }
+    }
+
     fn assertion_approved(&mut self, rp_id: &str) -> bool {
         if !self.session.verify_matches_current() {
             log::error!("session changed before assertion approval for {rp_id}");
@@ -1696,31 +1734,75 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
             == 0
 }
 
-fn supports_es256(value: &Value) -> bool {
-    let Value::Map(map) = value else {
-        return false;
-    };
-    map_text(map, "type") == Some("public-key")
-        && map_value(map, "alg")
+fn validate_pub_key_cred_params(params: &[Value]) -> Result<(), ErrorStatus> {
+    let mut supported_algorithm = false;
+    let mut seen = Vec::new();
+    for value in params {
+        let Value::Map(map) = value else {
+            return Err(ErrorStatus::InvalidCbor);
+        };
+        let credential_type = map_text(map, "type").ok_or(ErrorStatus::InvalidCbor)?;
+        let algorithm = map_value(map, "alg")
             .and_then(Value::as_integer)
             .and_then(|integer| i64::try_from(integer).ok())
-            == Some(COSE_ALG_ES256)
+            .ok_or(ErrorStatus::InvalidCbor)?;
+        if seen.contains(&(credential_type, algorithm)) {
+            return Err(ErrorStatus::InvalidCbor);
+        }
+        seen.push((credential_type, algorithm));
+        supported_algorithm |= credential_type == "public-key" && algorithm == COSE_ALG_ES256;
+    }
+    supported_algorithm
+        .then_some(())
+        .ok_or(ErrorStatus::UnsupportedAlgorithm)
+}
+
+fn validate_known_boolean_options(
+    options: &[(Value, Value)],
+    known: &[&str],
+) -> Result<(), ErrorStatus> {
+    for key in known {
+        if let Some(value) = map_value(options, *key)
+            && value.as_bool().is_none()
+        {
+            return Err(ErrorStatus::InvalidCbor);
+        }
+    }
+    Ok(())
 }
 
 fn validate_make_credential_options(options: Option<&[(Value, Value)]>) -> Result<(), ErrorStatus> {
-    validate_common_options(options, false)?;
-    validate_resident_key_options(options)?;
+    let Some(options) = options else {
+        return Ok(());
+    };
+    validate_known_boolean_options(options, &["rk", "up", "uv"])?;
+    if map_bool(options, "up") == Some(false) {
+        return Err(ErrorStatus::InvalidOption);
+    }
     Ok(())
 }
 
 fn validate_get_assertion_options(options: Option<&[(Value, Value)]>) -> Result<(), ErrorStatus> {
-    validate_common_options(options, false)
+    let Some(options) = options else {
+        return Ok(());
+    };
+    validate_known_boolean_options(options, &["up", "uv"])?;
+    if map_value(options, "rk").is_some() {
+        return Err(ErrorStatus::UnsupportedOption);
+    }
+    Ok(())
 }
 
-fn validate_credential_descriptor_list(list: Option<&[Value]>) -> Result<(), ErrorStatus> {
+fn validate_credential_descriptor_list(
+    list: Option<&[Value]>,
+    reject_empty: bool,
+) -> Result<(), ErrorStatus> {
     let Some(list) = list else {
         return Ok(());
     };
+    if reject_empty && list.is_empty() {
+        return Err(ErrorStatus::InvalidParameter);
+    }
 
     for entry in list {
         let Value::Map(map) = entry else {
@@ -1737,61 +1819,27 @@ fn validate_credential_descriptor_list(list: Option<&[Value]>) -> Result<(), Err
     Ok(())
 }
 
-fn validate_common_options(
-    options: Option<&[(Value, Value)]>,
-    reject_user_presence_false: bool,
-) -> Result<(), ErrorStatus> {
-    let Some(options) = options else {
+fn validate_cred_props_extension(extensions: Option<&[(Value, Value)]>) -> Result<(), ErrorStatus> {
+    let Some(extensions) = extensions else {
         return Ok(());
     };
-
-    if map_bool(options, "uv") == Some(true) {
-        log::debug!("ctap2 option uv=true approval=local");
+    if let Some(value) = map_value(extensions, "credProps")
+        && value.as_bool().is_none()
+    {
+        return Err(ErrorStatus::InvalidCbor);
     }
-    if map_bool(options, "up") == Some(false) {
-        log::debug!("ctap2 option up=false");
-        if reject_user_presence_false && map_bool(options, "uv") != Some(true) {
-            log::debug!("ctap2 option rejected reason=up_false_without_uv");
-            return Err(ErrorStatus::UnsupportedOption);
-        }
-    }
-
     Ok(())
 }
 
-fn validate_resident_key_options(options: Option<&[(Value, Value)]>) -> Result<(), ErrorStatus> {
-    let Some(options) = options else {
+fn validate_attestation_formats(formats: Option<&[Value]>) -> Result<(), ErrorStatus> {
+    let Some(formats) = formats else {
         return Ok(());
     };
-
-    if let Some(require_resident_key) = map_bool(options, "requireResidentKey") {
-        log::debug!("ctap2 option requireResidentKey={require_resident_key}");
-    }
-
-    if let Some(resident_key) = map_text(options, "residentKey") {
-        match resident_key {
-            "discouraged" | "preferred" | "required" => {
-                log::debug!("ctap2 option residentKey={resident_key}");
-            }
-            _ => return Err(ErrorStatus::InvalidCbor),
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_attestation_conveyance(attestation: Option<&str>) -> Result<(), ErrorStatus> {
-    let Some(attestation) = attestation else {
-        return Ok(());
-    };
-
-    match attestation {
-        "none" | "indirect" | "direct" | "enterprise" => {
-            log::debug!("ctap2 option attestation={attestation}");
-            Ok(())
-        }
-        _ => Err(ErrorStatus::InvalidCbor),
-    }
+    formats
+        .iter()
+        .all(|format| format.as_text().is_some())
+        .then_some(())
+        .ok_or(ErrorStatus::InvalidCbor)
 }
 
 fn excluded_credential_exists(
@@ -1814,10 +1862,6 @@ fn allow_list_allows(allow_list: Option<&[Value]>, credential_id: &[u8]) -> bool
         return true;
     };
 
-    if allow_list.is_empty() {
-        return true;
-    }
-
     credential_descriptor_list_contains(allow_list, credential_id)
 }
 
@@ -1838,7 +1882,7 @@ fn matching_credential_indexes(
     rp_id: &str,
     allow_list: Option<&[Value]>,
 ) -> Vec<usize> {
-    credentials
+    let mut indexes: Vec<_> = credentials
         .iter()
         .enumerate()
         .filter_map(|(index, credential)| {
@@ -1846,12 +1890,16 @@ fn matching_credential_indexes(
                 return None;
             }
             let matches = match allow_list {
-                Some(list) if !list.is_empty() => allow_list_allows(Some(list), &credential.id),
-                _ => credential.discoverable,
+                Some(list) => allow_list_allows(Some(list), &credential.id),
+                None => credential.discoverable,
             };
             matches.then_some(index)
         })
-        .collect()
+        .collect();
+    if allow_list.is_none() {
+        indexes.reverse();
+    }
+    indexes
 }
 
 fn credential_descriptor_list_contains(list: &[Value], credential_id: &[u8]) -> bool {
@@ -1942,7 +1990,7 @@ fn encode_assertion_response(
     credential_id: Vec<u8>,
     auth_data: Vec<u8>,
     signature: Vec<u8>,
-    user: Vec<(Value, Value)>,
+    user: Option<Vec<(Value, Value)>>,
     total_credentials: usize,
 ) -> Vec<u8> {
     let mut response = vec![
@@ -1958,9 +2006,11 @@ fn encode_assertion_response(
         ),
         (Value::Integer(2.into()), Value::Bytes(auth_data)),
         (Value::Integer(3.into()), Value::Bytes(signature)),
-        (Value::Integer(4.into()), Value::Map(user)),
     ];
 
+    if let Some(user) = user {
+        response.push((Value::Integer(4.into()), Value::Map(user)));
+    }
     if total_credentials > 1 {
         response.push((
             Value::Integer(5.into()),

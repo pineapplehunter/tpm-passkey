@@ -88,7 +88,11 @@ def main():
     assert len(uv_token) == 32
 
     first = register(ctap, rp_id, "resident-user-1", client_pin, uv_token)
-    second = register(ctap, rp_id, "resident-user-2")
+    second_token = client_pin.get_uv_token(
+        permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
+        permissions_rpid=rp_id,
+    )
+    second = register(ctap, rp_id, "resident-user-2", client_pin, second_token)
     credentials = [first.auth_data.credential_data, second.auth_data.credential_data]
 
     for attestation in (first, second):
@@ -107,15 +111,24 @@ def main():
 
     # excludeList must reject a credential already registered for this RP.
     descriptor = {"type": "public-key", "id": credentials[0].credential_id}
+    exclude_token = client_pin.get_uv_token(
+        permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
+        permissions_rpid=rp_id,
+    )
+    exclude_challenge = challenge("excluded-credential")
     expect_ctap_error(
         CtapError.ERR.CREDENTIAL_EXCLUDED,
         lambda: ctap.make_credential(
-            challenge("excluded-credential"),
+            exclude_challenge,
             {"id": rp_id, "name": rp_id},
             {"id": b"excluded", "name": "excluded", "displayName": "Excluded"},
             [{"type": "public-key", "alg": -7}],
             exclude_list=[descriptor],
             options={"rk": True, "up": True, "uv": False},
+            pin_uv_param=client_pin.protocol.authenticate(
+                exclude_token, exclude_challenge
+            ),
+            pin_uv_protocol=client_pin.protocol.VERSION,
         ),
     )
 

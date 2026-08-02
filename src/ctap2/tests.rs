@@ -831,9 +831,12 @@ fn allow_list_absent_allows_any_credential() {
 }
 
 #[test]
-fn allow_list_absent_or_empty_allows_any_credential() {
-    assert!(allow_list_allows(Some(&[]), &[1, 2, 3, 4]));
-    assert!(allow_list_allows(None, &[1, 2, 3, 4]));
+fn empty_credential_descriptor_lists_are_rejected() {
+    assert_eq!(
+        validate_credential_descriptor_list(Some(&[]), true),
+        Err(ErrorStatus::InvalidParameter)
+    );
+    assert_eq!(validate_credential_descriptor_list(None, true), Ok(()));
 }
 
 #[test]
@@ -869,6 +872,73 @@ fn credential_descriptor_requires_public_key_type_and_matching_id() {
 }
 
 #[test]
+fn make_credential_validates_every_algorithm_entry() {
+    let valid = Value::Map(vec![
+        (
+            Value::Text("type".to_owned()),
+            Value::Text("public-key".to_owned()),
+        ),
+        (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
+    ]);
+    let malformed = Value::Map(vec![(
+        Value::Text("type".to_owned()),
+        Value::Text("public-key".to_owned()),
+    )]);
+    assert_eq!(
+        validate_pub_key_cred_params(&[valid.clone(), malformed]),
+        Err(ErrorStatus::InvalidCbor)
+    );
+    assert_eq!(
+        validate_pub_key_cred_params(&[valid.clone(), valid]),
+        Err(ErrorStatus::InvalidCbor)
+    );
+    assert_eq!(
+        validate_pub_key_cred_params(&[Value::Map(vec![
+            (
+                Value::Text("type".to_owned()),
+                Value::Text("public-key".to_owned()),
+            ),
+            (Value::Text("alg".to_owned()), Value::Integer((-257).into())),
+        ])]),
+        Err(ErrorStatus::UnsupportedAlgorithm)
+    );
+}
+
+#[test]
+fn zero_length_pin_uv_auth_uses_selection_statuses() {
+    let store_dir = test_store_dir("zero-pin-uv-auth");
+    let mut authenticator =
+        Authenticator::new_with_approval(store_dir.clone(), None, Box::new(AlwaysApprove));
+    let request = || {
+        ctap_request(
+            Ctap2Command::GetAssertion,
+            Value::Map(vec![
+                (
+                    Value::Integer(1.into()),
+                    Value::Text("example.com".to_owned()),
+                ),
+                (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
+                (Value::Integer(6.into()), Value::Bytes(Vec::new())),
+            ]),
+        )
+    };
+    assert_eq!(
+        authenticator.handle_cbor(&request()),
+        vec![u8::from(ErrorStatus::PinNotSet)]
+    );
+    authenticator.client_pin = Some(ClientPinState {
+        pin_salt: vec![0; 32],
+        pin_verifier: vec![0; 32],
+        retries: PIN_RETRIES,
+    });
+    assert_eq!(
+        authenticator.handle_cbor(&request()),
+        vec![u8::from(ErrorStatus::PinInvalid)]
+    );
+    let _ = std::fs::remove_dir_all(store_dir);
+}
+
+#[test]
 fn make_credential_options_accept_absent_up_true_and_rk() {
     assert_eq!(validate_make_credential_options(None), Ok(()));
     assert_eq!(
@@ -884,6 +954,10 @@ fn make_credential_options_accept_absent_up_true_and_rk() {
         Ok(())
     );
     assert_eq!(
+        validate_make_credential_options(Some(&options_text_map(&[("rk", "yes")]))),
+        Err(ErrorStatus::InvalidCbor)
+    );
+    assert_eq!(
         validate_make_credential_options(Some(&options_map(&[("requireResidentKey", true)]))),
         Ok(())
     );
@@ -895,21 +969,22 @@ fn make_credential_options_accept_absent_up_true_and_rk() {
         validate_make_credential_options(Some(&options_text_map(&[("residentKey", "preferred")]))),
         Ok(())
     );
+    // WebAuthn resident-key fields are not CTAP options and are ignored.
     assert_eq!(
         validate_make_credential_options(Some(&options_text_map(&[("residentKey", "surprise")]))),
-        Err(ErrorStatus::InvalidCbor)
+        Ok(())
     );
 }
 
 #[test]
-fn attestation_conveyance_accepts_common_browser_values() {
-    assert_eq!(validate_attestation_conveyance(None), Ok(()));
-    assert_eq!(validate_attestation_conveyance(Some("none")), Ok(()));
-    assert_eq!(validate_attestation_conveyance(Some("indirect")), Ok(()));
-    assert_eq!(validate_attestation_conveyance(Some("direct")), Ok(()));
-    assert_eq!(validate_attestation_conveyance(Some("enterprise")), Ok(()));
+fn attestation_format_preferences_require_strings() {
+    assert_eq!(validate_attestation_formats(None), Ok(()));
     assert_eq!(
-        validate_attestation_conveyance(Some("unexpected")),
+        validate_attestation_formats(Some(&[Value::Text("none".to_owned())])),
+        Ok(())
+    );
+    assert_eq!(
+        validate_attestation_formats(Some(&[Value::Integer(1.into())])),
         Err(ErrorStatus::InvalidCbor)
     );
 }
@@ -927,6 +1002,10 @@ fn get_assertion_options_accept_absent_and_up_true() {
         validate_get_assertion_options(Some(&options_map(&[("up", false)]))),
         Ok(())
     );
+    assert_eq!(
+        validate_get_assertion_options(Some(&options_map(&[("rk", false)]))),
+        Err(ErrorStatus::UnsupportedOption)
+    );
 }
 
 #[test]
@@ -942,26 +1021,21 @@ fn options_reject_required_user_verification() {
 }
 
 #[test]
-fn options_accept_disabled_user_presence_with_uv() {
-    // Some sites (e.g. github.com) send up=false alongside uv=true on
-    // makeCredential; this combination must also be accepted.
+fn make_credential_rejects_disabled_user_presence() {
     assert_eq!(
         validate_make_credential_options(Some(&options_map(&[("up", false), ("uv", true)]))),
-        Ok(())
+        Err(ErrorStatus::InvalidOption)
     );
     assert_eq!(
-        validate_get_assertion_options(Some(&options_map(&[("up", false), ("uv", true)]))),
-        Ok(())
+        validate_make_credential_options(Some(&options_map(&[("up", false)]))),
+        Err(ErrorStatus::InvalidOption)
     );
 }
 
 #[test]
-fn options_accept_disabled_user_presence_without_uv() {
-    // Regression: webauthn.io sends authenticatorMakeCredential and
-    // authenticatorGetAssertion with up=false but no uv=true.  Both
-    // were rejected as UnsupportedOption.
+fn get_assertion_accepts_disabled_user_presence() {
     assert_eq!(
-        validate_make_credential_options(Some(&options_map(&[("up", false)]))),
+        validate_get_assertion_options(Some(&options_map(&[("up", false), ("uv", true)]))),
         Ok(())
     );
     assert_eq!(
@@ -1042,7 +1116,55 @@ fn multiple_matching_credentials_include_number_of_credentials_and_support_next_
         .and_then(Value::as_map)
         .and_then(|map| map_bytes(map, "id"))
         .expect("next credential id");
-    assert_ne!(first_id, next_id);
+    assert_eq!(first_id, &[2]);
+    assert_eq!(next_id, &[1]);
+    assert_eq!(
+        authenticator.handle_cbor(&[Ctap2Command::GetNextAssertion.into()]),
+        vec![u8::from(ErrorStatus::NotAllowed)]
+    );
+}
+
+#[test]
+fn allow_list_omits_user_count_and_next_assertion_state() {
+    let mut authenticator = authenticator_with_credentials(
+        "example.com",
+        vec![
+            test_credential(vec![1], "example.com", 1),
+            test_credential(vec![2], "example.com", 2),
+        ],
+    );
+    let response = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::GetAssertion,
+        Value::Map(vec![
+            (
+                Value::Integer(1.into()),
+                Value::Text("example.com".to_owned()),
+            ),
+            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
+            (
+                Value::Integer(3.into()),
+                Value::Array(vec![
+                    credential_descriptor(vec![1]),
+                    credential_descriptor(vec![2]),
+                ]),
+            ),
+            (
+                Value::Integer(5.into()),
+                Value::Map(options_map(&[("up", false)])),
+            ),
+        ]),
+    ));
+    assert_eq!(response[0], 0x00);
+    let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
+    else {
+        panic!("expected assertion response");
+    };
+    assert!(map_value(&response, 4).is_none());
+    assert!(map_value(&response, 5).is_none());
+    assert_eq!(
+        authenticator.handle_cbor(&[Ctap2Command::GetNextAssertion.into()]),
+        vec![u8::from(ErrorStatus::NotAllowed)]
+    );
 }
 
 #[test]
@@ -1137,7 +1259,7 @@ fn malformed_allow_list_and_exclude_list_are_rejected() {
 }
 
 #[test]
-fn empty_allow_list_matches_discoverable_credentials() {
+fn empty_allow_list_is_invalid() {
     let mut authenticator = authenticator_with_credential("example.com", vec![1, 2, 3, 4]);
 
     let response = authenticator.handle_cbor(&ctap_request(
@@ -1152,7 +1274,7 @@ fn empty_allow_list_matches_discoverable_credentials() {
         ]),
     ));
 
-    assert_eq!(response[0], 0x00);
+    assert_eq!(response, vec![u8::from(ErrorStatus::InvalidParameter)]);
 }
 
 #[test]
@@ -1312,7 +1434,6 @@ fn authenticator_with_credentials(
         key_agreement: None,
         pin_uv_auth_token: None,
         consecutive_pin_mismatches: 0,
-        uv_satisfied: false,
         management: None,
     }
 }
