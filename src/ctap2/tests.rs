@@ -1484,6 +1484,8 @@ fn authenticator_with_credentials(
         consecutive_pin_mismatches: 0,
         management: None,
         powered_up_at: Instant::now(),
+        operation_cancelled: None,
+        operation_status: None,
     }
 }
 

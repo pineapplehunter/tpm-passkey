@@ -275,6 +275,37 @@ credential-management preview (`0x41`) is rejected because only the final
 
 Audit status: **complete**.
 
+## CTAPHID USB transport
+
+Normative sections: 11.2.2 through 11.2.9.
+
+The 64-byte HID reports carry a 57-byte initialization-packet fragment followed
+by up to 128 ordered 59-byte continuation fragments, for a maximum 7609-byte
+message. CIDs zero and `0xffffffff` are reserved; broadcast is accepted only for
+channel-allocating `CTAPHID_INIT`. Continuations use sequence values `0x00`
+through `0x7f` and spurious continuations without an active message are ignored.
+
+Only one transaction is active globally. A request initialization packet from
+another allocated channel receives `ERR_CHANNEL_BUSY`. An `INIT` on the active
+CID aborts buffered or processing work, flushes state through the authenticator
+worker, echoes the nonce, and resynchronizes that CID. An incomplete packet
+sequence times out after three seconds with `ERR_MSG_TIMEOUT`; a wrong expected
+sequence returns `ERR_INVALID_SEQ` and aborts assembly.
+
+CBOR execution runs on a persistent worker that exclusively owns the
+Authenticator and TPM context. The UHID thread emits `CTAPHID_KEEPALIVE` at
+100-ms intervals with `STATUS_PROCESSING` or `STATUS_UPNEEDED`. A zero-length
+`CTAPHID_CANCEL` has no direct response. On the active CBOR CID it marks the
+operation cancelled, queues state cleanup, and the original CBOR transaction
+returns `CTAP2_ERR_KEEPALIVE_CANCEL`; on a non-active CID it is ignored.
+
+`CTAPHID_INIT`, `PING`, `CBOR`, `CANCEL`, `ERROR`, and `KEEPALIVE` follow their
+mandatory direction and length rules. `WINK` is implemented and advertised;
+`CAPABILITY_CBOR` and `CAPABILITY_NMSG` advertise CBOR support and the absence
+of CTAPHID_MSG/U2F.
+
+Audit status: **complete**.
+
 ## Remaining Audit Order
 
 1. Complete ClientPIN inputs, errors, permissions, and retry state.
@@ -282,4 +313,4 @@ Audit status: **complete**.
 3. Audit getInfo capability claims against implemented behavior.
 4. Complete credential management and stateful continuation commands.
 5. Complete reset, selection, and unsupported command behavior.
-6. Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
+6. Complete CTAPHID framing, channels, cancellation, keepalive, and errors.

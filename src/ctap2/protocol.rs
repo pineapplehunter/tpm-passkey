@@ -69,6 +69,7 @@ pub(super) enum ErrorStatus {
     KeyStoreFull = 0x28,
     UnsupportedOption = 0x2b,
     InvalidOption = 0x2c,
+    KeepaliveCancel = 0x2d,
     NoCredentials = 0x2e,
     NotAllowed = 0x30,
     PinInvalid = 0x31,

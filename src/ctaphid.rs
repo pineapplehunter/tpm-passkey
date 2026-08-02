@@ -1,6 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::{ctap2, hid::REPORT_SIZE, store};
@@ -15,6 +22,7 @@ pub enum CtapHidCommand {
     Wink = 0x08,
     Cbor = 0x10,
     Cancel = 0x11,
+    Keepalive = 0x3b,
     Error = 0x3f,
 }
 
@@ -26,6 +34,7 @@ impl CtapHidCommand {
             0x08 => Some(Self::Wink),
             0x10 => Some(Self::Cbor),
             0x11 => Some(Self::Cancel),
+            0x3b => Some(Self::Keepalive),
             0x3f => Some(Self::Error),
             _ => None,
         }
@@ -44,19 +53,29 @@ enum CtapHidError {
     Command = 0x01,
     Length = 0x03,
     Seq = 0x04,
+    Timeout = 0x05,
+    Busy = 0x06,
     Channel = 0x0b,
+    Other = 0x7f,
 }
 
+const CAPABILITY_WINK: u8 = 0x01;
 const CAPABILITY_CBOR: u8 = 0x04;
 const CAPABILITY_NMSG: u8 = 0x08;
 
 const MAX_PAYLOAD_SIZE: usize = (REPORT_SIZE - 7) + 128 * (REPORT_SIZE - 5);
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(3);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(100);
+const KEEPALIVE_PROCESSING: u8 = 1;
 
 pub struct PacketHandler {
-    pending: HashMap<u32, PendingRequest>,
+    pending: Option<PendingRequest>,
+    processing: Option<ProcessingRequest>,
     allocated_channels: HashSet<u32>,
     next_cid: u32,
-    authenticator: ctap2::Authenticator,
+    next_transaction_id: u64,
+    worker_tx: mpsc::Sender<WorkerCommand>,
+    worker_rx: mpsc::Receiver<WorkerResult>,
 }
 
 impl Default for PacketHandler {
@@ -72,31 +91,114 @@ struct PendingRequest {
     expected_len: usize,
     payload: Vec<u8>,
     next_sequence: u8,
+    started_at: Instant,
+}
+
+struct ProcessingRequest {
+    id: u64,
+    cid: u32,
+    cancelled: Arc<AtomicBool>,
+    status: Arc<AtomicU8>,
+    last_keepalive: Instant,
+}
+
+enum WorkerCommand {
+    Cbor {
+        id: u64,
+        cid: u32,
+        payload: Vec<u8>,
+        cancelled: Arc<AtomicBool>,
+        status: Arc<AtomicU8>,
+    },
+    CancelState,
+    Tpm {
+        command: crate::ctap2::TpmCommand,
+        response: mpsc::Sender<crate::ctap2::TpmCmdResult>,
+    },
+}
+
+struct WorkerResult {
+    id: u64,
+    cid: u32,
+    payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketOutcome {
     NeedMore,
+    Processing,
+    Ignored,
     Response(Response),
 }
 
 impl PacketHandler {
     pub fn new(store_dir: PathBuf, tpm_path: Option<PathBuf>) -> Self {
+        Self::new_with_user_approval(
+            store_dir,
+            tpm_path,
+            Box::new(crate::approval::SystemApproval),
+        )
+    }
+
+    fn new_with_user_approval(
+        store_dir: PathBuf,
+        tpm_path: Option<PathBuf>,
+        approval: Box<dyn crate::approval::UserApproval>,
+    ) -> Self {
+        let (worker_tx, command_rx) = mpsc::channel();
+        let (result_tx, worker_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut authenticator =
+                ctap2::Authenticator::new_with_approval(store_dir, tpm_path, approval);
+            while let Ok(command) = command_rx.recv() {
+                match command {
+                    WorkerCommand::Cbor {
+                        id,
+                        cid,
+                        payload,
+                        cancelled,
+                        status,
+                    } => {
+                        let payload =
+                            authenticator.handle_cbor_controlled(&payload, cancelled, status);
+                        if result_tx.send(WorkerResult { id, cid, payload }).is_err() {
+                            break;
+                        }
+                    }
+                    WorkerCommand::CancelState => authenticator.cancel_pending(),
+                    WorkerCommand::Tpm { command, response } => {
+                        let result = authenticator
+                            .handle_tpm_command(command)
+                            .map_err(|error| format!("{error}"));
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        });
+
         Self {
-            pending: HashMap::new(),
+            pending: None,
+            processing: None,
             allocated_channels: HashSet::new(),
             next_cid: 1,
-            authenticator: ctap2::Authenticator::new(store_dir, tpm_path),
+            next_transaction_id: 1,
+            worker_tx,
+            worker_rx,
         }
     }
 
-    /// Execute a TPM command from the management thread, using the
-    /// authenticator's already-open TPM context.
-    pub fn handle_tpm_command(
-        &mut self,
+    pub fn queue_tpm_command(
+        &self,
         command: crate::ctap2::TpmCommand,
-    ) -> color_eyre::Result<()> {
-        self.authenticator.handle_tpm_command(command)
+        response: mpsc::Sender<crate::ctap2::TpmCmdResult>,
+    ) {
+        if self
+            .worker_tx
+            .send(WorkerCommand::Tpm { command, response })
+            .is_err()
+        {
+            log::error!("authenticator worker stopped before TPM command was queued");
+        }
     }
 
     pub fn handle_packet(&mut self, report: &[u8]) -> Option<PacketOutcome> {
@@ -121,22 +223,31 @@ impl PacketHandler {
         report: &[u8],
     ) -> Option<PacketOutcome> {
         let payload_len = u16::from_be_bytes([report[5], report[6]]) as usize;
-        if payload_len > MAX_PAYLOAD_SIZE {
-            self.pending.remove(&cid);
-            return Some(PacketOutcome::Response(error(cid, CtapHidError::Length)));
-        }
-
         let Some(command) = CtapHidCommand::from_byte(command_id) else {
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Command)));
         };
-
+        if command == CtapHidCommand::Cancel {
+            if !self.allocated_channels.contains(&cid) {
+                return Some(PacketOutcome::Ignored);
+            }
+            return Some(self.cancel(cid, payload_len));
+        }
         let channel_is_valid = match command {
             CtapHidCommand::Init => cid == BROADCAST_CID || self.allocated_channels.contains(&cid),
             _ => cid != BROADCAST_CID && self.allocated_channels.contains(&cid),
         };
         if cid == 0 || !channel_is_valid {
-            self.pending.remove(&cid);
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Channel)));
+        }
+        if payload_len > MAX_PAYLOAD_SIZE {
+            self.abort_incomplete(cid);
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Length)));
+        }
+
+        if command == CtapHidCommand::Init && self.active_cid() == Some(cid) {
+            self.abort_transaction();
+        } else if self.active_cid().is_some() {
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Busy)));
         }
 
         let first_len = payload_len.min(REPORT_SIZE - 7);
@@ -144,22 +255,17 @@ impl PacketHandler {
         payload.extend_from_slice(&report[7..7 + first_len]);
 
         if payload.len() == payload_len {
-            self.pending.remove(&cid);
-            return Some(PacketOutcome::Response(
-                self.dispatch(cid, command, &payload),
-            ));
+            return Some(self.dispatch(cid, command, &payload));
         }
 
-        self.pending.insert(
+        self.pending = Some(PendingRequest {
             cid,
-            PendingRequest {
-                cid,
-                command,
-                expected_len: payload_len,
-                payload,
-                next_sequence: 0,
-            },
-        );
+            command,
+            expected_len: payload_len,
+            payload,
+            next_sequence: 0,
+            started_at: Instant::now(),
+        });
         Some(PacketOutcome::NeedMore)
     }
 
@@ -172,14 +278,15 @@ impl PacketHandler {
         if !self.allocated_channels.contains(&cid) {
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Channel)));
         }
-        let Some(pending) = self.pending.get_mut(&cid) else {
-            return Some(PacketOutcome::Response(error(cid, CtapHidError::Seq)));
+        let Some(pending) = self.pending.as_mut() else {
+            return Some(PacketOutcome::Ignored);
         };
-
-        if pending.cid != cid || pending.next_sequence != sequence {
-            let error_cid = pending.cid;
-            self.pending.remove(&cid);
-            return Some(PacketOutcome::Response(error(error_cid, CtapHidError::Seq)));
+        if pending.cid != cid {
+            return Some(PacketOutcome::Ignored);
+        }
+        if pending.next_sequence != sequence {
+            self.pending = None;
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Seq)));
         }
 
         let remaining = pending.expected_len - pending.payload.len();
@@ -187,25 +294,21 @@ impl PacketHandler {
         pending.payload.extend_from_slice(&report[5..5 + chunk_len]);
 
         if pending.payload.len() == pending.expected_len {
-            let pending = self.pending.remove(&cid).expect("pending request");
-            Some(PacketOutcome::Response(self.dispatch(
-                pending.cid,
-                pending.command,
-                &pending.payload,
-            )))
+            let pending = self.pending.take().expect("pending request");
+            Some(self.dispatch(pending.cid, pending.command, &pending.payload))
         } else {
-            pending.next_sequence = pending.next_sequence.wrapping_add(1);
+            pending.next_sequence += 1;
             Some(PacketOutcome::NeedMore)
         }
     }
 
-    fn dispatch(&mut self, cid: u32, command: CtapHidCommand, payload: &[u8]) -> Response {
+    fn dispatch(&mut self, cid: u32, command: CtapHidCommand, payload: &[u8]) -> PacketOutcome {
         log::debug!(
             "ctaphid request cid={cid:#010x} command={} payload_len={}",
             command_name(command),
             payload.len()
         );
-        match command {
+        let response = match command {
             CtapHidCommand::Init => {
                 let allocated_cid = if cid == BROADCAST_CID {
                     while self.next_cid == 0
@@ -228,23 +331,127 @@ impl PacketHandler {
                 command: CtapHidCommand::Ping,
                 payload: payload.to_vec(),
             },
-            CtapHidCommand::Wink => Response {
+            CtapHidCommand::Wink if payload.is_empty() => Response {
                 cid,
                 command: CtapHidCommand::Wink,
                 payload: Vec::new(),
             },
-            CtapHidCommand::Cbor => Response {
-                cid,
-                command: CtapHidCommand::Cbor,
-                payload: self.authenticator.handle_cbor(payload),
-            },
-            CtapHidCommand::Cancel => {
-                self.pending.remove(&cid);
-                self.authenticator.cancel_pending();
-                error(cid, CtapHidError::Command)
-            }
-            CtapHidCommand::Error => error(cid, CtapHidError::Command),
+            CtapHidCommand::Wink => error(cid, CtapHidError::Length),
+            CtapHidCommand::Cbor => return self.queue_cbor(cid, payload),
+            CtapHidCommand::Cancel => return self.cancel(cid, payload.len()),
+            CtapHidCommand::Keepalive | CtapHidCommand::Error => error(cid, CtapHidError::Command),
+        };
+        PacketOutcome::Response(response)
+    }
+
+    fn active_cid(&self) -> Option<u32> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.cid)
+            .or_else(|| self.processing.as_ref().map(|processing| processing.cid))
+    }
+
+    fn abort_incomplete(&mut self, cid: u32) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.cid == cid)
+        {
+            self.pending = None;
         }
+    }
+
+    fn abort_transaction(&mut self) {
+        self.pending = None;
+        if let Some(processing) = self.processing.take() {
+            processing.cancelled.store(true, Ordering::SeqCst);
+        }
+        let _ = self.worker_tx.send(WorkerCommand::CancelState);
+    }
+
+    fn cancel(&mut self, cid: u32, payload_len: usize) -> PacketOutcome {
+        if payload_len != 0 {
+            return PacketOutcome::Response(error(cid, CtapHidError::Length));
+        }
+        if let Some(processing) = self
+            .processing
+            .as_ref()
+            .filter(|processing| processing.cid == cid)
+        {
+            processing.cancelled.store(true, Ordering::SeqCst);
+            let _ = self.worker_tx.send(WorkerCommand::CancelState);
+        }
+        PacketOutcome::Ignored
+    }
+
+    fn queue_cbor(&mut self, cid: u32, payload: &[u8]) -> PacketOutcome {
+        let id = self.next_transaction_id;
+        self.next_transaction_id = self.next_transaction_id.wrapping_add(1).max(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(AtomicU8::new(KEEPALIVE_PROCESSING));
+        if self
+            .worker_tx
+            .send(WorkerCommand::Cbor {
+                id,
+                cid,
+                payload: payload.to_vec(),
+                cancelled: cancelled.clone(),
+                status: status.clone(),
+            })
+            .is_err()
+        {
+            return PacketOutcome::Response(error(cid, CtapHidError::Other));
+        }
+        self.processing = Some(ProcessingRequest {
+            id,
+            cid,
+            cancelled,
+            status,
+            last_keepalive: Instant::now(),
+        });
+        PacketOutcome::Processing
+    }
+
+    pub fn poll(&mut self) -> Option<PacketOutcome> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.started_at.elapsed() >= TRANSACTION_TIMEOUT)
+        {
+            let cid = self.pending.take().expect("timed-out request").cid;
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Timeout)));
+        }
+
+        while let Ok(result) = self.worker_rx.try_recv() {
+            if let Some(processing) = self
+                .processing
+                .as_ref()
+                .filter(|processing| processing.id == result.id)
+            {
+                let payload = if processing.cancelled.load(Ordering::SeqCst) {
+                    vec![0x2d]
+                } else {
+                    result.payload
+                };
+                self.processing = None;
+                return Some(PacketOutcome::Response(Response {
+                    cid: result.cid,
+                    command: CtapHidCommand::Cbor,
+                    payload,
+                }));
+            }
+        }
+
+        let processing = self.processing.as_mut()?;
+        if processing.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            processing.last_keepalive = Instant::now();
+            return Some(PacketOutcome::Response(Response {
+                cid: processing.cid,
+                command: CtapHidCommand::Keepalive,
+                payload: vec![processing.status.load(Ordering::SeqCst)],
+            }));
+        }
+        None
     }
 }
 
@@ -265,7 +472,8 @@ pub fn handle_packet(report: &[u8]) -> Option<Response> {
     let mut handler = PacketHandler::default();
     match handler.handle_packet(report) {
         Some(PacketOutcome::Response(response)) => Some(response),
-        Some(PacketOutcome::NeedMore) | None => None,
+        Some(PacketOutcome::NeedMore | PacketOutcome::Processing | PacketOutcome::Ignored)
+        | None => None,
     }
 }
 
@@ -295,6 +503,7 @@ pub fn command_name(command: CtapHidCommand) -> &'static str {
         CtapHidCommand::Wink => "WINK",
         CtapHidCommand::Cbor => "CBOR",
         CtapHidCommand::Cancel => "CANCEL",
+        CtapHidCommand::Keepalive => "KEEPALIVE",
         CtapHidCommand::Error => "ERROR",
     }
 }
@@ -309,7 +518,7 @@ fn handle_init(cid: u32, allocated_cid: u32, payload: &[u8]) -> Response {
     response.extend_from_slice(&allocated_cid.to_be_bytes());
     response.push(2); // CTAPHID protocol version.
     response.extend_from_slice(&[0, 1, 0]);
-    response.push(CAPABILITY_CBOR | CAPABILITY_NMSG);
+    response.push(CAPABILITY_WINK | CAPABILITY_CBOR | CAPABILITY_NMSG);
 
     Response {
         cid,
@@ -395,7 +604,10 @@ mod tests {
         assert_eq!(&response.payload[0..8], b"12345678");
         assert_eq!(&response.payload[8..12], &1u32.to_be_bytes());
         assert_eq!(response.payload[12], 2);
-        assert_eq!(response.payload[16], CAPABILITY_CBOR | CAPABILITY_NMSG);
+        assert_eq!(
+            response.payload[16],
+            CAPABILITY_WINK | CAPABILITY_CBOR | CAPABILITY_NMSG
+        );
     }
 
     #[test]
@@ -510,10 +722,106 @@ mod tests {
         assert_error(response, cid, CtapHidError::Seq);
 
         continuation[4] = 0;
-        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&continuation) else {
-            panic!("expected sequence error after abort");
+        assert_eq!(
+            handler.handle_packet(&continuation),
+            Some(PacketOutcome::Ignored),
+            "spurious continuations are ignored after the request is aborted"
+        );
+    }
+
+    #[test]
+    fn transactions_are_global_and_init_resynchronizes_the_active_channel() {
+        let mut handler = PacketHandler::default();
+        let active_cid = allocate_channel(&mut handler);
+        let other_cid = allocate_channel(&mut handler);
+        let partial = command_packet(active_cid, CtapHidCommand::Ping, &[0xaa; REPORT_SIZE]);
+        assert_eq!(
+            handler.handle_packet(&partial),
+            Some(PacketOutcome::NeedMore)
+        );
+
+        let other = command_packet(other_cid, CtapHidCommand::Ping, b"");
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&other) else {
+            panic!("expected channel-busy response");
         };
-        assert_error(response, cid, CtapHidError::Seq);
+        assert_error(response, other_cid, CtapHidError::Busy);
+
+        let resynchronize = command_packet(active_cid, CtapHidCommand::Init, b"12345678");
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&resynchronize) else {
+            panic!("expected resynchronization response");
+        };
+        assert_eq!(response.command, CtapHidCommand::Init);
+        assert_eq!(&response.payload[8..12], &active_cid.to_be_bytes());
+        assert!(handler.pending.is_none());
+    }
+
+    #[test]
+    fn incomplete_transactions_time_out() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let partial = command_packet(cid, CtapHidCommand::Ping, &[0xaa; REPORT_SIZE]);
+        assert_eq!(
+            handler.handle_packet(&partial),
+            Some(PacketOutcome::NeedMore)
+        );
+        handler
+            .pending
+            .as_mut()
+            .expect("pending request")
+            .started_at = Instant::now() - TRANSACTION_TIMEOUT;
+
+        let Some(PacketOutcome::Response(response)) = handler.poll() else {
+            panic!("expected timeout response");
+        };
+        assert_error(response, cid, CtapHidError::Timeout);
+        assert!(handler.pending.is_none());
+    }
+
+    struct SlowApproval;
+
+    impl crate::approval::UserApproval for SlowApproval {
+        fn approve(&self, _prompt: &str, _session: &crate::session::SessionContext) -> bool {
+            thread::sleep(Duration::from_millis(300));
+            true
+        }
+    }
+
+    #[test]
+    fn cbor_processing_emits_keepalive_and_cancel_has_no_direct_response() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "linux-tpm-fido2-ctaphid-cancel-{}",
+            std::process::id()
+        ));
+        let mut handler =
+            PacketHandler::new_with_user_approval(store_dir.clone(), None, Box::new(SlowApproval));
+        let cid = allocate_channel(&mut handler);
+        let selection = command_packet(
+            cid,
+            CtapHidCommand::Cbor,
+            &[ctap2::Ctap2Command::Selection.into()],
+        );
+        assert_eq!(
+            handler.handle_packet(&selection),
+            Some(PacketOutcome::Processing)
+        );
+
+        thread::sleep(KEEPALIVE_INTERVAL + Duration::from_millis(20));
+        let Some(PacketOutcome::Response(keepalive)) = handler.poll() else {
+            panic!("expected keepalive");
+        };
+        assert_eq!(keepalive.command, CtapHidCommand::Keepalive);
+        assert_eq!(keepalive.payload, vec![2]);
+
+        let cancel = command_packet(cid, CtapHidCommand::Cancel, b"");
+        assert_eq!(handler.handle_packet(&cancel), Some(PacketOutcome::Ignored));
+
+        thread::sleep(Duration::from_millis(220));
+        let Some(PacketOutcome::Response(cancelled)) = handler.poll() else {
+            panic!("expected cancelled CBOR response");
+        };
+        assert_eq!(cancelled.command, CtapHidCommand::Cbor);
+        assert_eq!(cancelled.payload, vec![0x2d]);
+        let _ = std::fs::remove_dir_all(store_dir);
     }
 
     #[test]

@@ -10,19 +10,23 @@ transaction approval flow.
 ## Runtime Request Flow
 
 1. The browser writes 64-byte reports to the UHID device.
-2. `ctaphid` validates the channel and packet sequence, assembles the request,
-   and dispatches complete commands.
-3. `ctap2::Authenticator` decodes the CTAP command and coordinates its state
-   machine.
-4. The command handler scopes credentials to the active UID, obtains approval
+2. `ctaphid` validates global transaction arbitration, channels, packet
+   sequence, and timeout, then assembles complete requests.
+3. Complete CBOR requests are sent to a persistent authenticator worker. The
+   UHID thread remains responsive for keepalives, cancellation, and competing
+   channels while approval or TPM work blocks.
+4. `ctap2::Authenticator` on the worker decodes the CTAP command and coordinates
+   its state machine.
+5. The command handler scopes credentials to the active UID, obtains approval
    through `approval::UserApproval`, and asks `tpm` to create or use keys.
-5. `store` persists credential, PIN, policy, and recovery state in SQLite.
-6. The CTAP response is encoded canonically, fragmented by `ctaphid`, and sent
-   to the browser through UHID.
+6. `store` persists credential, PIN, policy, and recovery state in SQLite.
+7. The worker result is fragmented by `ctaphid` and sent to the browser through
+   UHID.
 
 Management requests use a Unix socket. Socket threads perform validation and
-storage work, while TPM operations are sent to the daemon thread because the
-NixOS test TPM exposes only one usable `/dev/tpm0` opener.
+storage work, while TPM operations are queued to the same authenticator worker.
+This preserves one owner for the TPM context because the NixOS test TPM exposes
+only one usable `/dev/tpm0` opener.
 
 ## Source Boundaries
 
@@ -53,7 +57,9 @@ src/
 
 ## State Ownership
 
-`ctap2::Authenticator` owns state that must survive across CTAP commands:
+The persistent authenticator worker owns `ctap2::Authenticator` and its TPM
+context. `ctap2::Authenticator` owns state that must survive across CTAP
+commands:
 
 - loaded credentials and signature counters;
 - pending `getNextAssertion` enumeration;
@@ -63,11 +69,14 @@ src/
 - transaction UV state;
 - the lazily opened TPM context.
 
-`ctaphid::PacketHandler` owns transport state independently:
+`ctaphid::PacketHandler` remains on the UHID thread and owns transport state:
 
 - allocated channel IDs;
-- incomplete messages and expected sequence numbers;
-- the next channel ID to allocate.
+- the one globally active incomplete or processing transaction;
+- expected continuation sequence and transaction timeout;
+- keepalive timing, progress status, and cancellation flag;
+- the next channel ID to allocate;
+- command and result channels for the authenticator worker.
 
 Persistent state belongs to `store`; TPM handles and policy sessions belong to
 `tpm` and are flushed by their guards.

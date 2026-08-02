@@ -1,6 +1,10 @@
 use std::{
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -71,6 +75,8 @@ pub struct Authenticator {
     consecutive_pin_mismatches: u8,
     management: Option<ManagementState>,
     powered_up_at: Instant,
+    operation_cancelled: Option<Arc<AtomicBool>>,
+    operation_status: Option<Arc<AtomicU8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +168,8 @@ impl Authenticator {
             consecutive_pin_mismatches: 0,
             management: None,
             powered_up_at: Instant::now(),
+            operation_cancelled: None,
+            operation_status: None,
         }
     }
 
@@ -173,6 +181,24 @@ impl Authenticator {
                 Vec::new()
             }
         }
+    }
+
+    pub fn handle_cbor_controlled(
+        &mut self,
+        payload: &[u8],
+        cancelled: Arc<AtomicBool>,
+        status: Arc<AtomicU8>,
+    ) -> Vec<u8> {
+        self.operation_cancelled = Some(cancelled.clone());
+        self.operation_status = Some(status);
+        let response = self.handle_cbor(payload);
+        self.operation_cancelled = None;
+        self.operation_status = None;
+        if cancelled.load(Ordering::SeqCst) {
+            self.cancel_pending();
+            return error_response(ErrorStatus::KeepaliveCancel);
+        }
+        response
     }
 
     pub fn handle_cbor(&mut self, payload: &[u8]) -> Vec<u8> {
@@ -1485,11 +1511,21 @@ impl Authenticator {
     }
 
     fn user_presence_approved(&self, prompt: &str, operation: &str) -> bool {
+        if self.operation_is_cancelled() {
+            return false;
+        }
         if !self.session.verify_matches_current() {
             log::error!("session changed before {operation} approval");
             return false;
         }
-        if !self.approval.approve(prompt, &self.session) {
+        if let Some(status) = &self.operation_status {
+            status.store(2, Ordering::SeqCst);
+        }
+        let approved = self.approval.approve(prompt, &self.session);
+        if let Some(status) = &self.operation_status {
+            status.store(1, Ordering::SeqCst);
+        }
+        if !approved || self.operation_is_cancelled() {
             return false;
         }
         if !self.session.verify_matches_current() {
@@ -1497,6 +1533,12 @@ impl Authenticator {
             return false;
         }
         true
+    }
+
+    fn operation_is_cancelled(&self) -> bool {
+        self.operation_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
     }
 
     fn validate_pin_uv_auth(

@@ -188,12 +188,22 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
     loop {
         // Process any pending TPM commands from the management thread.
         if let Ok((command, resp_tx)) = tpm_cmd_rx.try_recv() {
-            log::debug!("processing TPM command from management thread");
-            let result = ctaphid
-                .handle_tpm_command(command)
-                .map_err(|e| format!("{e}"));
-            if resp_tx.send(result).is_err() {
-                log::warn!("management thread dropped response channel");
+            log::debug!("queuing TPM command from management thread");
+            ctaphid.queue_tpm_command(command, resp_tx);
+        }
+
+        if let Some(ctaphid::PacketOutcome::Response(response)) = ctaphid.poll() {
+            log::debug!(
+                "uhid tx cid={:#010x} command={} payload_len={}",
+                response.cid,
+                ctaphid::command_name(response.command),
+                response.payload.len()
+            );
+            for packet in response.packets() {
+                device
+                    .write(&packet)
+                    .wrap_err("writing UHID input report")?;
+                log::trace!("uhid tx packet_len={}", packet.len());
             }
         }
 

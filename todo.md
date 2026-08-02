@@ -51,11 +51,14 @@
 - [x] Reuse UV-token user presence for one operation in the same login session without weakening transaction or RP scoping.
 - [x] Document the security constraints and validate the changes.
 
-## CTAP test readability
+## CTAP and test maintainability
 
-- [x] Replace hand-built `Value::Map`/`Value::Array` test data with the `cbor!` macro.
+- [x] Replace hand-built `Value::Map`/`Value::Array` CTAP test data with the `cbor!` macro.
 - [x] Keep dynamic request helpers concise and preserve strict wire-shape assertions.
-- [x] Run formatting, Rust checks, clippy, and the NixOS VM test.
+- [ ] Replace remaining hand-built CBOR `Value::` construction with `cbor!` where the macro is clearer.
+- [ ] Remove tests without a useful behavioral assertion.
+- [ ] Deduplicate and merge overlapping tests where one focused test communicates the behavior better.
+- [ ] Run formatting, Rust checks, clippy, and the NixOS VM test after cleanup.
 
 ## CTAP 2.2 systematic audit
 
@@ -65,5 +68,8 @@
 - [x] Audit getInfo capability claims.
 - [x] Audit credential management and stateful continuation commands.
 - [x] Audit reset, selection, and unsupported commands.
-- [ ] Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
+- [x] Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
+  - [x] Choose an asynchronous command-execution design so the UHID loop can emit keepalives and receive cancellation while approval/TPM work is blocked.
+  - [x] Enforce global transaction arbitration, timeout, resynchronization, packet sequencing, and transport errors.
+  - [x] Implement status-only CANCEL handling and `CTAP2_ERR_KEEPALIVE_CANCEL` for cancelled CBOR work.
 - [ ] Run final Rust and NixOS validation.
