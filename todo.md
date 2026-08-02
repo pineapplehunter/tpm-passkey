@@ -3,6 +3,7 @@
 - [x] Move CTAP2 tests into a dedicated module.
 - [x] Extract CTAP command and status definitions.
 - [x] Extract CTAP CBOR codec helpers.
+- [x] Extract authenticator-data and COSE encoding helpers.
 - [x] Separate management protocol, service, and socket layers.
 - [x] Inject user approval through a testable interface.
 - [x] Extract shared credential domain conversions.
