@@ -28,4 +28,4 @@
 
 - [x] Return only the defined `pinUvAuthToken` field for token responses.
 - [x] Add strict response-shape regression coverage.
-- [ ] Run Rust and NixOS validation.
+- [x] Run Rust and NixOS validation.
