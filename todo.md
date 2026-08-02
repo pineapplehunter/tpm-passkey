@@ -44,6 +44,13 @@
 - [x] Add `config show` for current persistent configuration.
 - [x] Update tests and documentation, then run Rust and NixOS validation.
 
+## Credential deletion and approval reuse
+
+- [ ] Add an end-to-end test for deleting a credential.
+- [x] Explain why browser registration currently invokes polkit twice.
+- [x] Reuse UV-token user presence for one operation in the same login session without weakening transaction or RP scoping.
+- [ ] Document the security constraints and validate the changes.
+
 ## CTAP 2.2 systematic audit
 
 - [x] Create and maintain `docs/ctap2-compliance.md` from the normative specification.

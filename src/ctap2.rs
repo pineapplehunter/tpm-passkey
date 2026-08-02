@@ -84,8 +84,11 @@ struct PinUvAuthToken {
     value: Vec<u8>,
     permissions: Ctap2PermissionFlags,
     rp_id: Option<String>,
+    session_uid: Option<u32>,
+    session_id: Option<String>,
     issued_at: Instant,
     first_used_at: Option<Instant>,
+    user_present_until: Option<Instant>,
 }
 
 struct ManagementState {
@@ -395,14 +398,18 @@ impl Authenticator {
             return Err(ErrorStatus::OperationDenied);
         }
 
-        if !self.approval.approve(
-            &format!(
-                "Register a new passkey for {} as {}",
-                display_rp_label(rp_name, rp_id),
-                user_display_name.or(user_name).unwrap_or("unknown user")
-            ),
-            &self.session,
-        ) {
+        let cached_user_presence =
+            user_verified && self.pin_uv_auth_token_has_cached_user_presence();
+        if !cached_user_presence
+            && !self.approval.approve(
+                &format!(
+                    "Register a new passkey for {} as {}",
+                    display_rp_label(rp_name, rp_id),
+                    user_display_name.or(user_name).unwrap_or("unknown user")
+                ),
+                &self.session,
+            )
+        {
             return Err(ErrorStatus::OperationDenied);
         }
         let user_verified = user_verified || uv_requested;
@@ -582,7 +589,12 @@ impl Authenticator {
             return Err(ErrorStatus::NoCredentials);
         };
 
-        if (user_presence || uv_requested) && !self.assertion_approved(rp_id) {
+        let cached_user_presence =
+            user_verified && self.pin_uv_auth_token_has_cached_user_presence();
+        if (user_presence || uv_requested)
+            && !(user_presence && cached_user_presence)
+            && !self.assertion_approved(rp_id)
+        {
             return Err(ErrorStatus::OperationDenied);
         }
         let user_verified = user_verified || uv_requested;
@@ -1151,8 +1163,11 @@ impl Authenticator {
             value: token.clone(),
             permissions,
             rp_id,
+            session_uid: self.session.uid,
+            session_id: self.session.session_id.clone(),
             issued_at: Instant::now(),
             first_used_at: None,
+            user_present_until: None,
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
         Ok(encode_response(
@@ -1170,10 +1185,12 @@ impl Authenticator {
         rp_id: Option<String>,
     ) -> Result<Vec<u8>, ErrorStatus> {
         let permissions = validate_token_permissions(raw_permissions, rp_id.as_deref(), false)?;
+        let prompt = rp_id.as_deref().map_or_else(
+            || "Verify identity for a FIDO2 operation".to_owned(),
+            |rp_id| format!("Verify identity for FIDO2 operations at {rp_id}"),
+        );
         if !self.session.verify_matches_current()
-            || !self
-                .approval
-                .approve("Verify identity for a FIDO2 operation", &self.session)
+            || !self.approval.approve(&prompt, &self.session)
             || !self.session.verify_matches_current()
         {
             return Err(ErrorStatus::OperationDenied);
@@ -1181,12 +1198,16 @@ impl Authenticator {
         let (aes_key, _mac_key) = self.pin_uv_keys(key_agreement)?;
         let mut token = vec![0u8; 32];
         fill_random(&mut token);
+        let issued_at = Instant::now();
         self.pin_uv_auth_token = Some(PinUvAuthToken {
             value: token.clone(),
             permissions,
             rp_id,
-            issued_at: Instant::now(),
+            session_uid: self.session.uid,
+            session_id: self.session.session_id.clone(),
+            issued_at,
             first_used_at: None,
+            user_present_until: Some(issued_at + Duration::from_secs(30)),
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
         Ok(encode_response(
@@ -1334,9 +1355,20 @@ impl Authenticator {
         })
     }
 
+    fn pin_uv_auth_token_has_cached_user_presence(&self) -> bool {
+        self.pin_uv_auth_token.as_ref().is_some_and(|token| {
+            token.session_uid == self.session.uid
+                && token.session_id == self.session.session_id
+                && token
+                    .user_present_until
+                    .is_some_and(|deadline| Instant::now() <= deadline)
+        })
+    }
+
     fn consume_pin_uv_auth_token_after_user_presence(&mut self) {
         if let Some(token) = &mut self.pin_uv_auth_token {
             token.permissions &= Ctap2PermissionFlags::LARGE_BLOB_WRITE;
+            token.user_present_until = None;
         }
     }
 
@@ -1381,7 +1413,9 @@ impl Authenticator {
             .pin_uv_auth_token
             .as_ref()
             .filter(|token| {
-                token.issued_at.elapsed() <= Duration::from_secs(600)
+                token.session_uid == self.session.uid
+                    && token.session_id == self.session.session_id
+                    && token.issued_at.elapsed() <= Duration::from_secs(600)
                     && (token.first_used_at.is_some()
                         || token.issued_at.elapsed() <= Duration::from_secs(30))
             })

@@ -97,6 +97,11 @@ After a wrong PIN, retries are decremented and the key-agreement key is
 regenerated. Three consecutive mismatches in one power cycle produce
 `CTAP2_ERR_PIN_AUTH_BLOCKED`; zero retries produce `CTAP2_ERR_PIN_BLOCKED`.
 
+A token issued by built-in UV records user presence for at most 30 seconds. The
+cached presence is bound to the issuing login-session UID and session ID, and is
+consumed by one user-presence operation. A PIN-issued token has no cached user
+presence. All tokens remain cryptographically permission- and RP-scoped.
+
 Audit status: **complete for ClientPIN request/response handling and token
 issuance**. Permission consumption and user-presence state during subsequent
 commands are tracked by the makeCredential/getAssertion audits.

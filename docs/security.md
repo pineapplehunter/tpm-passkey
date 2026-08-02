@@ -191,6 +191,16 @@ A successful polkit operation establishes that the session user satisfied the co
 
 Authorization shall be associated with one specific CTAP transaction. Authorization results shall not be reused for unrelated requests unless the reuse semantics are explicitly defined and justified.
 
+The CTAP-defined user-presence state of a UV-issued `pinUvAuthToken` is the only current reuse. The UV approval names the requested RP ID, and cached presence may authorize one immediately following token-authenticated operation only when all of these remain true:
+
+* The token HMAC is valid and has the required permission.
+* The token's permissions RP ID matches the operation.
+* The active login-session UID and session ID match those recorded at issuance.
+* No more than 30 seconds have elapsed since UV approval.
+* Cached presence has not already been consumed.
+
+The operation clears cached presence and all token permissions except the CTAP-defined `lbw` exception. PIN-issued tokens do not carry cached user presence and therefore still require a separate presence approval. This avoids a second polkit prompt for the built-in-UV browser flow without turning approval into a general same-user or time-based authorization grant.
+
 Cancellation, timeout, session termination, session switching, or failure of the authentication agent shall cause the operation to fail closed.
 
 The authenticator cannot independently verify the browser’s web origin. It receives an RP ID and client-data hash from the client platform and relies on the WebAuthn client and relying party to perform the corresponding origin validation.

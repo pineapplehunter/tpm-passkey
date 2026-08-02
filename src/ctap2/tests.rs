@@ -1,5 +1,9 @@
 use super::*;
 use p256::elliptic_curve::sec1::ToSec1Point;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[test]
 fn get_info_starts_with_success() {
@@ -348,8 +352,12 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
 #[test]
 fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
     let store_dir = test_store_dir("uv-token");
-    let mut authenticator =
-        Authenticator::new_with_approval(store_dir.clone(), None, Box::new(AlwaysApprove));
+    let approval_count = Arc::new(AtomicUsize::new(0));
+    let mut authenticator = Authenticator::new_with_approval(
+        store_dir.clone(),
+        None,
+        Box::new(CountingApproval(approval_count.clone())),
+    );
     let client_secret = EphemeralSecret::generate();
     let server_key = client_pin_key_agreement(&mut authenticator);
     let server_public = parse_key_agreement(&server_key).expect("valid server public key");
@@ -383,14 +391,62 @@ fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
         panic!("expected UV token response");
     };
     let encrypted_token = map_bytes(&response, 2).expect("encrypted token");
-    assert_eq!(
-        decrypt_aes(&aes_key, encrypted_token)
-            .expect("decrypt token")
-            .len(),
-        32
-    );
+    let token = decrypt_aes(&aes_key, encrypted_token).expect("decrypt token");
+    assert_eq!(token.len(), 32);
     assert_eq!(response.len(), 1);
     assert!(map_value(&response, 3).is_none());
+
+    let client_data_hash = [0x44; 32];
+    let mut mac = HmacSha256::new_from_slice(&token).expect("HMAC key");
+    mac.update(&client_data_hash);
+    let make_credential = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::MakeCredential,
+        Value::Map(vec![
+            (
+                Value::Integer(1.into()),
+                Value::Bytes(client_data_hash.to_vec()),
+            ),
+            (
+                Value::Integer(2.into()),
+                Value::Map(vec![(
+                    Value::Text("id".to_owned()),
+                    Value::Text("passkeys.io".to_owned()),
+                )]),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Map(vec![(
+                    Value::Text("id".to_owned()),
+                    Value::Bytes(vec![0x22; 16]),
+                )]),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        Value::Text("type".to_owned()),
+                        Value::Text("public-key".to_owned()),
+                    ),
+                    (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
+                ])]),
+            ),
+            (
+                Value::Integer(7.into()),
+                Value::Map(options_map(&[("rk", true), ("up", true)])),
+            ),
+            (
+                Value::Integer(8.into()),
+                Value::Bytes(mac.finalize().into_bytes().to_vec()),
+            ),
+            (Value::Integer(9.into()), Value::Integer(2.into())),
+        ]),
+    ));
+    assert_eq!(
+        make_credential,
+        vec![u8::from(ErrorStatus::OperationDenied)],
+        "the request should pass approval reuse and fail only because tests have no TPM"
+    );
+    assert_eq!(approval_count.load(Ordering::SeqCst), 1);
 
     let retries = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
@@ -486,8 +542,11 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
         value: token_value,
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: None,
+        session_uid: authenticator.session.uid,
+        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now() - Duration::from_secs(31),
         first_used_at: None,
+        user_present_until: None,
     });
     assert_eq!(
         authenticator.validate_pin_uv_auth(
@@ -691,8 +750,11 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: Some(rp_id.to_owned()),
+        session_uid: authenticator.session.uid,
+        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
+        user_present_until: None,
     });
 
     // Should be rejected: Some(rp_id) token with None rp_id passed
@@ -714,8 +776,11 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: None,
+        session_uid: authenticator.session.uid,
+        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
+        user_present_until: None,
     });
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
@@ -748,8 +813,11 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         value: token,
         permissions: Ctap2PermissionFlags::GET_ASSERTION,
         rp_id: Some(rp_id.to_owned()),
+        session_uid: authenticator.session.uid,
+        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
+        user_present_until: None,
     });
     let mut mac =
         HmacSha256::new_from_slice(&authenticator.pin_uv_auth_token.as_ref().unwrap().value)
@@ -785,8 +853,11 @@ fn credential_management_enumerates_discoverable_credentials_with_permission_tok
         value: token.clone(),
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: None,
+        session_uid: authenticator.session.uid,
+        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
+        user_present_until: None,
     });
 
     let request = Value::Map(vec![
@@ -1371,6 +1442,15 @@ fn unsupported_policy_version_rejects_assertion() {
 }
 
 struct AlwaysApprove;
+
+struct CountingApproval(Arc<AtomicUsize>);
+
+impl approval::UserApproval for CountingApproval {
+    fn approve(&self, _prompt: &str, _session: &session::SessionContext) -> bool {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
 
 impl approval::UserApproval for AlwaysApprove {
     fn approve(&self, _prompt: &str, _session: &session::SessionContext) -> bool {
