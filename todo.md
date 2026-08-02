@@ -15,4 +15,4 @@
 - [x] Route ClientPIN subcommands 0x06 and 0x09 per CTAP 2.2.
 - [x] Add UV retry and browser-shaped UV token tests.
 - [x] Log CTAP status codes for failed commands.
-- [ ] Run Rust and NixOS validation.
+- [x] Run Rust and NixOS validation.
