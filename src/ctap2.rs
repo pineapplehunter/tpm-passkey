@@ -45,6 +45,10 @@ bitflags! {
         const MAKE_CREDENTIAL = 1 << 0;
         const GET_ASSERTION = 1 << 1;
         const CREDENTIAL_MANAGEMENT = 1 << 2;
+        const BIO_ENROLLMENT = 1 << 3;
+        const LARGE_BLOB_WRITE = 1 << 4;
+        const AUTHENTICATOR_CONFIGURATION = 1 << 5;
+        const PERSISTENT_CREDENTIAL_MANAGEMENT_READ_ONLY = 1 << 6;
     }
 }
 
@@ -64,6 +68,7 @@ pub struct Authenticator {
     client_pin: Option<ClientPinState>,
     key_agreement: Option<EphemeralSecret>,
     pin_uv_auth_token: Option<PinUvAuthToken>,
+    consecutive_pin_mismatches: u8,
     /// Set when `authenticatorSelection` (or a UV gesture) satisfied user
     /// verification for the current transaction. CTAP2.1 routes UV through
     /// `authenticatorSelection` when the authenticator advertises `uv` but
@@ -146,6 +151,7 @@ impl Authenticator {
             client_pin,
             key_agreement: None,
             pin_uv_auth_token: None,
+            consecutive_pin_mismatches: 0,
             uv_satisfied: false,
             management: None,
         }
@@ -745,8 +751,15 @@ impl Authenticator {
 
     fn client_pin(&mut self, body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
         let request = decode_map(body)?;
-        validate_pin_uv_protocol(map_integer(&request, 1))?;
+        let protocol = map_integer(&request, 1);
         let sub_command = map_integer(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
+        if matches!(sub_command, 1 | 7) {
+            if protocol.is_some() {
+                validate_pin_uv_protocol(protocol)?;
+            }
+        } else {
+            validate_pin_uv_protocol(protocol)?;
+        }
         log::debug!(
             "clientPIN request subcommand={} code={sub_command:#04x}",
             client_pin_subcommand_name(sub_command)
@@ -755,104 +768,64 @@ impl Authenticator {
 
         match sub_command {
             1 => {
-                if map_value(&request, 3).is_some() || map_value(&request, 4).is_some() {
-                    return Err(ErrorStatus::InvalidParameter);
-                }
                 let retries = i64::from(
                     self.client_pin
                         .as_ref()
                         .map_or(PIN_RETRIES, |pin| pin.retries),
                 );
-                Ok(encode_response(
-                    cbor!({
-                        3 => retries,
-                    })
-                    .unwrap(),
-                ))
+                let mut response = vec![(Value::Integer(3.into()), Value::Integer(retries.into()))];
+                if self.consecutive_pin_mismatches >= 3 {
+                    response.push((Value::Integer(4.into()), Value::Bool(true)));
+                }
+                Ok(encode_response(Value::Map(response)))
             }
             2 => {
-                if map_value(&request, 3).is_some() || map_value(&request, 4).is_some() {
-                    return Err(ErrorStatus::InvalidParameter);
-                }
                 self.key_agreement = Some(EphemeralSecret::generate());
                 Ok(key_agreement_response(
                     self.key_agreement.as_ref().expect("just generated"),
                 ))
             }
-            3 => {
-                let (new_pin_enc, pin_uv_auth_param) = if let Some(params) = map_map(&request, 4) {
-                    (map_bytes(params, 1), map_bytes(params, 2))
-                } else {
-                    (map_bytes(&request, 5), map_bytes(&request, 4))
-                };
-                self.set_pin(
+            3 => self.set_pin(
+                key_agreement,
+                map_bytes(&request, 5).ok_or(ErrorStatus::MissingParameter)?,
+                map_bytes(&request, 4).ok_or(ErrorStatus::MissingParameter)?,
+            ),
+            4 => self.change_pin(
+                key_agreement,
+                map_bytes(&request, 5).ok_or(ErrorStatus::MissingParameter)?,
+                map_bytes(&request, 6).ok_or(ErrorStatus::MissingParameter)?,
+                map_bytes(&request, 4).ok_or(ErrorStatus::MissingParameter)?,
+            ),
+            5 => {
+                if map_value(&request, 9).is_some() || map_value(&request, 10).is_some() {
+                    return Err(ErrorStatus::InvalidParameter);
+                }
+                self.get_pin_uv_auth_token(
                     key_agreement,
-                    new_pin_enc.ok_or(ErrorStatus::MissingParameter)?,
-                    pin_uv_auth_param.ok_or(ErrorStatus::MissingParameter)?,
+                    map_bytes(&request, 6).ok_or(ErrorStatus::MissingParameter)?,
+                    0x03,
+                    None,
+                    true,
                 )
             }
-            4 => {
-                let (new_pin_enc, pin_hash_enc, pin_uv_auth_param) =
-                    if let Some(params) = map_map(&request, 4) {
-                        (
-                            map_bytes(params, 1),
-                            map_bytes(params, 2),
-                            map_bytes(params, 3),
-                        )
-                    } else {
-                        (
-                            map_bytes(&request, 5),
-                            map_bytes(&request, 6),
-                            map_bytes(&request, 4),
-                        )
-                    };
-                self.change_pin(
-                    key_agreement,
-                    new_pin_enc.ok_or(ErrorStatus::MissingParameter)?,
-                    pin_hash_enc.ok_or(ErrorStatus::MissingParameter)?,
-                    pin_uv_auth_param.ok_or(ErrorStatus::MissingParameter)?,
-                )
-            }
-            6 => {
-                let (permissions, rp_id) = pin_uv_permissions(&request);
-                self.get_pin_uv_auth_token_using_uv(
-                    key_agreement,
-                    permissions.ok_or(ErrorStatus::MissingParameter)?,
-                    rp_id,
-                )
-            }
+            6 => self.get_pin_uv_auth_token_using_uv(
+                key_agreement,
+                pin_uv_permissions(&request).ok_or(ErrorStatus::MissingParameter)?,
+                map_text(&request, 10).map(str::to_owned),
+            ),
             7 => Ok(encode_response(
                 cbor!({
                     5 => UV_RETRIES,
                 })
                 .unwrap(),
             )),
-            9 => {
-                let (pin_hash_enc, permissions, rp_id) = if let Some(params) = map_map(&request, 4)
-                {
-                    (
-                        map_bytes(params, 1),
-                        map_integer(params, 2)
-                            .and_then(|value| u8::try_from(value).ok())
-                            .and_then(Ctap2PermissionFlags::from_bits),
-                        map_text(params, 3).map(str::to_owned),
-                    )
-                } else {
-                    (
-                        map_bytes(&request, 6),
-                        map_integer(&request, 9)
-                            .and_then(|value| u8::try_from(value).ok())
-                            .and_then(Ctap2PermissionFlags::from_bits),
-                        map_text(&request, 10).map(str::to_owned),
-                    )
-                };
-                self.get_pin_uv_auth_token(
-                    key_agreement,
-                    pin_hash_enc.ok_or(ErrorStatus::MissingParameter)?,
-                    permissions.ok_or(ErrorStatus::MissingParameter)?,
-                    rp_id,
-                )
-            }
+            9 => self.get_pin_uv_auth_token(
+                key_agreement,
+                map_bytes(&request, 6).ok_or(ErrorStatus::MissingParameter)?,
+                pin_uv_permissions(&request).ok_or(ErrorStatus::MissingParameter)?,
+                map_text(&request, 10).map(str::to_owned),
+                false,
+            ),
             _ => Err(ErrorStatus::InvalidCommand),
         }
     }
@@ -1046,9 +1019,9 @@ impl Authenticator {
         pin_uv_auth_param: &[u8],
     ) -> Result<Vec<u8>, ErrorStatus> {
         if self.client_pin.is_some() {
-            return Err(ErrorStatus::InvalidCommand);
+            return Err(ErrorStatus::PinAuthInvalid);
         }
-        if new_pin_enc.len() < 16 || !(new_pin_enc.len() - 16).is_multiple_of(16) {
+        if new_pin_enc.len() != 80 {
             return Err(ErrorStatus::InvalidParameter);
         }
         let (aes_key, hmac_key) = self.pin_uv_keys(key_agreement)?;
@@ -1080,11 +1053,7 @@ impl Authenticator {
         if self.client_pin.is_none() {
             return Err(ErrorStatus::PinNotSet);
         }
-        if new_pin_enc.len() < 16
-            || !(new_pin_enc.len() - 16).is_multiple_of(16)
-            || pin_hash_enc.len() < 16
-            || !(pin_hash_enc.len() - 16).is_multiple_of(16)
-        {
+        if new_pin_enc.len() != 80 || pin_hash_enc.len() != 32 {
             return Err(ErrorStatus::InvalidParameter);
         }
         let (aes_key, hmac_key) = self.pin_uv_keys(key_agreement)?;
@@ -1092,10 +1061,10 @@ impl Authenticator {
         auth_message.extend_from_slice(new_pin_enc);
         auth_message.extend_from_slice(pin_hash_enc);
         verify_pin_uv_auth_param(&hmac_key, pin_uv_auth_param, &auth_message)?;
-        let new_pin = decrypt_pin(&aes_key, new_pin_enc)?;
-        validate_new_pin(&new_pin)?;
         let pin_hash = decrypt_pin_hash(&aes_key, pin_hash_enc)?;
         self.authenticate_pin(&pin_hash)?;
+        let new_pin = decrypt_pin(&aes_key, new_pin_enc)?;
+        validate_new_pin(&new_pin)?;
 
         let mut pin_salt = vec![0u8; 32];
         fill_random(&mut pin_salt);
@@ -1109,6 +1078,7 @@ impl Authenticator {
         };
         self.persist_client_pin(&state)?;
         self.client_pin = Some(state);
+        self.pin_uv_auth_token = None;
         Ok(encode_response(Value::Map(Vec::new())))
     }
 
@@ -1116,15 +1086,12 @@ impl Authenticator {
         &mut self,
         key_agreement: Option<&[(Value, Value)]>,
         pin_hash_enc: &[u8],
-        permissions: Ctap2PermissionFlags,
+        raw_permissions: u8,
         rp_id: Option<String>,
+        allow_missing_rp_id: bool,
     ) -> Result<Vec<u8>, ErrorStatus> {
-        if permissions.is_empty() {
-            return Err(ErrorStatus::InvalidParameter);
-        }
-        if permissions.contains(Ctap2PermissionFlags::GET_ASSERTION) && rp_id.is_none() {
-            return Err(ErrorStatus::InvalidParameter);
-        }
+        let permissions =
+            validate_token_permissions(raw_permissions, rp_id.as_deref(), allow_missing_rp_id)?;
         let (aes_key, _mac_key) = self.pin_uv_keys(key_agreement)?;
         let pin_hash = decrypt_pin_hash(&aes_key, pin_hash_enc)?;
         self.authenticate_pin(&pin_hash)?;
@@ -1149,15 +1116,10 @@ impl Authenticator {
     fn get_pin_uv_auth_token_using_uv(
         &mut self,
         key_agreement: Option<&[(Value, Value)]>,
-        permissions: Ctap2PermissionFlags,
+        raw_permissions: u8,
         rp_id: Option<String>,
     ) -> Result<Vec<u8>, ErrorStatus> {
-        if permissions.is_empty() {
-            return Err(ErrorStatus::InvalidParameter);
-        }
-        if permissions.contains(Ctap2PermissionFlags::GET_ASSERTION) && rp_id.is_none() {
-            return Err(ErrorStatus::InvalidParameter);
-        }
+        let permissions = validate_token_permissions(raw_permissions, rp_id.as_deref(), false)?;
         if !self.session.verify_matches_current()
             || !self
                 .approval
@@ -1215,14 +1177,19 @@ impl Authenticator {
             pin.retries = pin.retries.saturating_sub(1);
             let retries = pin.retries;
             let state = pin.clone();
+            self.consecutive_pin_mismatches = self.consecutive_pin_mismatches.saturating_add(1);
+            self.key_agreement = None;
             self.persist_client_pin(&state)?;
             return Err(if retries == 0 {
                 ErrorStatus::PinBlocked
+            } else if self.consecutive_pin_mismatches >= 3 {
+                ErrorStatus::PinAuthBlocked
             } else {
                 ErrorStatus::PinInvalid
             });
         }
 
+        self.consecutive_pin_mismatches = 0;
         if pin.retries != PIN_RETRIES {
             pin.retries = PIN_RETRIES;
             let state = pin.clone();
@@ -1357,7 +1324,7 @@ impl Authenticator {
             self.pin_uv_auth_token = None;
             return Err(ErrorStatus::PinAuthInvalid);
         }
-        if auth_param.len() != 16 && auth_param.len() != 32 {
+        if auth_param.len() != 32 {
             self.pin_uv_auth_token = None;
             return Err(ErrorStatus::PinAuthInvalid);
         }
@@ -1533,24 +1500,35 @@ fn client_pin_subcommand_name(sub_command: i128) -> &'static str {
     }
 }
 
-fn pin_uv_permissions(
-    request: &[(Value, Value)],
-) -> (Option<Ctap2PermissionFlags>, Option<String>) {
-    if let Some(params) = map_map(request, 4) {
-        (
-            map_integer(params, 2)
-                .and_then(|value| u8::try_from(value).ok())
-                .and_then(Ctap2PermissionFlags::from_bits),
-            map_text(params, 3).map(str::to_owned),
-        )
-    } else {
-        (
-            map_integer(request, 9)
-                .and_then(|value| u8::try_from(value).ok())
-                .and_then(Ctap2PermissionFlags::from_bits),
-            map_text(request, 10).map(str::to_owned),
-        )
+fn pin_uv_permissions(request: &[(Value, Value)]) -> Option<u8> {
+    map_integer(request, 9).and_then(|value| u8::try_from(value).ok())
+}
+
+fn validate_token_permissions(
+    raw_permissions: u8,
+    rp_id: Option<&str>,
+    allow_missing_rp_id: bool,
+) -> Result<Ctap2PermissionFlags, ErrorStatus> {
+    if raw_permissions == 0 {
+        return Err(ErrorStatus::InvalidParameter);
     }
+    let permissions = Ctap2PermissionFlags::from_bits_truncate(raw_permissions);
+    if permissions.intersects(
+        Ctap2PermissionFlags::BIO_ENROLLMENT
+            | Ctap2PermissionFlags::LARGE_BLOB_WRITE
+            | Ctap2PermissionFlags::AUTHENTICATOR_CONFIGURATION
+            | Ctap2PermissionFlags::PERSISTENT_CREDENTIAL_MANAGEMENT_READ_ONLY,
+    ) {
+        return Err(ErrorStatus::UnauthorizedPermission);
+    }
+    if !allow_missing_rp_id
+        && permissions
+            .intersects(Ctap2PermissionFlags::MAKE_CREDENTIAL | Ctap2PermissionFlags::GET_ASSERTION)
+        && rp_id.is_none()
+    {
+        return Err(ErrorStatus::MissingParameter);
+    }
+    Ok(permissions)
 }
 
 fn validate_pin_uv_protocol(protocol: Option<i128>) -> Result<(), ErrorStatus> {
@@ -1569,6 +1547,17 @@ fn key_agreement_response(secret: &EphemeralSecret) -> Vec<u8> {
 }
 
 fn parse_key_agreement(map: &[(Value, Value)]) -> Result<PublicKey, ErrorStatus> {
+    const REQUIRED_KEYS: [i128; 5] = [1, 3, -1, -2, -3];
+    if map.len() != REQUIRED_KEYS.len()
+        || REQUIRED_KEYS.iter().any(|required| {
+            map.iter()
+                .filter(|(key, _)| key.as_integer().map(i128::from) == Some(*required))
+                .count()
+                != 1
+        })
+    {
+        return Err(ErrorStatus::InvalidParameter);
+    }
     let kty = map_integer(map, 1).ok_or(ErrorStatus::InvalidParameter)?;
     let alg = map_integer(map, 3).ok_or(ErrorStatus::InvalidParameter)?;
     let crv = map_integer(map, -1).ok_or(ErrorStatus::InvalidParameter)?;
@@ -1601,7 +1590,7 @@ fn verify_pin_uv_auth_param(
     auth_param: &[u8],
     message: &[u8],
 ) -> Result<(), ErrorStatus> {
-    if auth_param.len() != 16 && auth_param.len() != 32 {
+    if auth_param.len() != 32 {
         return Err(ErrorStatus::PinAuthInvalid);
     }
     let mut mac = HmacSha256::new_from_slice(hmac_key).map_err(|_| ErrorStatus::OperationDenied)?;
@@ -1663,7 +1652,8 @@ fn decrypt_pin_hash(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, ErrorSt
 }
 
 fn validate_new_pin(pin: &[u8]) -> Result<(), ErrorStatus> {
-    if !(4..=63).contains(&pin.len()) || pin.contains(&0) {
+    let pin_text = std::str::from_utf8(pin).map_err(|_| ErrorStatus::PinPolicyViolation)?;
+    if pin.len() > 63 || pin_text.chars().count() < 4 || pin.contains(&0) {
         return Err(ErrorStatus::PinPolicyViolation);
     }
     Ok(())

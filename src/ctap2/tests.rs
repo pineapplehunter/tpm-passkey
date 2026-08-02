@@ -152,23 +152,17 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
     let mut padded_pin = vec![b'1', b'2', b'3', b'4'];
     padded_pin.resize(64, 0);
     let encrypted_pin = encrypt_aes(&aes_key, &padded_pin).expect("encrypt PIN");
-    let set_params = Value::Map(vec![
-        (
-            Value::Integer(1.into()),
-            Value::Bytes(encrypted_pin.clone()),
-        ),
-        (
-            Value::Integer(2.into()),
-            Value::Bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
-        ),
-    ]);
     let set_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
         Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
             (Value::Integer(2.into()), Value::Integer(3.into())),
             (Value::Integer(3.into()), client_key.clone()),
-            (Value::Integer(4.into()), set_params),
+            (
+                Value::Integer(4.into()),
+                Value::Bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
+            ),
+            (Value::Integer(5.into()), Value::Bytes(encrypted_pin)),
         ]),
     ));
     assert_eq!(set_response[0], 0x00);
@@ -196,6 +190,10 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
             (Value::Integer(3.into()), client_key),
             (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
             (Value::Integer(9.into()), Value::Integer(1.into())),
+            (
+                Value::Integer(10.into()),
+                Value::Text("example.com".to_owned()),
+            ),
         ]),
     ));
     assert_eq!(token_response[0], 0x00);
@@ -225,9 +223,62 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
             ),
             (Value::Integer(6.into()), Value::Bytes(wrong_encrypted_hash)),
             (Value::Integer(9.into()), Value::Integer(1.into())),
+            (
+                Value::Integer(10.into()),
+                Value::Text("example.com".to_owned()),
+            ),
         ]),
     ));
     assert_eq!(wrong_response, vec![ErrorStatus::PinInvalid as u8]);
+
+    for expected_status in [ErrorStatus::PinInvalid, ErrorStatus::PinAuthBlocked] {
+        let retry_secret = EphemeralSecret::generate();
+        let retry_server_key = client_pin_key_agreement(&mut authenticator);
+        let retry_server_public =
+            parse_key_agreement(&retry_server_key).expect("valid server public key");
+        let (retry_aes_key, _) = derive_protocol2_keys(
+            retry_secret
+                .diffie_hellman(&retry_server_public)
+                .raw_secret_bytes()
+                .as_slice(),
+        )
+        .expect("derive protocol 2 keys");
+        let wrong_encrypted_hash =
+            encrypt_aes(&retry_aes_key, &wrong_hash[..16]).expect("encrypt PIN hash");
+        let response = authenticator.handle_cbor(&ctap_request(
+            Ctap2Command::ClientPin,
+            Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(2.into())),
+                (Value::Integer(2.into()), Value::Integer(9.into())),
+                (
+                    Value::Integer(3.into()),
+                    client_key_agreement(&retry_secret),
+                ),
+                (Value::Integer(6.into()), Value::Bytes(wrong_encrypted_hash)),
+                (Value::Integer(9.into()), Value::Integer(1.into())),
+                (
+                    Value::Integer(10.into()),
+                    Value::Text("example.com".to_owned()),
+                ),
+            ]),
+        ));
+        assert_eq!(response, vec![u8::from(expected_status)]);
+    }
+
+    let blocked_retries = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(1.into()))]),
+    ));
+    let Value::Map(blocked_retries) =
+        ciborium::from_reader::<Value, _>(&blocked_retries[1..]).expect("CBOR")
+    else {
+        panic!("expected blocked retries response");
+    };
+    assert_eq!(
+        map_value(&blocked_retries, 3),
+        Some(&Value::Integer(5.into()))
+    );
+    assert_eq!(map_value(&blocked_retries, 4), Some(&Value::Bool(true)));
 
     let mut restored = Authenticator::new(store_dir.clone(), None);
     let restored_retries = restored.handle_cbor(&ctap_request(
@@ -242,7 +293,50 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
     else {
         panic!("expected restored getRetries response");
     };
-    assert_eq!(map_value(&restored_map, 3), Some(&Value::Integer(7.into())));
+    assert_eq!(map_value(&restored_map, 3), Some(&Value::Integer(5.into())));
+
+    let legacy_secret = EphemeralSecret::generate();
+    let legacy_server_key = client_pin_key_agreement(&mut restored);
+    let legacy_server_public =
+        parse_key_agreement(&legacy_server_key).expect("valid server public key");
+    let (legacy_aes_key, _) = derive_protocol2_keys(
+        legacy_secret
+            .diffie_hellman(&legacy_server_public)
+            .raw_secret_bytes()
+            .as_slice(),
+    )
+    .expect("derive protocol 2 keys");
+    let encrypted_pin_hash =
+        encrypt_aes(&legacy_aes_key, &pin_hash[..16]).expect("encrypt PIN hash");
+    let legacy_response = restored.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Integer(5.into())),
+            (
+                Value::Integer(3.into()),
+                client_key_agreement(&legacy_secret),
+            ),
+            (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
+        ]),
+    ));
+    assert_eq!(legacy_response[0], 0x00);
+    let Value::Map(legacy_response) =
+        ciborium::from_reader::<Value, _>(&legacy_response[1..]).expect("CBOR")
+    else {
+        panic!("expected legacy token response");
+    };
+    assert_eq!(legacy_response.len(), 1);
+    assert_eq!(
+        decrypt_aes(
+            &legacy_aes_key,
+            map_bytes(&legacy_response, 2).expect("encrypted legacy token")
+        )
+        .expect("decrypt legacy token")
+        .len(),
+        32
+    );
+
     std::fs::remove_dir_all(store_dir).expect("remove test store");
 }
 
@@ -312,6 +406,84 @@ fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
 }
 
 #[test]
+fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
+    let store_dir = test_store_dir("client-pin-wire-shape");
+    let mut authenticator = Authenticator::new(store_dir.clone(), None);
+
+    let retries = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(1.into()))]),
+    ));
+    assert_eq!(
+        retries[0], 0x00,
+        "getPINRetries does not require a protocol"
+    );
+
+    let nested_parameters = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Integer(3.into())),
+            (Value::Integer(4.into()), Value::Map(Vec::new())),
+        ]),
+    ));
+    assert_eq!(
+        nested_parameters,
+        vec![u8::from(ErrorStatus::MissingParameter)]
+    );
+
+    assert_eq!(
+        validate_token_permissions(0, Some("example.com"), false),
+        Err(ErrorStatus::InvalidParameter)
+    );
+    assert_eq!(
+        validate_token_permissions(1, None, false),
+        Err(ErrorStatus::MissingParameter)
+    );
+    assert_eq!(
+        validate_token_permissions(8, None, false),
+        Err(ErrorStatus::UnauthorizedPermission)
+    );
+    assert!(
+        validate_token_permissions(0x80, None, false)
+            .expect("undefined permission bits are ignored")
+            .is_empty()
+    );
+
+    assert_eq!(
+        validate_new_pin("éé".as_bytes()),
+        Err(ErrorStatus::PinPolicyViolation)
+    );
+    assert_eq!(validate_new_pin("éééé".as_bytes()), Ok(()));
+
+    let secret = EphemeralSecret::generate();
+    let Value::Map(mut key) = client_key_agreement(&secret) else {
+        panic!("expected key agreement map");
+    };
+    key.push((Value::Integer(2.into()), Value::Bytes(vec![1])));
+    assert!(matches!(
+        parse_key_agreement(&key),
+        Err(ErrorStatus::InvalidParameter)
+    ));
+
+    let _ = std::fs::remove_dir_all(store_dir);
+}
+
+#[test]
+fn protocol2_authentication_parameters_are_full_length() {
+    let key = [0x55; 32];
+    let message = b"protocol-two-message";
+    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC key");
+    mac.update(message);
+    let signature = mac.finalize().into_bytes();
+    assert_eq!(verify_pin_uv_auth_param(&key, &signature, message), Ok(()));
+    assert_eq!(
+        verify_pin_uv_auth_param(&key, &signature[..16], message),
+        Err(ErrorStatus::PinAuthInvalid)
+    );
+}
+
+#[test]
 fn protocol2_aes_and_hmac_use_separate_derived_keys() {
     let secret = [0x42; 32];
     let (aes_key, hmac_key) = derive_protocol2_keys(&secret).expect("derive keys");
@@ -352,23 +524,17 @@ fn make_credential_with_pin_uv_auth_token_regression() {
     let mut padded_pin = vec![b'1', b'2', b'3', b'4'];
     padded_pin.resize(64, 0);
     let encrypted_pin = encrypt_aes(&aes_key, &padded_pin).expect("encrypt PIN");
-    let set_params = Value::Map(vec![
-        (
-            Value::Integer(1.into()),
-            Value::Bytes(encrypted_pin.clone()),
-        ),
-        (
-            Value::Integer(2.into()),
-            Value::Bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
-        ),
-    ]);
     let set_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
         Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
             (Value::Integer(2.into()), Value::Integer(3.into())),
             (Value::Integer(3.into()), client_key),
-            (Value::Integer(4.into()), set_params),
+            (
+                Value::Integer(4.into()),
+                Value::Bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
+            ),
+            (Value::Integer(5.into()), Value::Bytes(encrypted_pin)),
         ]),
     ));
     assert_eq!(set_response[0], 0x00, "setPin should succeed");
@@ -539,7 +705,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         HmacSha256::new_from_slice(&authenticator.pin_uv_auth_token.as_ref().unwrap().value)
             .expect("HMAC key");
     mac.update(&client_data_hash);
-    let assertion_auth_param = mac.finalize().into_bytes()[..16].to_vec();
+    let assertion_auth_param = mac.finalize().into_bytes().to_vec();
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
         Some(&assertion_auth_param),
@@ -1099,6 +1265,7 @@ fn authenticator_with_credentials(
         client_pin: None,
         key_agreement: None,
         pin_uv_auth_token: None,
+        consecutive_pin_mismatches: 0,
         uv_satisfied: false,
         management: None,
     }
@@ -1192,7 +1359,7 @@ fn client_key_agreement(secret: &EphemeralSecret) -> Value {
 fn pin_auth_param(key: &[u8; 32], message: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
     mac.update(message);
-    mac.finalize().into_bytes()[..16].to_vec()
+    mac.finalize().into_bytes().to_vec()
 }
 
 fn management_pin_auth(
@@ -1203,7 +1370,7 @@ fn management_pin_auth(
     let message = management_auth_message(sub_command, params);
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
     mac.update(&message);
-    mac.finalize().into_bytes()[..16].to_vec()
+    mac.finalize().into_bytes().to_vec()
 }
 
 fn options_map(options: &[(&str, bool)]) -> Vec<(Value, Value)> {

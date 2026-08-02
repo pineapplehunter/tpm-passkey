@@ -71,8 +71,10 @@ pub(super) enum ErrorStatus {
     PinInvalid = 0x31,
     PinBlocked = 0x32,
     PinAuthInvalid = 0x33,
+    PinAuthBlocked = 0x34,
     PinNotSet = 0x35,
     PinPolicyViolation = 0x37,
+    UnauthorizedPermission = 0x40,
 }
 
 impl From<ErrorStatus> for u8 {
