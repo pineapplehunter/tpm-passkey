@@ -24,7 +24,7 @@ It exposes a browser-usable virtual HID authenticator, which uses the TPM for si
 Daemon:
 
 ```sh
-linux-tpm-fido2 --store-dir .linux-tpm-fido2-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
+linux-tpm-fido2 daemon --store-dir .linux-tpm-fido2-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
 ```
 
 Useful flags:
@@ -41,7 +41,7 @@ Useful flags:
 ## Future Work
 
 - Expand CTAP2 compatibility for additional browser request shapes.
-- Compatibility with polkit
+- Harden polkit and session-switch handling.
 - Further security review
 
 ## Current Limits

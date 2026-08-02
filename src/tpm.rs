@@ -166,6 +166,14 @@ impl Tpm {
         })
     }
 
+    /// Select the PCRs used by subsequent policy creation, update, and signing.
+    pub fn set_pcr_indices(&mut self, pcr_indices: &[u32]) -> Result<()> {
+        let (selection, name) = default_pcr_selection(Some(pcr_indices))?;
+        self.pcr_selection_list = selection;
+        self.pcr_selection_name = name;
+        Ok(())
+    }
+
     pub fn probe(&mut self) -> Result<()> {
         let random = self
             .context
@@ -919,15 +927,49 @@ fn signing_key_public(policy: Option<&PcrPolicyBinding>, user_with_auth: bool) -
 }
 
 pub fn pcr_selection_for_indices(pcr_indices: &[u32]) -> Result<PcrSelectionList> {
+    if pcr_indices.is_empty() {
+        return Err(eyre!("at least one PCR index is required"));
+    }
+    if let Some(index) = pcr_indices.iter().find(|&&index| index > 23) {
+        return Err(eyre!("invalid PCR index {index}; expected 0..=23"));
+    }
+    let mut unique = pcr_indices.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != pcr_indices.len() {
+        return Err(eyre!("duplicate PCR indices are not allowed"));
+    }
+
     let slots: Result<Vec<PcrSlot>> = pcr_indices
         .iter()
-        .map(|&i| PcrSlot::try_from(1u32 << i).map_err(|_| eyre!("invalid PCR index {}", i)))
+        .map(|&index| {
+            PcrSlot::try_from(1u32 << index).map_err(|_| eyre!("invalid PCR index {index}"))
+        })
         .collect();
-    let slots = slots?;
     PcrSelectionListBuilder::new()
-        .with_selection(HashingAlgorithm::Sha256, &slots)
+        .with_selection(HashingAlgorithm::Sha256, &slots?)
         .build()
         .wrap_err("building PCR selection list")
+}
+
+pub fn pcr_indices_from_selection(selection: &str) -> Result<Vec<u32>> {
+    let (algorithm, indices) = selection
+        .split_once(':')
+        .ok_or_else(|| eyre!("invalid PCR selection {selection:?}"))?;
+    if algorithm != "sha256" {
+        return Err(eyre!("unsupported PCR bank {algorithm:?}"));
+    }
+    let indices = indices
+        .split(',')
+        .map(|index| {
+            index
+                .trim()
+                .parse::<u32>()
+                .wrap_err_with(|| format!("invalid PCR index {index:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pcr_selection_for_indices(&indices)?;
+    Ok(indices)
 }
 
 fn default_pcr_selection(pcr_indices: Option<&[u32]>) -> Result<(PcrSelectionList, String)> {
@@ -1015,7 +1057,28 @@ fn der_integer(value: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryKdf, recovery_passphrase_hash, recovery_passphrase_matches};
+    use super::{
+        RecoveryKdf, pcr_indices_from_selection, pcr_selection_for_indices,
+        recovery_passphrase_hash, recovery_passphrase_matches,
+    };
+
+    #[test]
+    fn pcr_selection_validation_rejects_invalid_input() {
+        assert!(pcr_selection_for_indices(&[]).is_err());
+        assert!(pcr_selection_for_indices(&[7, 7]).is_err());
+        assert!(pcr_selection_for_indices(&[24]).is_err());
+        assert!(pcr_selection_for_indices(&[1, 7]).is_ok());
+    }
+
+    #[test]
+    fn stored_pcr_selection_round_trips() {
+        assert_eq!(
+            pcr_indices_from_selection("sha256:1,7").expect("valid selection"),
+            vec![1, 7]
+        );
+        assert!(pcr_indices_from_selection("sha1:7").is_err());
+        assert!(pcr_indices_from_selection("sha256:").is_err());
+    }
 
     #[test]
     fn recovery_passphrase_hash_is_deterministic() {

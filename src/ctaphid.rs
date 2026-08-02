@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use crate::{ctap2, hid::REPORT_SIZE, store};
 
@@ -41,6 +44,7 @@ enum CtapHidError {
     Command = 0x01,
     Length = 0x03,
     Seq = 0x04,
+    Channel = 0x0b,
 }
 
 const CAPABILITY_CBOR: u8 = 0x04;
@@ -50,6 +54,7 @@ const MAX_PAYLOAD_SIZE: usize = (REPORT_SIZE - 7) + 128 * (REPORT_SIZE - 5);
 
 pub struct PacketHandler {
     pending: HashMap<u32, PendingRequest>,
+    allocated_channels: HashSet<u32>,
     next_cid: u32,
     authenticator: ctap2::Authenticator,
 }
@@ -79,6 +84,7 @@ impl PacketHandler {
     pub fn new(store_dir: PathBuf, tpm_path: Option<PathBuf>) -> Self {
         Self {
             pending: HashMap::new(),
+            allocated_channels: HashSet::new(),
             next_cid: 1,
             authenticator: ctap2::Authenticator::new(store_dir, tpm_path),
         }
@@ -124,6 +130,15 @@ impl PacketHandler {
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Command)));
         };
 
+        let channel_is_valid = match command {
+            CtapHidCommand::Init => cid == BROADCAST_CID || self.allocated_channels.contains(&cid),
+            _ => cid != BROADCAST_CID && self.allocated_channels.contains(&cid),
+        };
+        if cid == 0 || !channel_is_valid {
+            self.pending.remove(&cid);
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Channel)));
+        }
+
         let first_len = payload_len.min(REPORT_SIZE - 7);
         let mut payload = Vec::with_capacity(payload_len);
         payload.extend_from_slice(&report[7..7 + first_len]);
@@ -154,7 +169,12 @@ impl PacketHandler {
         sequence: u8,
         report: &[u8],
     ) -> Option<PacketOutcome> {
-        let pending = self.pending.get_mut(&cid)?;
+        if !self.allocated_channels.contains(&cid) {
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Channel)));
+        }
+        let Some(pending) = self.pending.get_mut(&cid) else {
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Seq)));
+        };
 
         if pending.cid != cid || pending.next_sequence != sequence {
             let error_cid = pending.cid;
@@ -183,11 +203,15 @@ impl PacketHandler {
         match command {
             CtapHidCommand::Init => {
                 let allocated_cid = if cid == BROADCAST_CID {
-                    if self.next_cid == 0 {
-                        self.next_cid = 1;
+                    while self.next_cid == 0
+                        || self.next_cid == BROADCAST_CID
+                        || self.allocated_channels.contains(&self.next_cid)
+                    {
+                        self.next_cid = self.next_cid.wrapping_add(1).max(1);
                     }
                     let allocated = self.next_cid;
                     self.next_cid = self.next_cid.wrapping_add(1).max(1);
+                    self.allocated_channels.insert(allocated);
                     allocated
                 } else {
                     cid
@@ -328,13 +352,31 @@ fn encode_message(cid: u32, command: CtapHidCommand, payload: &[u8]) -> Vec<[u8;
 mod tests {
     use super::*;
 
-    fn init_packet() -> [u8; REPORT_SIZE] {
+    fn command_packet(cid: u32, command: CtapHidCommand, payload: &[u8]) -> [u8; REPORT_SIZE] {
         let mut packet = [0u8; REPORT_SIZE];
-        packet[0..4].copy_from_slice(&BROADCAST_CID.to_be_bytes());
-        packet[4] = CtapHidCommand::Init.byte() | TYPE_INIT;
-        packet[5..7].copy_from_slice(&8u16.to_be_bytes());
-        packet[7..15].copy_from_slice(b"12345678");
+        packet[0..4].copy_from_slice(&cid.to_be_bytes());
+        packet[4] = command.byte() | TYPE_INIT;
+        packet[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        let first_len = payload.len().min(REPORT_SIZE - 7);
+        packet[7..7 + first_len].copy_from_slice(&payload[..first_len]);
         packet
+    }
+
+    fn init_packet() -> [u8; REPORT_SIZE] {
+        command_packet(BROADCAST_CID, CtapHidCommand::Init, b"12345678")
+    }
+
+    fn allocate_channel(handler: &mut PacketHandler) -> u32 {
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&init_packet()) else {
+            panic!("expected INIT response");
+        };
+        u32::from_be_bytes(response.payload[8..12].try_into().expect("allocated CID"))
+    }
+
+    fn assert_error(response: Response, cid: u32, expected: CtapHidError) {
+        assert_eq!(response.cid, cid);
+        assert_eq!(response.command, CtapHidCommand::Error);
+        assert_eq!(response.payload, vec![expected as u8]);
     }
 
     #[test]
@@ -350,16 +392,17 @@ mod tests {
     #[test]
     fn continuation_packets_are_assembled() {
         let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
         let payload = vec![0xaa; 100];
 
         let mut first = [0u8; REPORT_SIZE];
-        first[0..4].copy_from_slice(&7u32.to_be_bytes());
+        first[0..4].copy_from_slice(&cid.to_be_bytes());
         first[4] = CtapHidCommand::Ping.byte() | TYPE_INIT;
         first[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         first[7..].copy_from_slice(&payload[..REPORT_SIZE - 7]);
 
         let mut second = [0u8; REPORT_SIZE];
-        second[0..4].copy_from_slice(&7u32.to_be_bytes());
+        second[0..4].copy_from_slice(&cid.to_be_bytes());
         second[4] = 0;
         second[5..5 + payload.len() - (REPORT_SIZE - 7)]
             .copy_from_slice(&payload[REPORT_SIZE - 7..]);
@@ -374,16 +417,113 @@ mod tests {
 
     #[test]
     fn ping_echoes_payload() {
-        let mut packet = [0u8; REPORT_SIZE];
-        packet[0..4].copy_from_slice(&7u32.to_be_bytes());
-        packet[4] = CtapHidCommand::Ping.byte() | TYPE_INIT;
-        packet[5..7].copy_from_slice(&3u16.to_be_bytes());
-        packet[7..10].copy_from_slice(b"abc");
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let packet = command_packet(cid, CtapHidCommand::Ping, b"abc");
 
-        let response = handle_packet(&packet).expect("response");
-        assert_eq!(response.cid, 7);
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected PING response");
+        };
+        assert_eq!(response.cid, cid);
         assert_eq!(response.command, CtapHidCommand::Ping);
         assert_eq!(response.payload, b"abc");
+    }
+
+    #[test]
+    fn init_allocates_distinct_non_reserved_channels() {
+        let mut handler = PacketHandler::default();
+        let first = allocate_channel(&mut handler);
+        let second = allocate_channel(&mut handler);
+        assert_ne!(first, second);
+        assert_ne!(first, 0);
+        assert_ne!(first, BROADCAST_CID);
+    }
+
+    #[test]
+    fn init_requires_an_eight_byte_nonce() {
+        let mut handler = PacketHandler::default();
+        let packet = command_packet(BROADCAST_CID, CtapHidCommand::Init, b"short");
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected error response");
+        };
+        assert_error(response, BROADCAST_CID, CtapHidError::Length);
+    }
+
+    #[test]
+    fn non_init_commands_reject_reserved_or_unallocated_channels() {
+        let mut handler = PacketHandler::default();
+        for cid in [0, 42, BROADCAST_CID] {
+            let packet = command_packet(cid, CtapHidCommand::Ping, b"");
+            let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+                panic!("expected error response");
+            };
+            assert_error(response, cid, CtapHidError::Channel);
+        }
+    }
+
+    #[test]
+    fn unknown_command_returns_invalid_command() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let mut packet = command_packet(cid, CtapHidCommand::Ping, b"");
+        packet[4] = TYPE_INIT | 0x7e;
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected error response");
+        };
+        assert_error(response, cid, CtapHidError::Command);
+    }
+
+    #[test]
+    fn oversized_request_returns_invalid_length() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let mut packet = command_packet(cid, CtapHidCommand::Ping, b"");
+        packet[5..7].copy_from_slice(&((MAX_PAYLOAD_SIZE + 1) as u16).to_be_bytes());
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected error response");
+        };
+        assert_error(response, cid, CtapHidError::Length);
+    }
+
+    #[test]
+    fn invalid_continuation_sequence_aborts_request() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let first = command_packet(cid, CtapHidCommand::Ping, &[0xaa; REPORT_SIZE]);
+        assert_eq!(handler.handle_packet(&first), Some(PacketOutcome::NeedMore));
+
+        let mut continuation = [0u8; REPORT_SIZE];
+        continuation[0..4].copy_from_slice(&cid.to_be_bytes());
+        continuation[4] = 1;
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&continuation) else {
+            panic!("expected sequence error");
+        };
+        assert_error(response, cid, CtapHidError::Seq);
+
+        continuation[4] = 0;
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&continuation) else {
+            panic!("expected sequence error after abort");
+        };
+        assert_error(response, cid, CtapHidError::Seq);
+    }
+
+    #[test]
+    fn response_fragmentation_preserves_payload_and_sequence_numbers() {
+        let payload = vec![0x5a; 200];
+        let packets = encode_message(9, CtapHidCommand::Ping, &payload);
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[0][4], TYPE_INIT | CtapHidCommand::Ping.byte());
+        assert_eq!(&packets[0][5..7], &(payload.len() as u16).to_be_bytes());
+        assert_eq!(packets[1][4], 0);
+        assert_eq!(packets[2][4], 1);
+        assert_eq!(packets[3][4], 2);
+
+        let mut reconstructed = packets[0][7..].to_vec();
+        for packet in &packets[1..] {
+            reconstructed.extend_from_slice(&packet[5..]);
+        }
+        reconstructed.truncate(payload.len());
+        assert_eq!(reconstructed, payload);
     }
 
     #[test]

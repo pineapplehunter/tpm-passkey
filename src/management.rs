@@ -103,19 +103,11 @@ fn filter_uid(uid: u32) -> Option<u32> {
     if uid == 0 { None } else { Some(uid) }
 }
 
-fn pcr_indices_from_selection(selection: &str) -> Option<Vec<u32>> {
-    let (_, indices_str) = selection.split_once(':')?;
-    indices_str
-        .split(',')
-        .map(|s| s.trim().parse::<u32>().ok())
-        .collect::<Option<Vec<_>>>()
-}
-
 fn check_pcr_stale(
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
     policy: &store::StoredPcrPolicy,
 ) -> Option<bool> {
-    let pcr_indices = pcr_indices_from_selection(&policy.selection)?;
+    let pcr_indices = tpm::pcr_indices_from_selection(&policy.selection).ok()?;
     let tx = tpm_cmd_tx?;
     let (digest_tx, digest_rx) = mpsc::channel();
     let cmd = ctap2::TpmCommand::PcrDigestCheck(ctap2::PcrDigestCheckCommand {
@@ -470,8 +462,23 @@ fn handle_update_pcr_reference(
         // Send TPM operation to main thread, or fall back to direct open.
         let cmd_result = if let Some(tx) = tpm_cmd_tx {
             let (resp_tx, resp_rx) = mpsc::channel();
+            let pcr_indices = match tpm::pcr_indices_from_selection(&policy.selection) {
+                Ok(indices) => indices,
+                Err(error) => {
+                    results.push(
+                        cbor!({
+                            "credential" => id_hex,
+                            "status" => "error",
+                            "error" => format!("invalid stored PCR selection: {error}"),
+                        })
+                        .unwrap(),
+                    );
+                    continue;
+                }
+            };
             let cmd = ctap2::TpmCommand::PcrPolicyUpdate(ctap2::PcrPolicyUpdateCommand {
                 credential_id: credential.id.clone(),
+                pcr_indices,
                 authority,
                 authority_name,
                 policy_ref,
@@ -487,7 +494,27 @@ fn handle_update_pcr_reference(
             }
         } else {
             // Fallback: open TPM directly (for testing without daemon).
-            ctap2::update_pcr_policy_for_credential(store_dir, None, &credential.id, passphrase)
+            let pcr_indices = match tpm::pcr_indices_from_selection(&policy.selection) {
+                Ok(indices) => indices,
+                Err(error) => {
+                    results.push(
+                        cbor!({
+                            "credential" => id_hex,
+                            "status" => "error",
+                            "error" => format!("invalid stored PCR selection: {error}"),
+                        })
+                        .unwrap(),
+                    );
+                    continue;
+                }
+            };
+            ctap2::update_pcr_policy_for_credential(
+                store_dir,
+                None,
+                &credential.id,
+                passphrase,
+                &pcr_indices,
+            )
         };
 
         match cmd_result {
@@ -526,9 +553,17 @@ fn handle_update_pcr_policy(
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
     peer_uid: u32,
     passphrase: &str,
-    _pcr_indices: &[u32],
+    pcr_indices: &[u32],
     credential_target: &CredentialTarget,
 ) -> ManagementResponse {
+    if let Err(error) = tpm::pcr_selection_for_indices(pcr_indices) {
+        return ManagementResponse {
+            ok: false,
+            error: Some(format!("invalid PCR selection: {error}")),
+            result: None,
+        };
+    }
+
     let credentials = match store::load_ctap2_credentials_from_dir(store_dir, filter_uid(peer_uid))
     {
         Ok(c) => c,
@@ -690,6 +725,7 @@ fn handle_update_pcr_policy(
             let (resp_tx, resp_rx) = mpsc::channel();
             let cmd = ctap2::TpmCommand::PcrPolicyUpdate(ctap2::PcrPolicyUpdateCommand {
                 credential_id: id.clone(),
+                pcr_indices: pcr_indices.to_vec(),
                 authority,
                 authority_name,
                 policy_ref,
@@ -710,6 +746,7 @@ fn handle_update_pcr_policy(
                 Some(Path::new("/dev/tpmrm0")),
                 id,
                 passphrase,
+                pcr_indices,
             )
         };
 
@@ -745,6 +782,13 @@ fn handle_update_pcr_policy(
 }
 
 fn handle_set_default_pcr_policy(store_dir: &Path, pcr_indices: &[u32]) -> ManagementResponse {
+    if let Err(error) = tpm::pcr_selection_for_indices(pcr_indices) {
+        return ManagementResponse {
+            ok: false,
+            error: Some(format!("invalid PCR selection: {error}")),
+            result: None,
+        };
+    }
     match store::save_default_pcr_policy(store_dir, pcr_indices) {
         Ok(()) => ManagementResponse {
             ok: true,

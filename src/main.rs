@@ -311,8 +311,12 @@ fn run_update_pcr_reference() -> Result<()> {
 }
 
 fn run_update_pcr_policy(args: PcrPolicyArgs) -> Result<()> {
-    if args.pcr.is_empty() {
-        bail!("at least one --pcr index is required");
+    tpm::pcr_selection_for_indices(&args.pcr).wrap_err("invalid PCR selection")?;
+    if args.all && !args.credential_ids.is_empty() {
+        bail!("--all cannot be combined with credential IDs");
+    }
+    if !args.all && args.credential_ids.is_empty() {
+        bail!("provide --all or at least one credential ID");
     }
     let passphrase = prompt_password_confirm("Enter recovery passphrase: ")?;
 
@@ -350,6 +354,7 @@ fn run_update_pcr_policy(args: PcrPolicyArgs) -> Result<()> {
 }
 
 fn run_set_default_pcr_policy(args: DefaultPcrPolicyArgs) -> Result<()> {
+    tpm::pcr_selection_for_indices(&args.pcr_indices).wrap_err("invalid PCR selection")?;
     let pcr_indices = args.pcr_indices.clone();
     let request = management::ManagementRequest::SetDefaultPcrPolicy { pcr_indices };
     let response = management::send_request(&request)?;

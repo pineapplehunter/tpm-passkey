@@ -136,6 +136,12 @@ pub struct Authenticator {
     client_pin: Option<ClientPinState>,
     key_agreement: Option<EphemeralSecret>,
     pin_uv_auth_token: Option<PinUvAuthToken>,
+    /// Set when `authenticatorSelection` (or a UV gesture) satisfied user
+    /// verification for the current transaction. CTAP2.1 routes UV through
+    /// `authenticatorSelection` when the authenticator advertises `uv` but
+    /// has no clientPIN; the resulting UV must be reflected in the auth-data
+    /// flags of the following makeCredential / getAssertion.
+    uv_satisfied: bool,
     management: Option<ManagementState>,
 }
 
@@ -170,6 +176,7 @@ struct PendingAssertion {
     total_credentials: usize,
     created_at: Instant,
     session_uid: Option<u32>,
+    user_presence: bool,
     user_verified: bool,
 }
 
@@ -216,6 +223,7 @@ impl Authenticator {
             client_pin,
             key_agreement: None,
             pin_uv_auth_token: None,
+            uv_satisfied: false,
             management: None,
         }
     }
@@ -285,8 +293,14 @@ impl Authenticator {
                 match store::load_daemon_passphrase_from_dir(&self.store_dir) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        log::info!("daemon passphrase not set; blocking FIDO2 operation");
-                        return error_response(ErrorStatus::OperationDenied);
+                        // No recovery passphrase set: registration/assertion are
+                        // still allowed; credentials simply won't carry
+                        // passphrase-backed recovery material. This keeps a fresh
+                        // authenticator usable out of the box instead of denying
+                        // every operation until a passphrase is configured.
+                        log::error!(
+                            "daemon passphrase not set; credentials will be created without recovery material"
+                        );
                     }
                     Err(e) => {
                         log::error!("failed to check daemon passphrase: {e}");
@@ -323,6 +337,7 @@ impl Authenticator {
         self.management = None;
         self.pin_uv_auth_token = None;
         self.key_agreement = None;
+        self.uv_satisfied = false;
     }
 
     /// authenticatorReset (0x07): factory-resets the authenticator, deleting all
@@ -354,6 +369,11 @@ impl Authenticator {
         if !self.assertion_approved("selection") {
             return Err(ErrorStatus::OperationDenied);
         }
+        // CTAP2.1 uses authenticatorSelection as the UV gesture when the
+        // authenticator advertises `uv` but has no clientPIN. Record that UV
+        // was satisfied so the following makeCredential / getAssertion can set
+        // the UV flag in their auth-data.
+        self.uv_satisfied = true;
         Ok(encode_response(Value::Map(Vec::new())))
     }
 
@@ -361,21 +381,19 @@ impl Authenticator {
     /// This authenticator has no built-in biometric user verification method,
     /// so the command is not supported. CTAP2.2 §6.7.
     fn bio_enrollment(&mut self, _body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
-        todo!(
-            "authenticatorBioEnrollment (0x09) is not supported: this authenticator has no built-in biometric user verification method"
-        )
+        Err(ErrorStatus::InvalidCommand)
     }
 
     /// authenticatorLargeBlobs (0x0C): large blob storage (credBlob / largeBlob
     /// extensions). Not yet implemented. CTAP2.2 §6.10.
     fn large_blobs(&mut self, _body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
-        todo!("authenticatorLargeBlobs (0x0C) is not implemented")
+        Err(ErrorStatus::InvalidCommand)
     }
 
     /// authenticatorConfig (0x0D): authenticator configuration (enterprise
     /// attestation, alwaysUv, minPINLength). Not yet implemented. CTAP2.2 §6.11.
     fn config(&mut self, _body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
-        todo!("authenticatorConfig (0x0D) is not implemented")
+        Err(ErrorStatus::InvalidCommand)
     }
 
     fn make_credential(&mut self, body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
@@ -408,6 +426,9 @@ impl Authenticator {
             Some(rp_id),
         )?;
         let options = map_map(&request, 7);
+        if let Some(options) = options {
+            log::debug!("makeCredential options: {options:?}");
+        }
         validate_make_credential_options(options)?;
         let uv_requested = options.is_some_and(|options| map_bool(options, "uv") == Some(true));
         let discoverable = options.and_then(|options| map_bool(options, "rk")) == Some(true)
@@ -436,7 +457,7 @@ impl Authenticator {
         ) {
             return Err(ErrorStatus::OperationDenied);
         }
-        let user_verified = user_verified || uv_requested;
+        let user_verified = user_verified || uv_requested || self.uv_satisfied;
 
         if !self.session.verify_matches_current() {
             log::error!("session changed during registration approval");
@@ -448,10 +469,20 @@ impl Authenticator {
             Ok(Some((salt, hash, kdf))) => Some((salt, hash, kdf)),
             _ => None,
         };
+        let pcr_indices = store::load_default_pcr_policy(&self.store_dir)
+            .map_err(|error| {
+                log::warn!("failed to load default PCR policy: {error:?}");
+                ErrorStatus::OperationDenied
+            })?
+            .unwrap_or_else(|| vec![7]);
         let Some(tpm) = self.ensure_tpm() else {
             log::warn!("cannot create CTAP2 credential without TPM context");
             return Err(ErrorStatus::OperationDenied);
         };
+        tpm.set_pcr_indices(&pcr_indices).map_err(|error| {
+            log::warn!("invalid default PCR policy: {error:?}");
+            ErrorStatus::OperationDenied
+        })?;
         let mut credential_id = vec![0u8; 32];
         fill_random(&mut credential_id);
         let recovery_material = match daemon_passphrase {
@@ -544,14 +575,20 @@ impl Authenticator {
             self.credentials.len()
         );
 
-        Ok(encode_response(
+        let response = encode_response(
             cbor!({
                 1 => "none",
                 2 => Value::Bytes(auth_data),
                 3 => {},
             })
             .unwrap(),
-        ))
+        );
+        log::debug!(
+            "makeCredential response ({} bytes): {}",
+            response.len(),
+            hex::encode(&response)
+        );
+        Ok(response)
     }
 
     fn get_assertion(&mut self, body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
@@ -571,6 +608,7 @@ impl Authenticator {
         let options = map_map(&request, 5);
         validate_get_assertion_options(options)?;
         let uv_requested = options.is_some_and(|options| map_bool(options, "uv") == Some(true));
+        let user_presence = options.and_then(|options| map_bool(options, "up")) != Some(false);
         validate_credential_descriptor_list(allow_list)?;
 
         // Reload credentials from disk when running as daemon (tpm_path is set)
@@ -583,10 +621,10 @@ impl Authenticator {
             return Err(ErrorStatus::NoCredentials);
         };
 
-        if !self.assertion_approved(rp_id) {
+        if (user_presence || uv_requested) && !self.assertion_approved(rp_id) {
             return Err(ErrorStatus::OperationDenied);
         }
-        let user_verified = user_verified || uv_requested;
+        let user_verified = user_verified || uv_requested || self.uv_satisfied;
 
         self.pending_assertion = if remaining_indexes.is_empty() {
             None
@@ -598,6 +636,7 @@ impl Authenticator {
                 total_credentials: credential_indexes.len(),
                 created_at: Instant::now(),
                 session_uid: self.session.uid,
+                user_presence,
                 user_verified,
             })
         };
@@ -607,7 +646,7 @@ impl Authenticator {
             let sign_count = credential.sign_count.saturating_add(1);
             let auth_data = make_auth_data(
                 &credential.rp_id,
-                0x01 | if user_verified { 0x04 } else { 0 },
+                (if user_presence { 0x01 } else { 0 }) | (if user_verified { 0x04 } else { 0 }),
                 sign_count,
                 None,
                 None,
@@ -714,6 +753,7 @@ impl Authenticator {
                 total_credentials: pending.total_credentials,
                 created_at: pending.created_at,
                 session_uid: pending.session_uid,
+                user_presence: pending.user_presence,
                 user_verified: pending.user_verified,
             })
         };
@@ -722,7 +762,8 @@ impl Authenticator {
         let sign_count = credential.sign_count.saturating_add(1);
         let auth_data = make_auth_data(
             &credential.rp_id,
-            0x01 | if pending.user_verified { 0x04 } else { 0 },
+            (if pending.user_presence { 0x01 } else { 0 })
+                | (if pending.user_verified { 0x04 } else { 0 }),
             sign_count,
             None,
             None,
@@ -1171,7 +1212,7 @@ impl Authenticator {
         if permissions.contains(Ctap2PermissionFlags::GET_ASSERTION) && rp_id.is_none() {
             return Err(ErrorStatus::InvalidParameter);
         }
-        let (aes_key, mac_key) = self.pin_uv_keys(key_agreement)?;
+        let (aes_key, _mac_key) = self.pin_uv_keys(key_agreement)?;
         let pin_hash = decrypt_pin_hash(&aes_key, pin_hash_enc)?;
         self.authenticate_pin(&pin_hash)?;
 
@@ -1184,7 +1225,7 @@ impl Authenticator {
             issued_at: Instant::now(),
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
-        let pin_uv_auth_param = compute_pin_uv_auth_param(&mac_key, &encrypted_token)?;
+        let pin_uv_auth_param = compute_pin_uv_auth_param(&token, &encrypted_token)?;
         Ok(encode_response(
             cbor!({
                 2 => Value::Bytes(encrypted_token),
@@ -1212,7 +1253,7 @@ impl Authenticator {
         {
             return Err(ErrorStatus::OperationDenied);
         }
-        let (aes_key, mac_key) = self.pin_uv_keys(key_agreement)?;
+        let (aes_key, _mac_key) = self.pin_uv_keys(key_agreement)?;
         let mut token = vec![0u8; 32];
         fill_random(&mut token);
         self.pin_uv_auth_token = Some(PinUvAuthToken {
@@ -1222,7 +1263,7 @@ impl Authenticator {
             issued_at: Instant::now(),
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
-        let pin_uv_auth_param = compute_pin_uv_auth_param(&mac_key, &encrypted_token)?;
+        let pin_uv_auth_param = compute_pin_uv_auth_param(&token, &encrypted_token)?;
         Ok(encode_response(
             cbor!({
                 2 => Value::Bytes(encrypted_token),
@@ -1448,6 +1489,8 @@ impl Authenticator {
                 let tpm = self
                     .ensure_tpm()
                     .ok_or_else(|| color_eyre::eyre::eyre!("TPM not available"))?;
+                tpm.set_pcr_indices(&cmd.pcr_indices)
+                    .wrap_err("selecting PCRs for policy update")?;
                 let new_policy = tpm
                     .update_authorized_policy(&cmd.authority, &cmd.authority_name, &cmd.policy_ref)
                     .wrap_err("updating PCR policy via management TPM command")?;
@@ -1525,6 +1568,7 @@ pub enum TpmCommand {
 /// Data needed to update a credential's PCR policy via `policy_authorize`.
 pub struct PcrPolicyUpdateCommand {
     pub credential_id: Vec<u8>,
+    pub pcr_indices: Vec<u32>,
     pub authority: tpm::TpmCredential,
     pub authority_name: Vec<u8>,
     pub policy_ref: Vec<u8>,
@@ -1582,10 +1626,17 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
                 "plat" => false,
                 "rk" => true,
                 "up" => true,
-                "uv" => false,
+                // The polkit approval prompt is this authenticator's user
+                // verification method; authenticatorSelection is the CTAP2.1
+                // UV gesture. Advertise `uv` so browsers route UV through it.
+                "uv" => true,
                 "clientPin" => client_pin,
+                // CTAP 2.2 §6.4 requires pinUvAuthToken when either clientPin
+                // or built-in UV is available. Polkit-backed UV is available
+                // even before a client PIN has been configured.
                 "pinUvAuthToken" => true,
                 "credMgmt" => true,
+                "makeCredUvNotRqd" => true,
             },
             6 => [PIN_UV_AUTH_PROTOCOL],
             5 => 1200,
@@ -1715,11 +1766,17 @@ fn verify_pin_uv_auth_param(
         .ok_or(ErrorStatus::PinAuthInvalid)
 }
 
-fn compute_pin_uv_auth_param(mac_key: &[u8; 32], message: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
-    let mut mac = HmacSha256::new_from_slice(mac_key).map_err(|_| ErrorStatus::OperationDenied)?;
+/// Compute `pinUvAuthParam` (response key 3) for a `getPinUvAuthToken`
+/// response. Per CTAP 2.2 §6.5.5.7, this is
+/// HMAC-SHA256(token, encryptedToken), where `token` is the issued
+/// pinUvAuthToken (used as the MAC key). For PIN/UV Auth Protocol 2 the
+/// full 32-byte digest is returned (libfido2 `cbor_encode_pin_auth`).
+/// This mirrors `verify_pin_uv_auth_param` on the client side.
+fn compute_pin_uv_auth_param(token: &[u8], message: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
+    let mut mac = HmacSha256::new_from_slice(token).map_err(|_| ErrorStatus::OperationDenied)?;
     mac.update(message);
     let result = mac.finalize().into_bytes();
-    Ok(result[..16].to_vec())
+    Ok(result.to_vec())
 }
 
 fn encrypt_aes(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
@@ -2149,6 +2206,10 @@ fn sign_credential(
             policy.policy_version
         ));
     }
+    let pcr_indices = policy
+        .map(|policy| tpm::pcr_indices_from_selection(&policy.selection))
+        .transpose()
+        .wrap_err("parsing stored PCR selection")?;
     let Some(tpm) = authenticator.ensure_tpm() else {
         #[cfg(test)]
         {
@@ -2161,6 +2222,10 @@ fn sign_credential(
             ));
         }
     };
+    if let Some(indices) = &pcr_indices {
+        tpm.set_pcr_indices(indices)
+            .wrap_err("selecting credential PCRs")?;
+    }
     let digest = Sha256::digest(signed_data);
     let policy_binding = policy.map(|policy| tpm::PcrPolicyBinding {
         selection: policy.selection.clone(),
@@ -2236,6 +2301,7 @@ pub fn update_pcr_policy_for_credential(
     tpm_path: Option<&std::path::Path>,
     credential_id: &[u8],
     recovery_passphrase: &str,
+    pcr_indices: &[u32],
 ) -> color_eyre::Result<()> {
     let credentials = store::load_ctap2_credentials_from_dir(store_dir, None)?;
     let credential = credentials
@@ -2271,8 +2337,7 @@ pub fn update_pcr_policy_for_credential(
     }
 
     let tpm_path = tpm_path.unwrap_or(std::path::Path::new("/dev/tpmrm0"));
-    let pcr_indices = store::load_default_pcr_policy(store_dir).unwrap_or(None);
-    let mut tpm = tpm::Tpm::open(tpm_path, pcr_indices.as_deref())
+    let mut tpm = tpm::Tpm::open(tpm_path, Some(pcr_indices))
         .wrap_err("opening TPM for PCR policy update")?;
 
     let authority = tpm::TpmCredential {
@@ -2419,6 +2484,72 @@ mod tests {
     }
 
     #[test]
+    fn get_info_advertises_a_consistent_ctap21_configuration() {
+        let response = Authenticator::default().handle_cbor(&[Ctap2Command::GetInfo.into()]);
+        let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
+        else {
+            panic!("expected getInfo map");
+        };
+
+        let versions = map_value(&map, 1)
+            .and_then(Value::as_array)
+            .expect("versions");
+        assert!(versions.contains(&Value::Text("FIDO_2_0".to_owned())));
+        assert!(versions.contains(&Value::Text("FIDO_2_1".to_owned())));
+        assert_eq!(map_bytes(&map, 3).map(<[u8]>::len), Some(16));
+        assert!(
+            map_value(&map, 5)
+                .and_then(Value::as_integer)
+                .map(i128::from)
+                .is_some_and(|size| size >= 1024),
+            "maxMsgSize must accommodate the CTAP minimum message size"
+        );
+
+        let options = map_value(&map, 4).and_then(Value::as_map).expect("options");
+        assert_eq!(map_bool(options, "rk"), Some(true));
+        assert_eq!(map_bool(options, "up"), Some(true));
+        assert_eq!(map_bool(options, "uv"), Some(true));
+        assert_eq!(map_bool(options, "pinUvAuthToken"), Some(true));
+        assert_eq!(map_bool(options, "credMgmt"), Some(true));
+
+        let algorithms = map_value(&map, 10)
+            .and_then(Value::as_array)
+            .expect("algorithms");
+        assert!(algorithms.iter().any(|algorithm| {
+            algorithm.as_map().is_some_and(|algorithm| {
+                map_integer(algorithm, "alg") == Some(COSE_ALG_ES256.into())
+                    && map_text(algorithm, "type") == Some("public-key")
+            })
+        }));
+    }
+
+    #[test]
+    fn empty_and_malformed_cbor_requests_return_ctap_errors() {
+        let mut authenticator = Authenticator::default();
+        assert_eq!(
+            authenticator.handle_cbor(&[]),
+            error_response(ErrorStatus::InvalidCommand)
+        );
+        assert_eq!(
+            authenticator.handle_cbor(&[Ctap2Command::GetAssertion.into(), 0xff]),
+            error_response(ErrorStatus::InvalidCbor)
+        );
+        assert_eq!(
+            authenticator.handle_cbor(&[Ctap2Command::GetNextAssertion.into(), 0xa0]),
+            error_response(ErrorStatus::InvalidCbor)
+        );
+    }
+
+    #[test]
+    fn make_auth_data_encodes_rp_hash_flags_and_counter() {
+        let auth_data = make_auth_data("example.com", 0x05, 0x0102_0304, None, None);
+        assert_eq!(&auth_data[..32], Sha256::digest(b"example.com").as_slice());
+        assert_eq!(auth_data[32], 0x05);
+        assert_eq!(&auth_data[33..37], &[1, 2, 3, 4]);
+        assert_eq!(auth_data.len(), 37);
+    }
+
+    #[test]
     fn make_auth_data_sets_extension_flag_when_extensions_are_present() {
         let auth_data = make_auth_data(
             "example.com",
@@ -2440,6 +2571,17 @@ mod tests {
             Authenticator::default().handle_cbor(&[0xff]),
             error_response(ErrorStatus::InvalidCommand)
         );
+    }
+
+    #[test]
+    fn unsupported_commands_do_not_panic() {
+        let mut authenticator = Authenticator::default();
+        for command in [0x09, 0x0c, 0x0d, 0x40] {
+            assert_eq!(
+                authenticator.handle_cbor(&[command]),
+                error_response(ErrorStatus::InvalidCommand)
+            );
+        }
     }
 
     #[test]
@@ -2671,6 +2813,23 @@ mod tests {
         let token = decrypt_aes(&aes_key2, encrypted_token).expect("decrypt token");
         assert_eq!(token.len(), 32, "pinUvAuthToken must be 32 bytes");
 
+        // key 3 (pinUvAuthParam) MUST equal HMAC-SHA256(token,
+        // encryptedToken) over the full 32-byte digest (PIN/UV Auth
+        // Protocol 2). This is exactly what libfido2 / browsers verify,
+        // so a mismatch here is what makes a browser reject the token
+        // and close the device.
+        let expected_pin_uv_auth_param = {
+            let mut mac = HmacSha256::new_from_slice(&token).expect("HMAC key");
+            mac.update(encrypted_token);
+            mac.finalize().into_bytes().to_vec()
+        };
+        let pin_uv_auth_param = map_bytes(&token_map, 3).expect("pinUvAuthParam (key 3)");
+        assert_eq!(
+            pin_uv_auth_param,
+            expected_pin_uv_auth_param.as_slice(),
+            "key 3 must be HMAC-SHA256(token, encryptedToken)"
+        );
+
         // ── REGRESSION 2+3: validate_pin_uv_auth for makeCredential ─────────
         let client_data_hash = [0xcc; 32];
 
@@ -2678,7 +2837,9 @@ mod tests {
         let make_cred_message = [client_data_hash.as_slice(), rp_id.as_bytes()].concat();
         let mut mac = HmacSha256::new_from_slice(&token).expect("HMAC key");
         mac.update(&make_cred_message);
-        let correct_auth_param = mac.finalize().into_bytes()[..16].to_vec();
+        // PIN/UV Auth Protocol 2 returns the full 32-byte HMAC (libfido2
+        // cbor_encode_pin_auth: outlen = dgst_len for protocol 2).
+        let correct_auth_param = mac.finalize().into_bytes().to_vec();
 
         // Should succeed: correct HMAC message + Some(rp_id)
         let result = authenticator.validate_pin_uv_auth(
@@ -2994,6 +3155,37 @@ mod tests {
     }
 
     #[test]
+    fn get_assertion_respects_the_requested_user_presence_flag() {
+        for (requested, expected_flag) in [(true, 0x01), (false, 0x00)] {
+            let mut authenticator =
+                authenticator_with_credential("example.com", vec![u8::from(requested)]);
+            let response = authenticator.handle_cbor(&ctap_request(
+                Ctap2Command::GetAssertion,
+                Value::Map(vec![
+                    (
+                        Value::Integer(1.into()),
+                        Value::Text("example.com".to_owned()),
+                    ),
+                    (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
+                    (
+                        Value::Integer(5.into()),
+                        Value::Map(options_map(&[("up", requested)])),
+                    ),
+                ]),
+            ));
+            assert_eq!(response[0], 0x00);
+            let Value::Map(response) =
+                ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
+            else {
+                panic!("expected assertion map");
+            };
+            let auth_data = map_bytes(&response, 2).expect("authenticator data");
+            assert_eq!(auth_data[32] & 0x01, expected_flag);
+            std::fs::remove_dir_all(&authenticator.store_dir).expect("remove test store");
+        }
+    }
+
+    #[test]
     fn multiple_matching_credentials_include_number_of_credentials_and_support_next_assertion() {
         let mut authenticator = authenticator_with_credentials(
             "example.com",
@@ -3298,6 +3490,7 @@ mod tests {
             client_pin: None,
             key_agreement: None,
             pin_uv_auth_token: None,
+            uv_satisfied: false,
             management: None,
         }
     }

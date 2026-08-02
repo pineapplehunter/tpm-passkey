@@ -3,8 +3,7 @@ use std::io::{self, Write};
 use crate::session;
 
 pub fn approve(prompt: &str, session: &session::SessionContext) -> bool {
-    #[cfg(test)]
-    {
+    if cfg!(test) {
         let _ = session;
         log::warn!("auto-approving in test: {prompt}");
         return true;

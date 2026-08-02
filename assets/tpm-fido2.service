@@ -7,7 +7,7 @@ ConditionPathExists=/dev/tpmrm0
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/linux-tpm-fido2 --store-dir /var/lib/linux-tpm-fido2 --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
+ExecStart=/usr/bin/linux-tpm-fido2 daemon --store-dir /var/lib/linux-tpm-fido2 --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
 
 StateDirectory=linux-tpm-fido2
 StateDirectoryMode=0700

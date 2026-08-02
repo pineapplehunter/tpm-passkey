@@ -23,7 +23,7 @@ Credentials are stored in a project-local directory by default:
 The store directory can be overridden at runtime:
 
 ```sh
-linux-tpm-fido2 --store-dir /path/to/store
+linux-tpm-fido2 daemon --store-dir /path/to/store
 ```
 
 Startup logs the resolved SQLite database path.
