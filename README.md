@@ -38,6 +38,11 @@ Useful flags:
 - Recovery slots stored separately from the primary credential metadata.
 - Sign counter persistence.
 
+## Protocol Compliance
+
+The maintained CTAP 2.2 wire-format checklist and audit status are in
+[`docs/ctap2-compliance.md`](docs/ctap2-compliance.md).
+
 ## Future Work
 
 - Expand CTAP2 compatibility for additional browser request shapes.

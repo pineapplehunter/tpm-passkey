@@ -35,3 +35,14 @@
 - [x] Verify `pinUvAuthParam` over `clientDataHash` only.
 - [x] Exercise token-authenticated makeCredential through the CTAP handler and VM.
 - [x] Run Rust and NixOS validation.
+
+## CTAP 2.2 systematic audit
+
+- [x] Create and maintain `docs/ctap2-compliance.md` from the normative specification.
+- [ ] Complete the ClientPIN wire-format, cryptography, permission, and retry audit.
+- [ ] Audit makeCredential and getAssertion.
+- [ ] Audit getInfo capability claims.
+- [ ] Audit credential management and stateful continuation commands.
+- [ ] Audit reset, selection, and unsupported commands.
+- [ ] Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
+- [ ] Run final Rust and NixOS validation.
