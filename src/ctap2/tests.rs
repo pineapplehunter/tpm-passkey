@@ -466,6 +466,29 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
         Err(ErrorStatus::InvalidParameter)
     ));
 
+    let token_value = vec![0x77; 32];
+    let message = b"credential-management";
+    let mut mac = HmacSha256::new_from_slice(&token_value).expect("HMAC key");
+    mac.update(message);
+    let auth_param = mac.finalize().into_bytes();
+    authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        value: token_value,
+        permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
+        rp_id: None,
+        issued_at: Instant::now() - Duration::from_secs(31),
+        first_used_at: None,
+    });
+    assert_eq!(
+        authenticator.validate_pin_uv_auth(
+            Some(2),
+            Some(&auth_param),
+            message,
+            Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
+            None,
+        ),
+        Err(ErrorStatus::PinAuthInvalid)
+    );
+
     let _ = std::fs::remove_dir_all(store_dir);
 }
 
@@ -658,6 +681,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: Some(rp_id.to_owned()),
         issued_at: Instant::now(),
+        first_used_at: None,
     });
 
     // Should be rejected: Some(rp_id) token with None rp_id passed
@@ -674,12 +698,13 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         "REGRESSION 3: scoped token + None rp_id should be rejected"
     );
 
-    // Token without rp_id should work for any rp_id
+    // A legacy token without an RP ID is associated with the first mc/ga RP.
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: None,
         issued_at: Instant::now(),
+        first_used_at: None,
     });
     let result = authenticator.validate_pin_uv_auth(
         Some(2),
@@ -688,10 +713,23 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         Ctap2PermissionFlags::MAKE_CREDENTIAL,
         Some(rp_id),
     );
+    assert_eq!(result, Ok(true));
     assert_eq!(
-        result,
-        Ok(true),
-        "token without rp_id should be valid for any rp_id"
+        authenticator
+            .pin_uv_auth_token
+            .as_ref()
+            .and_then(|token| token.rp_id.as_deref()),
+        Some(rp_id)
+    );
+    assert_eq!(
+        authenticator.validate_pin_uv_auth(
+            Some(2),
+            Some(&correct_auth_param),
+            &client_data_hash,
+            Ctap2PermissionFlags::MAKE_CREDENTIAL,
+            Some("other.example.com"),
+        ),
+        Err(ErrorStatus::PinAuthInvalid)
     );
 
     // ── getAssertion HMAC: clientDataHash only (CTAP 2.1 §6.2.1) ───────
@@ -700,6 +738,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         permissions: Ctap2PermissionFlags::GET_ASSERTION,
         rp_id: Some(rp_id.to_owned()),
         issued_at: Instant::now(),
+        first_used_at: None,
     });
     let mut mac =
         HmacSha256::new_from_slice(&authenticator.pin_uv_auth_token.as_ref().unwrap().value)
@@ -736,6 +775,7 @@ fn credential_management_enumerates_discoverable_credentials_with_permission_tok
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: None,
         issued_at: Instant::now(),
+        first_used_at: None,
     });
 
     let request = Value::Map(vec![

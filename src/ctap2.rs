@@ -91,6 +91,7 @@ struct PinUvAuthToken {
     permissions: Ctap2PermissionFlags,
     rp_id: Option<String>,
     issued_at: Instant,
+    first_used_at: Option<Instant>,
 }
 
 struct ManagementState {
@@ -1103,6 +1104,7 @@ impl Authenticator {
             permissions,
             rp_id,
             issued_at: Instant::now(),
+            first_used_at: None,
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
         Ok(encode_response(
@@ -1136,6 +1138,7 @@ impl Authenticator {
             permissions,
             rp_id,
             issued_at: Instant::now(),
+            first_used_at: None,
         });
         let encrypted_token = encrypt_aes(&aes_key, &token)?;
         Ok(encode_response(
@@ -1309,7 +1312,11 @@ impl Authenticator {
         let Some(token) = self
             .pin_uv_auth_token
             .as_ref()
-            .filter(|token| token.issued_at.elapsed() <= Duration::from_secs(600))
+            .filter(|token| {
+                token.issued_at.elapsed() <= Duration::from_secs(600)
+                    && (token.first_used_at.is_some()
+                        || token.issued_at.elapsed() <= Duration::from_secs(30))
+            })
             .cloned()
         else {
             self.pin_uv_auth_token = None;
@@ -1332,12 +1339,24 @@ impl Authenticator {
             HmacSha256::new_from_slice(&token.value).map_err(|_| ErrorStatus::OperationDenied)?;
         mac.update(message);
         let expected = mac.finalize().into_bytes();
-        if constant_time_equal(&expected[..auth_param.len()], auth_param) {
-            Ok(true)
-        } else {
+        if !constant_time_equal(&expected[..auth_param.len()], auth_param) {
             self.pin_uv_auth_token = None;
-            Err(ErrorStatus::PinAuthInvalid)
+            return Err(ErrorStatus::PinAuthInvalid);
         }
+
+        let current_token = self
+            .pin_uv_auth_token
+            .as_mut()
+            .expect("validated token remains present");
+        current_token.first_used_at.get_or_insert_with(Instant::now);
+        if current_token.rp_id.is_none()
+            && permission.intersects(
+                Ctap2PermissionFlags::MAKE_CREDENTIAL | Ctap2PermissionFlags::GET_ASSERTION,
+            )
+        {
+            current_token.rp_id = rp_id.map(str::to_owned);
+        }
+        Ok(true)
     }
 
     /// Execute a TPM command issued by the management thread.
