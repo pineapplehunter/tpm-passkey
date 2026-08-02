@@ -147,10 +147,26 @@
                 + "login.example.test 'assert credential challenge'"
             )
 
+          # -- CTAPHID and CTAP 2.1 compliance checks --
+          ret, output = machine.execute(
+              "python3 ${./tests/ctap_compliance.py} compliance.example.test"
+          )
+          print("### CTAP compliance stdout/stderr:")
+          print("### " + output.strip().replace("\n", "\n### "))
+          if ret != 0:
+              journal = machine.succeed("journalctl -u linux-tpm-fido2 --no-pager -n 100")
+              print("### daemon journal after CTAP compliance failure:")
+              for line in journal.strip().split("\n"):
+                  print("### " + line)
+              raise Exception(f"CTAP compliance checks failed:\n{output}")
+
           # -- list-credentials (after registration) --
           output = mgmt("list-credentials")
           print("list-credentials (after registration):", output)
           assert "login.example.test" in output, f"Expected credential listing, got: {output}"
+          assert output.count("compliance.example.test") == 2, (
+              f"Expected two discoverable compliance credentials, got: {output}"
+          )
 
           # -- PCR update via update-pcr-reference (expect for passphrase) --
           machine.succeed("tpm2_pcrextend 7:sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -236,6 +252,9 @@
           output = mgmt("list-credentials")
           print("list-credentials (after reboot):", output)
           assert "login.example.test" in output, f"Expected credential listing, got: {output}"
+          assert output.count("compliance.example.test") == 2, (
+              f"Expected compliance credentials to survive reboot, got: {output}"
+          )
 
           # -- fido2-manage PIN-dependent subcommands (daemon has no PIN at this point) --
           machine.succeed(
