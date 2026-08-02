@@ -39,7 +39,7 @@
 ## CTAP 2.2 systematic audit
 
 - [x] Create and maintain `docs/ctap2-compliance.md` from the normative specification.
-- [ ] Complete the ClientPIN wire-format, cryptography, permission, and retry audit.
+- [x] Complete the ClientPIN wire-format, cryptography, permission, and retry audit.
 - [ ] Audit makeCredential and getAssertion.
 - [ ] Audit getInfo capability claims.
 - [ ] Audit credential management and stateful continuation commands.

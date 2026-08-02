@@ -419,6 +419,12 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
         "getPINRetries does not require a protocol"
     );
 
+    let unknown = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(8.into()))]),
+    ));
+    assert_eq!(unknown, vec![u8::from(ErrorStatus::InvalidSubcommand)]);
+
     let nested_parameters = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
         Value::Map(vec![

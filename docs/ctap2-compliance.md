@@ -97,7 +97,9 @@ After a wrong PIN, retries are decremented and the key-agreement key is
 regenerated. Three consecutive mismatches in one power cycle produce
 `CTAP2_ERR_PIN_AUTH_BLOCKED`; zero retries produce `CTAP2_ERR_PIN_BLOCKED`.
 
-Audit status: **in progress**.
+Audit status: **complete for ClientPIN request/response handling and token
+issuance**. Permission consumption and user-presence state during subsequent
+commands are tracked by the makeCredential/getAssertion audits.
 
 ## `authenticatorMakeCredential` (`0x01`)
 

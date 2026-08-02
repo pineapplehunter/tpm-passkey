@@ -74,6 +74,7 @@ pub(super) enum ErrorStatus {
     PinAuthBlocked = 0x34,
     PinNotSet = 0x35,
     PinPolicyViolation = 0x37,
+    InvalidSubcommand = 0x3e,
     UnauthorizedPermission = 0x40,
 }
 

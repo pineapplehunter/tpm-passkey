@@ -754,6 +754,9 @@ impl Authenticator {
         let request = decode_map(body)?;
         let protocol = map_integer(&request, 1);
         let sub_command = map_integer(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
+        if !matches!(sub_command, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 9) {
+            return Err(ErrorStatus::InvalidSubcommand);
+        }
         if matches!(sub_command, 1 | 7) {
             if protocol.is_some() {
                 validate_pin_uv_protocol(protocol)?;
@@ -827,7 +830,7 @@ impl Authenticator {
                 map_text(&request, 10).map(str::to_owned),
                 false,
             ),
-            _ => Err(ErrorStatus::InvalidCommand),
+            _ => unreachable!("validated ClientPIN subcommand"),
         }
     }
 
