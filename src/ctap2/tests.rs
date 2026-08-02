@@ -192,7 +192,7 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
         Ctap2Command::ClientPin,
         Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(6.into())),
+            (Value::Integer(2.into()), Value::Integer(9.into())),
             (Value::Integer(3.into()), client_key),
             (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
             (Value::Integer(9.into()), Value::Integer(1.into())),
@@ -218,7 +218,7 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
         Ctap2Command::ClientPin,
         Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(6.into())),
+            (Value::Integer(2.into()), Value::Integer(9.into())),
             (
                 Value::Integer(3.into()),
                 client_key_agreement(&client_secret),
@@ -244,6 +244,70 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
     };
     assert_eq!(map_value(&restored_map, 3), Some(&Value::Integer(7.into())));
     std::fs::remove_dir_all(store_dir).expect("remove test store");
+}
+
+#[test]
+fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
+    let store_dir = test_store_dir("uv-token");
+    let mut authenticator =
+        Authenticator::new_with_approval(store_dir.clone(), None, Box::new(AlwaysApprove));
+    let client_secret = EphemeralSecret::generate();
+    let server_key = client_pin_key_agreement(&mut authenticator);
+    let server_public = parse_key_agreement(&server_key).expect("valid server public key");
+    let (aes_key, _) = derive_protocol2_keys(
+        client_secret
+            .diffie_hellman(&server_public)
+            .raw_secret_bytes()
+            .as_slice(),
+    )
+    .expect("derive protocol 2 keys");
+
+    let response = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Integer(6.into())),
+            (
+                Value::Integer(3.into()),
+                client_key_agreement(&client_secret),
+            ),
+            (Value::Integer(9.into()), Value::Integer(1.into())),
+            (
+                Value::Integer(10.into()),
+                Value::Text("passkeys.io".to_owned()),
+            ),
+        ]),
+    ));
+    assert_eq!(response[0], 0x00);
+    let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
+    else {
+        panic!("expected UV token response");
+    };
+    let encrypted_token = map_bytes(&response, 2).expect("encrypted token");
+    assert_eq!(
+        decrypt_aes(&aes_key, encrypted_token)
+            .expect("decrypt token")
+            .len(),
+        32
+    );
+    assert_eq!(map_bytes(&response, 3).map(<[u8]>::len), Some(32));
+
+    let retries = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::ClientPin,
+        Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(2.into())),
+            (Value::Integer(2.into()), Value::Integer(7.into())),
+        ]),
+    ));
+    let Value::Map(retries) = ciborium::from_reader::<Value, _>(&retries[1..]).expect("CBOR")
+    else {
+        panic!("expected UV retries response");
+    };
+    assert_eq!(
+        map_value(&retries, 5),
+        Some(&Value::Integer(UV_RETRIES.into()))
+    );
+    let _ = std::fs::remove_dir_all(store_dir);
 }
 
 #[test]
@@ -342,7 +406,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         Ctap2Command::ClientPin,
         Value::Map(vec![
             (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(6.into())),
+            (Value::Integer(2.into()), Value::Integer(9.into())),
             (Value::Integer(3.into()), client_key2),
             (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
             (Value::Integer(9.into()), Value::Integer(1.into())),

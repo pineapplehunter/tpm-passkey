@@ -9,3 +9,10 @@
 - [x] Extract shared credential domain conversions.
 - [x] Refresh the architecture documentation.
 - [x] Run the full Rust and NixOS validation suites.
+
+## Client PIN/UV interoperability
+
+- [x] Route ClientPIN subcommands 0x06 and 0x09 per CTAP 2.2.
+- [x] Add UV retry and browser-shaped UV token tests.
+- [x] Log CTAP status codes for failed commands.
+- [ ] Run Rust and NixOS validation.

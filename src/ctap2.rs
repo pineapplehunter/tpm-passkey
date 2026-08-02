@@ -35,6 +35,7 @@ type Aes256CbcDecryptor = cbc::Decryptor<Aes256>;
 
 const PIN_UV_AUTH_PROTOCOL: u64 = 2;
 const PIN_RETRIES: u32 = 8;
+const UV_RETRIES: u32 = 8;
 const PIN_KDF_ROUNDS: u32 = 100_000;
 const MAX_RESIDENT_CREDENTIALS: usize = 128;
 
@@ -211,7 +212,7 @@ impl Authenticator {
             }
         }
 
-        match match command {
+        let result = match command {
             Ctap2Command::GetInfo => Ok(get_info_response(self.client_pin.is_some())),
             Ctap2Command::ClientPin => self.client_pin(body),
             Ctap2Command::MakeCredential => self.make_credential(body),
@@ -227,9 +228,17 @@ impl Authenticator {
             }
             Ctap2Command::LargeBlobs => self.large_blobs(body),
             Ctap2Command::Config => self.config(body),
-        } {
+        };
+        match result {
             Ok(response) => response,
-            Err(status) => error_response(status),
+            Err(status) => {
+                log::info!(
+                    "ctap2 command {} failed: {status:?} ({:#04x})",
+                    command_name(command),
+                    u8::from(status)
+                );
+                error_response(status)
+            }
         }
     }
 
@@ -731,6 +740,7 @@ impl Authenticator {
         let request = decode_map(body)?;
         validate_pin_uv_protocol(map_integer(&request, 1))?;
         let sub_command = map_integer(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
+        log::debug!("authenticatorClientPIN subcommand={sub_command:#04x}");
         let key_agreement = map_map(&request, 3);
 
         match sub_command {
@@ -793,13 +803,27 @@ impl Authenticator {
                     pin_uv_auth_param.ok_or(ErrorStatus::MissingParameter)?,
                 )
             }
-            6 | 9 => {
+            6 => {
+                let (permissions, rp_id) = pin_uv_permissions(&request);
+                self.get_pin_uv_auth_token_using_uv(
+                    key_agreement,
+                    permissions.ok_or(ErrorStatus::MissingParameter)?,
+                    rp_id,
+                )
+            }
+            7 => Ok(encode_response(
+                cbor!({
+                    5 => UV_RETRIES,
+                })
+                .unwrap(),
+            )),
+            9 => {
                 let (pin_hash_enc, permissions, rp_id) = if let Some(params) = map_map(&request, 4)
                 {
                     (
                         map_bytes(params, 1),
                         map_integer(params, 2)
-                            .and_then(|v| u8::try_from(v).ok())
+                            .and_then(|value| u8::try_from(value).ok())
                             .and_then(Ctap2PermissionFlags::from_bits),
                         map_text(params, 3).map(str::to_owned),
                     )
@@ -807,7 +831,7 @@ impl Authenticator {
                     (
                         map_bytes(&request, 6),
                         map_integer(&request, 9)
-                            .and_then(|v| u8::try_from(v).ok())
+                            .and_then(|value| u8::try_from(value).ok())
                             .and_then(Ctap2PermissionFlags::from_bits),
                         map_text(&request, 10).map(str::to_owned),
                     )
@@ -815,28 +839,6 @@ impl Authenticator {
                 self.get_pin_uv_auth_token(
                     key_agreement,
                     pin_hash_enc.ok_or(ErrorStatus::MissingParameter)?,
-                    permissions.ok_or(ErrorStatus::MissingParameter)?,
-                    rp_id,
-                )
-            }
-            10 => {
-                let (permissions, rp_id) = if let Some(params) = map_map(&request, 4) {
-                    (
-                        map_integer(params, 2)
-                            .and_then(|v| u8::try_from(v).ok())
-                            .and_then(Ctap2PermissionFlags::from_bits),
-                        map_text(params, 3).map(str::to_owned),
-                    )
-                } else {
-                    (
-                        map_integer(&request, 9)
-                            .and_then(|v| u8::try_from(v).ok())
-                            .and_then(Ctap2PermissionFlags::from_bits),
-                        map_text(&request, 10).map(str::to_owned),
-                    )
-                };
-                self.get_pin_uv_auth_token_using_uv(
-                    key_agreement,
                     permissions.ok_or(ErrorStatus::MissingParameter)?,
                     rp_id,
                 )
@@ -1509,6 +1511,26 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
         })
         .unwrap(),
     )
+}
+
+fn pin_uv_permissions(
+    request: &[(Value, Value)],
+) -> (Option<Ctap2PermissionFlags>, Option<String>) {
+    if let Some(params) = map_map(request, 4) {
+        (
+            map_integer(params, 2)
+                .and_then(|value| u8::try_from(value).ok())
+                .and_then(Ctap2PermissionFlags::from_bits),
+            map_text(params, 3).map(str::to_owned),
+        )
+    } else {
+        (
+            map_integer(request, 9)
+                .and_then(|value| u8::try_from(value).ok())
+                .and_then(Ctap2PermissionFlags::from_bits),
+            map_text(request, 10).map(str::to_owned),
+        )
+    }
 }
 
 fn validate_pin_uv_protocol(protocol: Option<i128>) -> Result<(), ErrorStatus> {

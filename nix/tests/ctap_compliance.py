@@ -5,7 +5,7 @@ import traceback
 
 from fido2.cose import ES256
 from fido2.ctap import CtapError
-from fido2.ctap2 import Ctap2
+from fido2.ctap2 import ClientPin, Ctap2
 from fido2.hid import CTAPHID, CtapHidDevice
 from fido2.webauthn import AuthenticatorData
 
@@ -67,6 +67,16 @@ def main():
         algorithm.get("type") == "public-key" and algorithm.get("alg") == -7
         for algorithm in info.algorithms
     )
+
+    # Browser registration uses subcommand 0x06 when built-in UV and
+    # pinUvAuthToken are advertised, even when no client PIN is configured.
+    client_pin = ClientPin(ctap)
+    assert client_pin.get_uv_retries() == 8
+    uv_token = client_pin.get_uv_token(
+        permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
+        permissions_rpid=rp_id,
+    )
+    assert len(uv_token) == 32
 
     first = register(ctap, rp_id, "resident-user-1")
     second = register(ctap, rp_id, "resident-user-2")
