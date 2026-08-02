@@ -1,0 +1,86 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, p.policy_selection FROM credential_metadata m JOIN credential_keyslots p ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' WHERE (?1 IS NULL OR m.user_id = ?1 OR m.user_id IS NULL) ORDER BY m.rp_id, m.credential_id",
+  "describe": {
+    "columns": [
+      {
+        "name": "credential_id",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "credential_metadata",
+            "name": "credential_id"
+          }
+        }
+      },
+      {
+        "name": "rp_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "credential_metadata",
+            "name": "rp_id"
+          }
+        }
+      },
+      {
+        "name": "user_name",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "credential_metadata",
+            "name": "user_name"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "credential_metadata",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "last_used_at",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "credential_metadata",
+            "name": "last_used_at"
+          }
+        }
+      },
+      {
+        "name": "policy_selection",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "credential_keyslots",
+            "name": "policy_selection"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "934fa778dfa24398d9d5f9bd892d581d25aec9ffd056a2cdf56d792d0b1aa6e3"
+}

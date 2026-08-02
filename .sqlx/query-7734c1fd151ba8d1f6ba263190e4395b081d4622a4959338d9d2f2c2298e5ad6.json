@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE credential_metadata SET sign_count = ?1, updated_at = CURRENT_TIMESTAMP, last_used_at = CURRENT_TIMESTAMP WHERE credential_id = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "7734c1fd151ba8d1f6ba263190e4395b081d4622a4959338d9d2f2c2298e5ad6"
+}

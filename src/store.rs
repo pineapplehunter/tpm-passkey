@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -28,6 +29,16 @@ type HmacSha256 = Hmac<Sha256>;
 pub const DEV_STORE_DIR: &str = ".linux-tpm-fido2-store";
 const CREDENTIALS_DATABASE_FILE: &str = "credentials.sqlite";
 const HMAC_KEY_FILE: &str = "integrity.hmac-key";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCredentialSummary {
+    pub id: Vec<u8>,
+    pub rp_id: String,
+    pub user_name: Option<String>,
+    pub registered_at: String,
+    pub last_used_at: Option<String>,
+    pub policy_selection: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCtap2Credential {
@@ -218,6 +229,13 @@ pub fn load_ctap2_credentials_from_dir(
     user_id: Option<u32>,
 ) -> Result<Vec<StoredCtap2Credential>> {
     block_on_store(load_ctap2_credentials_async(dir.as_ref(), user_id))
+}
+
+pub fn load_credential_summaries_from_dir(
+    dir: impl AsRef<Path>,
+    user_id: Option<u32>,
+) -> Result<Vec<StoredCredentialSummary>> {
+    block_on_store(load_credential_summaries_async(dir.as_ref(), user_id))
 }
 
 pub fn save_ctap2_credentials(credentials: &[StoredCtap2Credential]) -> Result<()> {
@@ -414,6 +432,49 @@ async fn save_daemon_passphrase_async(
     Ok(())
 }
 
+async fn load_credential_summaries_async(
+    dir: &Path,
+    user_id: Option<u32>,
+) -> Result<Vec<StoredCredentialSummary>> {
+    let database_path = credentials_database_path_in_dir(dir);
+    if !database_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let pool = open_database(dir).await?;
+    let user_id = user_id.map(i64::from);
+    let rows = sqlx::query!(
+        "SELECT m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, \
+                p.policy_selection \
+         FROM credential_metadata m \
+         JOIN credential_keyslots p \
+           ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' \
+         WHERE (?1 IS NULL OR m.user_id = ?1 OR m.user_id IS NULL) \
+         ORDER BY m.rp_id, m.credential_id",
+        user_id,
+    )
+    .fetch_all(&pool)
+    .await
+    .wrap_err_with(|| {
+        format!(
+            "loading credential summaries from {}",
+            database_path.display()
+        )
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| StoredCredentialSummary {
+            id: row.credential_id,
+            rp_id: row.rp_id,
+            user_name: row.user_name,
+            registered_at: row.created_at,
+            last_used_at: row.last_used_at,
+            policy_selection: row.policy_selection,
+        })
+        .collect())
+}
+
 async fn load_ctap2_credentials_async(
     dir: &Path,
     user_id: Option<u32>,
@@ -558,6 +619,14 @@ async fn save_ctap2_credentials_async(
 ) -> Result<()> {
     let pool = open_database(dir).await?;
     let mut tx = pool.begin().await.wrap_err("beginning store transaction")?;
+    let existing_timestamps: HashMap<Vec<u8>, (String, Option<String>)> =
+        sqlx::query!("SELECT credential_id, created_at, last_used_at FROM credential_metadata")
+            .fetch_all(&mut *tx)
+            .await
+            .wrap_err("loading existing credential timestamps")?
+            .into_iter()
+            .map(|row| (row.credential_id, (row.created_at, row.last_used_at)))
+            .collect();
 
     sqlx::query!("DELETE FROM credential_metadata")
         .execute(&mut *tx)
@@ -576,10 +645,16 @@ async fn save_ctap2_credentials_async(
             }
         };
 
+        let (registered_at, last_used_at) = existing_timestamps
+            .get(&credential.id)
+            .map(|(registered_at, last_used_at)| {
+                (Some(registered_at.as_str()), last_used_at.as_deref())
+            })
+            .unwrap_or((None, None));
         sqlx::query!(
             "INSERT INTO credential_metadata \
-             (credential_id, rp_id, discoverable, user_id, user_handle, user_name, user_display_name, sign_count, integrity_mac) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (credential_id, rp_id, discoverable, user_id, user_handle, user_name, user_display_name, sign_count, integrity_mac, created_at, last_used_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, CURRENT_TIMESTAMP), ?11)",
             &credential.id,
             &credential.rp_id,
             i64::from(credential.discoverable),
@@ -589,6 +664,8 @@ async fn save_ctap2_credentials_async(
             credential.user_display_name.as_deref(),
             i64::from(credential.sign_count),
             key.as_deref(),
+            registered_at,
+            last_used_at,
         )
         .execute(&mut *tx)
         .await
@@ -664,7 +741,7 @@ async fn update_ctap2_sign_count_async(
     let pool = open_database(dir).await?;
     let result = sqlx::query!(
         "UPDATE credential_metadata \
-         SET sign_count = ?1, updated_at = CURRENT_TIMESTAMP \
+         SET sign_count = ?1, updated_at = CURRENT_TIMESTAMP, last_used_at = CURRENT_TIMESTAMP \
          WHERE credential_id = ?2",
         i64::from(sign_count),
         credential_id,
@@ -1191,6 +1268,14 @@ mod tests {
         let second = test_credential(vec![2], "second.example", 2);
         save_ctap2_credentials_to_dir(&dir, &[first.clone(), second.clone()])
             .expect("save credentials");
+        let initial_summaries =
+            load_credential_summaries_from_dir(&dir, None).expect("load initial summaries");
+        let first_registered_at = initial_summaries
+            .iter()
+            .find(|summary| summary.id == first.id)
+            .expect("first summary")
+            .registered_at
+            .clone();
 
         update_ctap2_sign_count_in_dir(&dir, &first.id, 42).expect("update sign count");
 
@@ -1206,6 +1291,30 @@ mod tests {
 
         assert_eq!(loaded_first.sign_count, 42);
         assert_eq!(loaded_second.sign_count, 2);
+
+        let used_summaries =
+            load_credential_summaries_from_dir(&dir, None).expect("load used summaries");
+        let first_summary = used_summaries
+            .iter()
+            .find(|summary| summary.id == first.id)
+            .expect("first summary");
+        let second_summary = used_summaries
+            .iter()
+            .find(|summary| summary.id == second.id)
+            .expect("second summary");
+        assert_eq!(first_summary.registered_at, first_registered_at);
+        assert!(first_summary.last_used_at.is_some());
+        assert!(second_summary.last_used_at.is_none());
+
+        save_ctap2_credentials_to_dir(&dir, &loaded).expect("resave credentials");
+        let resaved_summaries =
+            load_credential_summaries_from_dir(&dir, None).expect("load resaved summaries");
+        let resaved_first = resaved_summaries
+            .iter()
+            .find(|summary| summary.id == first.id)
+            .expect("resaved first summary");
+        assert_eq!(resaved_first.registered_at, first_registered_at);
+        assert_eq!(resaved_first.last_used_at, first_summary.last_used_at);
         fs::remove_dir_all(&dir).expect("remove test store");
     }
 

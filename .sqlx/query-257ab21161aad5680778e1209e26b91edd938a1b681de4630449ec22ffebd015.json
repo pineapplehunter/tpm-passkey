@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO credential_metadata (credential_id, rp_id, discoverable, user_id, user_handle, user_name, user_display_name, sign_count, integrity_mac, created_at, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, CURRENT_TIMESTAMP), ?11)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "257ab21161aad5680778e1209e26b91edd938a1b681de4630449ec22ffebd015"
+}
