@@ -42,7 +42,7 @@
 - [x] Show bound PCR indices in `list-credentials`.
 - [x] Move default PCR policy setting to `config set default-pcr-policy`.
 - [x] Add `config show` for current persistent configuration.
-- [ ] Update tests and documentation, then run Rust and NixOS validation.
+- [x] Update tests and documentation, then run Rust and NixOS validation.
 
 ## CTAP 2.2 systematic audit
 
