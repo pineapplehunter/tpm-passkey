@@ -51,6 +51,8 @@
         };
 
         testScript = ''
+          import base64
+
           def login_alice():
               machine.send_key("ctrl-alt-f1")
               machine.wait_until_tty_matches("1", "login:")
@@ -301,6 +303,29 @@
               'send "5678\\r"; '
               'expect eof'
               "'"
+          )
+
+          # -- credential-management deletion removes storage and assertion access --
+          before_delete = mgmt("list-credentials")
+          delete_row = next(
+              row.split("\t")
+              for row in before_delete.strip().splitlines()
+              if "compliance.example.test" in row
+          )
+          credential_b64 = base64.b64encode(bytes.fromhex(delete_row[0])).decode()
+          machine.succeed(
+              "expect -c '"
+              + f"spawn fido2-manage -delete -device 1 -credential {credential_b64}; "
+              + 'expect "Are you sure you want to proceed?"; '
+              + 'send "Y\\r"; '
+              + 'expect "Enter PIN"; '
+              + 'send "5678\\r"; '
+              + 'expect eof'
+              + "'"
+          )
+          after_delete = mgmt("list-credentials")
+          assert after_delete.count("compliance.example.test") == 1, (
+              f"Expected one compliance credential after deletion, got: {after_delete}"
           )
         '';
       };
