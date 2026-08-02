@@ -5,7 +5,7 @@ import traceback
 
 from fido2.cose import ES256
 from fido2.ctap import CtapError
-from fido2.ctap2 import ClientPin, Ctap2
+from fido2.ctap2 import ClientPin, CredentialManagement, Ctap2
 from fido2.hid import CTAPHID, CtapHidDevice
 from fido2.webauthn import AuthenticatorData
 
@@ -184,6 +184,63 @@ def main():
             allow_list=[descriptor],
             options={"up": False, "uv": False},
         ),
+    )
+
+    # Credential-management response keys and unauthenticated continuation
+    # commands must interoperate with a strict CTAP client.
+    management_token = client_pin.get_uv_token(
+        permissions=ClientPin.PERMISSION.CREDENTIAL_MGMT,
+    )
+    credential_management = CredentialManagement(
+        ctap, client_pin.protocol, management_token
+    )
+    metadata = credential_management.get_metadata()
+    assert metadata[CredentialManagement.RESULT.EXISTING_CRED_COUNT] == 2
+    relying_parties = credential_management.enumerate_rps()
+    assert len(relying_parties) == 1
+    assert relying_parties[0][CredentialManagement.RESULT.RP]["id"] == rp_id
+    managed_credentials = credential_management.enumerate_creds(
+        hashlib.sha256(rp_id.encode()).digest()
+    )
+    assert len(managed_credentials) == 2
+    assert {
+        credential[CredentialManagement.RESULT.CREDENTIAL_ID]["id"]
+        for credential in managed_credentials
+    } == set(keys)
+
+    updated_descriptor = managed_credentials[0][
+        CredentialManagement.RESULT.CREDENTIAL_ID
+    ]
+    original_user_id = managed_credentials[0][CredentialManagement.RESULT.USER]["id"]
+    credential_management.update_user_info(
+        updated_descriptor,
+        {
+            "id": original_user_id,
+            "name": "updated-user",
+            "displayName": "Updated User",
+        },
+    )
+    updated_credentials = credential_management.enumerate_creds(
+        hashlib.sha256(rp_id.encode()).digest()
+    )
+    updated = next(
+        credential
+        for credential in updated_credentials
+        if credential[CredentialManagement.RESULT.CREDENTIAL_ID]["id"]
+        == updated_descriptor["id"]
+    )
+    assert updated[CredentialManagement.RESULT.USER] == {
+        "id": original_user_id,
+        "name": "updated-user",
+        "displayName": "Updated User",
+    }
+
+    # A non-continuation operation interrupts enumeration state.
+    credential_management.enumerate_rps_begin()
+    credential_management.get_metadata()
+    expect_ctap_error(
+        CtapError.ERR.NOT_ALLOWED,
+        credential_management.enumerate_rps_next,
     )
 
 

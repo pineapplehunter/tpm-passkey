@@ -91,13 +91,22 @@ struct PinUvAuthToken {
     user_present_until: Option<Instant>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagementContinuation {
+    RelyingParties,
+    Credentials,
+}
+
 struct ManagementState {
+    continuation: ManagementContinuation,
     rp_indexes: Vec<usize>,
     rp_position: usize,
     credential_indexes: Vec<usize>,
     credential_position: usize,
     session_uid: Option<u32>,
-    created_at: Instant,
+    session_id: Option<String>,
+    token: Vec<u8>,
+    last_used_at: Instant,
 }
 
 struct PendingAssertion {
@@ -896,29 +905,44 @@ impl Authenticator {
             return Err(ErrorStatus::OperationDenied);
         }
         let request = decode_map(body)?;
-        let sub_command = map_integer(&request, 1).ok_or(ErrorStatus::MissingParameter)?;
-        let params = map_map(&request, 2);
-        let protocol = map_integer(&request, 3);
-        let auth_param = map_bytes(&request, 4);
-        let message = management_auth_message(sub_command, params);
-
-        if self.client_pin.is_none() {
-            return Err(ErrorStatus::PinNotSet);
+        let sub_command = optional_integer(&request, 1)?.ok_or(ErrorStatus::MissingParameter)?;
+        if !(1..=7).contains(&sub_command) {
+            return Err(ErrorStatus::InvalidSubcommand);
         }
+        let params = optional_map(&request, 2)?;
+        let protocol = optional_integer(&request, 3)?;
+        let auth_param = optional_bytes(&request, 4)?;
+
+        if sub_command == 3 {
+            return self.enumerate_rps_next();
+        }
+        if sub_command == 5 {
+            return self.enumerate_credentials_next();
+        }
+
+        // Any operation other than the matching continuation interrupts prior
+        // enumeration state.
+        self.management = None;
+        let auth_param = auth_param.ok_or(ErrorStatus::PuatRequired)?;
+        let protocol = protocol.ok_or(ErrorStatus::MissingParameter)?;
+        let permission_rp_id = match sub_command {
+            1 | 2 => None,
+            4 => {
+                validate_enumerate_credentials_params(params)?;
+                None
+            }
+            6 => self.credential_rp_id_for_params(params, false)?,
+            7 => self.credential_rp_id_for_params(params, true)?,
+            _ => unreachable!("continuation commands returned above"),
+        };
+        let message = management_auth_message(sub_command, params);
         self.validate_pin_uv_auth(
-            protocol,
-            auth_param,
+            Some(protocol),
+            Some(auth_param),
             &message,
             Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
-            None,
+            permission_rp_id.as_deref(),
         )?;
-
-        if self.management.as_ref().is_some_and(|state| {
-            state.created_at.elapsed() > Duration::from_secs(30)
-                || state.session_uid != self.session.uid
-        }) {
-            self.management = None;
-        }
 
         match sub_command {
             1 => {
@@ -936,12 +960,10 @@ impl Authenticator {
                 ))
             }
             2 => self.enumerate_rps_begin(),
-            3 => self.enumerate_rps_next(),
             4 => self.enumerate_credentials_begin(params),
-            5 => self.enumerate_credentials_next(),
             6 => self.delete_credential(params),
             7 => self.update_user_information(params),
-            _ => Err(ErrorStatus::InvalidCommand),
+            _ => unreachable!("validated credential-management subcommand"),
         }
     }
 
@@ -961,23 +983,33 @@ impl Authenticator {
         };
         let total = rp_indexes.len();
         self.management = Some(ManagementState {
+            continuation: ManagementContinuation::RelyingParties,
             rp_indexes,
             rp_position: 1,
             credential_indexes: Vec::new(),
             credential_position: 0,
             session_uid: self.session.uid,
-            created_at: Instant::now(),
+            session_id: self.session.session_id.clone(),
+            token: self
+                .pin_uv_auth_token
+                .as_ref()
+                .expect("credential management token was validated")
+                .value
+                .clone(),
+            last_used_at: Instant::now(),
         });
         Ok(encode_rp_response(&self.credentials[first], Some(total)))
     }
 
     fn enumerate_rps_next(&mut self) -> Result<Vec<u8>, ErrorStatus> {
-        let state = self.management.as_mut().ok_or(ErrorStatus::NoCredentials)?;
+        self.validate_management_continuation(ManagementContinuation::RelyingParties)?;
+        let state = self.management.as_mut().ok_or(ErrorStatus::NotAllowed)?;
         let index = *state
             .rp_indexes
             .get(state.rp_position)
-            .ok_or(ErrorStatus::NoCredentials)?;
+            .ok_or(ErrorStatus::NotAllowed)?;
         state.rp_position += 1;
+        state.last_used_at = Instant::now();
         Ok(encode_rp_response(&self.credentials[index], None))
     }
 
@@ -1003,12 +1035,20 @@ impl Authenticator {
         };
         let total = indexes.len();
         self.management = Some(ManagementState {
+            continuation: ManagementContinuation::Credentials,
             rp_indexes: Vec::new(),
             rp_position: 0,
             credential_indexes: indexes,
             credential_position: 1,
             session_uid: self.session.uid,
-            created_at: Instant::now(),
+            session_id: self.session.session_id.clone(),
+            token: self
+                .pin_uv_auth_token
+                .as_ref()
+                .expect("credential management token was validated")
+                .value
+                .clone(),
+            last_used_at: Instant::now(),
         });
         Ok(encode_credential_management_response(
             &self.credentials[first],
@@ -1017,25 +1057,64 @@ impl Authenticator {
     }
 
     fn enumerate_credentials_next(&mut self) -> Result<Vec<u8>, ErrorStatus> {
-        let state = self.management.as_mut().ok_or(ErrorStatus::NoCredentials)?;
+        self.validate_management_continuation(ManagementContinuation::Credentials)?;
+        let state = self.management.as_mut().ok_or(ErrorStatus::NotAllowed)?;
         let index = *state
             .credential_indexes
             .get(state.credential_position)
-            .ok_or(ErrorStatus::NoCredentials)?;
+            .ok_or(ErrorStatus::NotAllowed)?;
         state.credential_position += 1;
+        state.last_used_at = Instant::now();
         Ok(encode_credential_management_response(
             &self.credentials[index],
             None,
         ))
     }
 
+    fn credential_rp_id_for_params(
+        &self,
+        params: Option<&[(Value, Value)]>,
+        require_user: bool,
+    ) -> Result<Option<String>, ErrorStatus> {
+        let id = management_credential_id(params)?;
+        if require_user {
+            validate_management_user(params)?;
+        }
+        Ok(self
+            .credentials
+            .iter()
+            .find(|credential| credential.discoverable && credential.id == id)
+            .map(|credential| credential.rp_id.clone()))
+    }
+
+    fn validate_management_continuation(
+        &mut self,
+        expected: ManagementContinuation,
+    ) -> Result<(), ErrorStatus> {
+        let valid = self.management.as_ref().is_some_and(|state| {
+            state.continuation == expected
+                && state.last_used_at.elapsed() <= Duration::from_secs(30)
+                && state.session_uid == self.session.uid
+                && state.session_id == self.session.session_id
+                && self.pin_uv_auth_token.as_ref().is_some_and(|token| {
+                    token.value == state.token
+                        && token.session_uid == self.session.uid
+                        && token.session_id == self.session.session_id
+                        && token.issued_at.elapsed() <= Duration::from_secs(600)
+                })
+        });
+        if !valid {
+            self.management = None;
+            return Err(ErrorStatus::NotAllowed);
+        }
+        Ok(())
+    }
+
     fn delete_credential(
         &mut self,
         params: Option<&[(Value, Value)]>,
     ) -> Result<Vec<u8>, ErrorStatus> {
-        let params = params.ok_or(ErrorStatus::MissingParameter)?;
-        let descriptor = map_map(params, 2).ok_or(ErrorStatus::MissingParameter)?;
-        let id = map_bytes(descriptor, "id").ok_or(ErrorStatus::MissingParameter)?;
+        let id = management_credential_id(params)?;
         let index = self
             .credentials
             .iter()
@@ -1054,20 +1133,23 @@ impl Authenticator {
         &mut self,
         params: Option<&[(Value, Value)]>,
     ) -> Result<Vec<u8>, ErrorStatus> {
-        let params = params.ok_or(ErrorStatus::MissingParameter)?;
-        let descriptor = map_map(params, 2).ok_or(ErrorStatus::MissingParameter)?;
-        let id = map_bytes(descriptor, "id").ok_or(ErrorStatus::MissingParameter)?;
-        let user = map_map(params, 3).ok_or(ErrorStatus::MissingParameter)?;
+        let id = management_credential_id(params)?;
+        let user = validate_management_user(params)?;
+        let user_id = map_bytes(user, "id").expect("validated user ID");
         let credential = self
             .credentials
             .iter_mut()
             .find(|credential| credential.discoverable && credential.id == id)
             .ok_or(ErrorStatus::NoCredentials)?;
-        if let Some(user_id) = map_bytes(user, "id") {
-            credential.user_handle = user_id.to_vec();
+        if credential.user_handle != user_id {
+            return Err(ErrorStatus::InvalidParameter);
         }
-        credential.user_name = map_text(user, "name").map(str::to_owned);
-        credential.user_display_name = map_text(user, "displayName").map(str::to_owned);
+        credential.user_name = map_text(user, "name")
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        credential.user_display_name = map_text(user, "displayName")
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         self.save_credentials();
         self.management = None;
         Ok(encode_response(Value::Map(Vec::new())))
@@ -2011,6 +2093,51 @@ fn display_rp_label(rp_name: Option<&str>, rp_id: &str) -> String {
     }
 }
 
+fn validate_enumerate_credentials_params(
+    params: Option<&[(Value, Value)]>,
+) -> Result<(), ErrorStatus> {
+    let params = params.ok_or(ErrorStatus::MissingParameter)?;
+    let rp_hash = map_value(params, 1).ok_or(ErrorStatus::MissingParameter)?;
+    let rp_hash = rp_hash.as_bytes().ok_or(ErrorStatus::InvalidCbor)?;
+    if rp_hash.len() != 32 {
+        return Err(ErrorStatus::InvalidParameter);
+    }
+    Ok(())
+}
+
+fn management_credential_id(params: Option<&[(Value, Value)]>) -> Result<&[u8], ErrorStatus> {
+    let params = params.ok_or(ErrorStatus::MissingParameter)?;
+    let descriptor = map_value(params, 2).ok_or(ErrorStatus::MissingParameter)?;
+    let descriptor = descriptor.as_map().ok_or(ErrorStatus::InvalidCbor)?;
+    let credential_type = map_value(descriptor, "type").ok_or(ErrorStatus::MissingParameter)?;
+    if credential_type.as_text() != Some("public-key") {
+        return Err(ErrorStatus::InvalidCbor);
+    }
+    map_value(descriptor, "id")
+        .ok_or(ErrorStatus::MissingParameter)?
+        .as_bytes()
+        .map(Vec::as_slice)
+        .ok_or(ErrorStatus::InvalidCbor)
+}
+
+fn validate_management_user(
+    params: Option<&[(Value, Value)]>,
+) -> Result<&[(Value, Value)], ErrorStatus> {
+    let params = params.ok_or(ErrorStatus::MissingParameter)?;
+    let user = map_value(params, 3).ok_or(ErrorStatus::MissingParameter)?;
+    let user = user.as_map().ok_or(ErrorStatus::InvalidCbor)?;
+    let id = map_value(user, "id").ok_or(ErrorStatus::MissingParameter)?;
+    if id.as_bytes().is_none() {
+        return Err(ErrorStatus::InvalidCbor);
+    }
+    for key in ["name", "displayName"] {
+        if map_value(user, key).is_some_and(|value| value.as_text().is_none()) {
+            return Err(ErrorStatus::InvalidCbor);
+        }
+    }
+    Ok(user)
+}
+
 fn encode_rp_response(credential: &Credential, total: Option<usize>) -> Vec<u8> {
     let mut rp = vec![(
         Value::Text("id".to_owned()),
@@ -2021,15 +2148,15 @@ fn encode_rp_response(credential: &Credential, total: Option<usize>) -> Vec<u8> 
         Value::Text(credential.rp_id.clone()),
     ));
     let mut response = vec![
-        (Value::Integer(1.into()), Value::Map(rp)),
+        (Value::Integer(3.into()), Value::Map(rp)),
         (
-            Value::Integer(2.into()),
+            Value::Integer(4.into()),
             Value::Bytes(Sha256::digest(credential.rp_id.as_bytes()).to_vec()),
         ),
     ];
     if let Some(total) = total {
         response.push((
-            Value::Integer(3.into()),
+            Value::Integer(5.into()),
             Value::Integer((total as u64).into()),
         ));
     }
@@ -2051,9 +2178,9 @@ fn encode_credential_management_response(credential: &Credential, total: Option<
         ));
     }
     let mut response = vec![
-        (Value::Integer(1.into()), Value::Map(user)),
+        (Value::Integer(6.into()), Value::Map(user)),
         (
-            Value::Integer(2.into()),
+            Value::Integer(7.into()),
             Value::Map(vec![
                 (
                     Value::Text("type".to_owned()),
@@ -2066,13 +2193,13 @@ fn encode_credential_management_response(credential: &Credential, total: Option<
             ]),
         ),
         (
-            Value::Integer(3.into()),
+            Value::Integer(8.into()),
             cose_credential_public_key(&credential.key),
         ),
     ];
     if let Some(total) = total {
         response.push((
-            Value::Integer(4.into()),
+            Value::Integer(9.into()),
             Value::Integer((total as u64).into()),
         ));
     }

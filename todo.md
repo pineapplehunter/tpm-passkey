@@ -51,13 +51,19 @@
 - [x] Reuse UV-token user presence for one operation in the same login session without weakening transaction or RP scoping.
 - [x] Document the security constraints and validate the changes.
 
+## CTAP test readability
+
+- [x] Replace hand-built `Value::Map`/`Value::Array` test data with the `cbor!` macro.
+- [x] Keep dynamic request helpers concise and preserve strict wire-shape assertions.
+- [x] Run formatting, Rust checks, clippy, and the NixOS VM test.
+
 ## CTAP 2.2 systematic audit
 
 - [x] Create and maintain `docs/ctap2-compliance.md` from the normative specification.
 - [x] Complete the ClientPIN wire-format, cryptography, permission, and retry audit.
 - [x] Audit makeCredential and getAssertion.
 - [x] Audit getInfo capability claims.
-- [ ] Audit credential management and stateful continuation commands.
+- [x] Audit credential management and stateful continuation commands.
 - [ ] Audit reset, selection, and unsupported commands.
 - [ ] Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
 - [ ] Run final Rust and NixOS validation.

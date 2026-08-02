@@ -30,11 +30,11 @@ fn get_info_uses_project_aaguid_and_algorithm_metadata() {
     );
     assert_eq!(
         map_value(&map, 6),
-        Some(&Value::Array(vec![Value::Integer(2.into())]))
+        Some(&cbor!([2]).expect("protocol list"))
     );
     assert_eq!(
         map_value(&map, 2),
-        Some(&Value::Array(vec![Value::Text("credProps".to_owned())]))
+        Some(&cbor!(["credProps"]).expect("extension list"))
     );
 }
 
@@ -48,8 +48,8 @@ fn get_info_advertises_a_consistent_ctap21_configuration() {
     let versions = map_value(&map, 1)
         .and_then(Value::as_array)
         .expect("versions");
-    assert!(versions.contains(&Value::Text("FIDO_2_0".to_owned())));
-    assert!(versions.contains(&Value::Text("FIDO_2_1".to_owned())));
+    assert!(versions.contains(&cbor!("FIDO_2_0").expect("version")));
+    assert!(versions.contains(&cbor!("FIDO_2_1").expect("version")));
     assert_eq!(map_bytes(&map, 3).map(<[u8]>::len), Some(16));
     assert!(
         map_value(&map, 5)
@@ -65,7 +65,7 @@ fn get_info_advertises_a_consistent_ctap21_configuration() {
     assert_eq!(map_bool(options, "uv"), Some(true));
     assert_eq!(map_bool(options, "pinUvAuthToken"), Some(true));
     assert_eq!(map_bool(options, "credMgmt"), Some(true));
-    assert_eq!(map_value(&map, 13), Some(&Value::Integer(4.into())));
+    assert_eq!(map_integer(&map, 13), Some(4));
 
     let algorithms = map_value(&map, 10)
         .and_then(Value::as_array)
@@ -163,47 +163,40 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
     let encrypted_pin = encrypt_aes(&aes_key, &padded_pin).expect("encrypt PIN");
     let set_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(3.into())),
-            (Value::Integer(3.into()), client_key.clone()),
-            (
-                Value::Integer(4.into()),
-                Value::Bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
-            ),
-            (Value::Integer(5.into()), Value::Bytes(encrypted_pin)),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 3,
+            3 => client_key.clone(),
+            4 => bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
+            5 => bytes(encrypted_pin),
+        })
+        .expect("set-PIN request"),
     ));
     assert_eq!(set_response[0], 0x00);
 
     let retries = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(1.into())),
-        ]),
+        cbor!({ 1 => 2, 2 => 1 }).expect("PIN-retries request"),
     ));
     let Value::Map(retries_map) = ciborium::from_reader::<Value, _>(&retries[1..]).expect("CBOR")
     else {
         panic!("expected getRetries response");
     };
-    assert_eq!(map_value(&retries_map, 3), Some(&Value::Integer(8.into())));
+    assert_eq!(map_integer(&retries_map, 3), Some(8));
 
     let pin_hash = Sha256::digest(b"1234");
     let encrypted_pin_hash = encrypt_aes(&aes_key, &pin_hash[..16]).expect("encrypt PIN hash");
     let token_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(9.into())),
-            (Value::Integer(3.into()), client_key),
-            (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
-            (Value::Integer(9.into()), Value::Integer(1.into())),
-            (
-                Value::Integer(10.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 9,
+            3 => client_key,
+            6 => bytes(encrypted_pin_hash),
+            9 => 1,
+            10 => "example.com",
+        })
+        .expect("PIN-token request"),
     ));
     assert_eq!(token_response[0], 0x00);
     let Value::Map(token_map) =
@@ -223,20 +216,15 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
     let wrong_encrypted_hash = encrypt_aes(&aes_key, &wrong_hash[..16]).expect("encrypt PIN hash");
     let wrong_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(9.into())),
-            (
-                Value::Integer(3.into()),
-                client_key_agreement(&client_secret),
-            ),
-            (Value::Integer(6.into()), Value::Bytes(wrong_encrypted_hash)),
-            (Value::Integer(9.into()), Value::Integer(1.into())),
-            (
-                Value::Integer(10.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 9,
+            3 => client_key_agreement(&client_secret),
+            6 => bytes(wrong_encrypted_hash),
+            9 => 1,
+            10 => "example.com",
+        })
+        .expect("wrong-PIN token request"),
     ));
     assert_eq!(wrong_response, vec![ErrorStatus::PinInvalid as u8]);
 
@@ -256,53 +244,42 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
             encrypt_aes(&retry_aes_key, &wrong_hash[..16]).expect("encrypt PIN hash");
         let response = authenticator.handle_cbor(&ctap_request(
             Ctap2Command::ClientPin,
-            Value::Map(vec![
-                (Value::Integer(1.into()), Value::Integer(2.into())),
-                (Value::Integer(2.into()), Value::Integer(9.into())),
-                (
-                    Value::Integer(3.into()),
-                    client_key_agreement(&retry_secret),
-                ),
-                (Value::Integer(6.into()), Value::Bytes(wrong_encrypted_hash)),
-                (Value::Integer(9.into()), Value::Integer(1.into())),
-                (
-                    Value::Integer(10.into()),
-                    Value::Text("example.com".to_owned()),
-                ),
-            ]),
+            cbor!({
+                1 => 2,
+                2 => 9,
+                3 => client_key_agreement(&retry_secret),
+                6 => bytes(wrong_encrypted_hash),
+                9 => 1,
+                10 => "example.com",
+            })
+            .expect("retry wrong-PIN request"),
         ));
         assert_eq!(response, vec![u8::from(expected_status)]);
     }
 
     let blocked_retries = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(1.into()))]),
+        cbor!({ 2 => 1 }).expect("PIN-retries request"),
     ));
     let Value::Map(blocked_retries) =
         ciborium::from_reader::<Value, _>(&blocked_retries[1..]).expect("CBOR")
     else {
         panic!("expected blocked retries response");
     };
-    assert_eq!(
-        map_value(&blocked_retries, 3),
-        Some(&Value::Integer(5.into()))
-    );
-    assert_eq!(map_value(&blocked_retries, 4), Some(&Value::Bool(true)));
+    assert_eq!(map_integer(&blocked_retries, 3), Some(5));
+    assert_eq!(map_bool(&blocked_retries, 4), Some(true));
 
     let mut restored = Authenticator::new(store_dir.clone(), None);
     let restored_retries = restored.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(1.into())),
-        ]),
+        cbor!({ 1 => 2, 2 => 1 }).expect("PIN-retries request"),
     ));
     let Value::Map(restored_map) =
         ciborium::from_reader::<Value, _>(&restored_retries[1..]).expect("CBOR")
     else {
         panic!("expected restored getRetries response");
     };
-    assert_eq!(map_value(&restored_map, 3), Some(&Value::Integer(5.into())));
+    assert_eq!(map_integer(&restored_map, 3), Some(5));
 
     let legacy_secret = EphemeralSecret::generate();
     let legacy_server_key = client_pin_key_agreement(&mut restored);
@@ -319,15 +296,13 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
         encrypt_aes(&legacy_aes_key, &pin_hash[..16]).expect("encrypt PIN hash");
     let legacy_response = restored.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(5.into())),
-            (
-                Value::Integer(3.into()),
-                client_key_agreement(&legacy_secret),
-            ),
-            (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 5,
+            3 => client_key_agreement(&legacy_secret),
+            6 => bytes(encrypted_pin_hash),
+        })
+        .expect("legacy token request"),
     ));
     assert_eq!(legacy_response[0], 0x00);
     let Value::Map(legacy_response) =
@@ -371,19 +346,14 @@ fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
 
     let response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(6.into())),
-            (
-                Value::Integer(3.into()),
-                client_key_agreement(&client_secret),
-            ),
-            (Value::Integer(9.into()), Value::Integer(1.into())),
-            (
-                Value::Integer(10.into()),
-                Value::Text("passkeys.io".to_owned()),
-            ),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 6,
+            3 => client_key_agreement(&client_secret),
+            9 => 1,
+            10 => "passkeys.io",
+        })
+        .expect("UV-token request"),
     ));
     assert_eq!(response[0], 0x00);
     let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
@@ -401,45 +371,16 @@ fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
     mac.update(&client_data_hash);
     let make_credential = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::MakeCredential,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Bytes(client_data_hash.to_vec()),
-            ),
-            (
-                Value::Integer(2.into()),
-                Value::Map(vec![(
-                    Value::Text("id".to_owned()),
-                    Value::Text("passkeys.io".to_owned()),
-                )]),
-            ),
-            (
-                Value::Integer(3.into()),
-                Value::Map(vec![(
-                    Value::Text("id".to_owned()),
-                    Value::Bytes(vec![0x22; 16]),
-                )]),
-            ),
-            (
-                Value::Integer(4.into()),
-                Value::Array(vec![Value::Map(vec![
-                    (
-                        Value::Text("type".to_owned()),
-                        Value::Text("public-key".to_owned()),
-                    ),
-                    (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
-                ])]),
-            ),
-            (
-                Value::Integer(7.into()),
-                Value::Map(options_map(&[("rk", true), ("up", true)])),
-            ),
-            (
-                Value::Integer(8.into()),
-                Value::Bytes(mac.finalize().into_bytes().to_vec()),
-            ),
-            (Value::Integer(9.into()), Value::Integer(2.into())),
-        ]),
+        cbor!({
+            1 => bytes(client_data_hash),
+            2 => { "id" => "passkeys.io" },
+            3 => { "id" => bytes([0x22; 16]) },
+            4 => [{ "type" => "public-key", "alg" => -7 }],
+            7 => { "rk" => true, "up" => true },
+            8 => bytes(mac.finalize().into_bytes()),
+            9 => 2,
+        })
+        .expect("make-credential request"),
     ));
     assert_eq!(
         make_credential,
@@ -450,19 +391,13 @@ fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
 
     let retries = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(7.into())),
-        ]),
+        cbor!({ 1 => 2, 2 => 7 }).expect("UV-retries request"),
     ));
     let Value::Map(retries) = ciborium::from_reader::<Value, _>(&retries[1..]).expect("CBOR")
     else {
         panic!("expected UV retries response");
     };
-    assert_eq!(
-        map_value(&retries, 5),
-        Some(&Value::Integer(UV_RETRIES.into()))
-    );
+    assert_eq!(map_integer(&retries, 5), Some(UV_RETRIES.into()));
     let _ = std::fs::remove_dir_all(store_dir);
 }
 
@@ -473,7 +408,7 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
 
     let retries = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(1.into()))]),
+        cbor!({ 2 => 1 }).expect("PIN-retries request"),
     ));
     assert_eq!(
         retries[0], 0x00,
@@ -482,17 +417,13 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
 
     let unknown = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![(Value::Integer(2.into()), Value::Integer(8.into()))]),
+        cbor!({ 2 => 8 }).expect("unknown ClientPIN request"),
     ));
     assert_eq!(unknown, vec![u8::from(ErrorStatus::InvalidSubcommand)]);
 
     let nested_parameters = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(3.into())),
-            (Value::Integer(4.into()), Value::Map(Vec::new())),
-        ]),
+        cbor!({ 1 => 2, 2 => 3, 4 => {} }).expect("nested ClientPIN request"),
     ));
     assert_eq!(
         nested_parameters,
@@ -527,7 +458,9 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
     let Value::Map(mut key) = client_key_agreement(&secret) else {
         panic!("expected key agreement map");
     };
-    key.push((Value::Integer(2.into()), Value::Bytes(vec![1])));
+    key.extend(cbor_map(
+        cbor!({ 2 => bytes([1]) }).expect("extra key-agreement member"),
+    ));
     assert!(matches!(
         parse_key_agreement(&key),
         Err(ErrorStatus::InvalidParameter)
@@ -619,16 +552,14 @@ fn make_credential_with_pin_uv_auth_token_regression() {
     let encrypted_pin = encrypt_aes(&aes_key, &padded_pin).expect("encrypt PIN");
     let set_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(3.into())),
-            (Value::Integer(3.into()), client_key),
-            (
-                Value::Integer(4.into()),
-                Value::Bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
-            ),
-            (Value::Integer(5.into()), Value::Bytes(encrypted_pin)),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 3,
+            3 => client_key,
+            4 => bytes(pin_auth_param(&hmac_key, &encrypted_pin)),
+            5 => bytes(encrypted_pin),
+        })
+        .expect("set-PIN request"),
     ));
     assert_eq!(set_response[0], 0x00, "setPin should succeed");
 
@@ -650,14 +581,15 @@ fn make_credential_with_pin_uv_auth_token_regression() {
 
     let token_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(9.into())),
-            (Value::Integer(3.into()), client_key2),
-            (Value::Integer(6.into()), Value::Bytes(encrypted_pin_hash)),
-            (Value::Integer(9.into()), Value::Integer(1.into())),
-            (Value::Integer(10.into()), Value::Text(rp_id.to_owned())),
-        ]),
+        cbor!({
+            1 => 2,
+            2 => 9,
+            3 => client_key2,
+            6 => bytes(encrypted_pin_hash),
+            9 => 1,
+            10 => rp_id,
+        })
+        .expect("PIN-token request"),
     ));
     assert_eq!(token_response[0], 0x00, "getToken should succeed");
     let Value::Map(token_map) =
@@ -692,41 +624,15 @@ fn make_credential_with_pin_uv_auth_token_regression() {
     // being rejected as PinAuthInvalid.
     let make_credential_response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::MakeCredential,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Bytes(client_data_hash.to_vec()),
-            ),
-            (
-                Value::Integer(2.into()),
-                Value::Map(vec![(
-                    Value::Text("id".to_owned()),
-                    Value::Text(rp_id.to_owned()),
-                )]),
-            ),
-            (
-                Value::Integer(3.into()),
-                Value::Map(vec![(
-                    Value::Text("id".to_owned()),
-                    Value::Bytes(vec![0x42; 16]),
-                )]),
-            ),
-            (
-                Value::Integer(4.into()),
-                Value::Array(vec![Value::Map(vec![
-                    (
-                        Value::Text("type".to_owned()),
-                        Value::Text("public-key".to_owned()),
-                    ),
-                    (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
-                ])]),
-            ),
-            (
-                Value::Integer(8.into()),
-                Value::Bytes(correct_auth_param.clone()),
-            ),
-            (Value::Integer(9.into()), Value::Integer(2.into())),
-        ]),
+        cbor!({
+            1 => bytes(client_data_hash),
+            2 => { "id" => rp_id },
+            3 => { "id" => bytes([0x42; 16]) },
+            4 => [{ "type" => "public-key", "alg" => -7 }],
+            8 => bytes(correct_auth_param.clone()),
+            9 => 2,
+        })
+        .expect("make-credential request"),
     ));
     assert_eq!(
         make_credential_response[0],
@@ -842,39 +748,148 @@ fn make_credential_with_pin_uv_auth_token_regression() {
 
 #[test]
 fn credential_management_enumerates_discoverable_credentials_with_permission_token() {
-    let mut authenticator = authenticator_with_credential("example.com", vec![1, 2, 3]);
-    let token = vec![0x33; 32];
-    authenticator.client_pin = Some(ClientPinState {
-        pin_salt: vec![0; 32],
-        pin_verifier: vec![0; 32],
-        retries: PIN_RETRIES,
-    });
-    authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
-        value: token.clone(),
-        permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
-        rp_id: None,
-        session_uid: authenticator.session.uid,
-        session_id: authenticator.session.session_id.clone(),
-        issued_at: Instant::now(),
-        first_used_at: None,
-        user_present_until: None,
-    });
+    let mut authenticator = authenticator_with_credentials(
+        "example.com",
+        vec![
+            test_credential(vec![1, 2, 3], "example.com", 0),
+            test_credential(vec![4, 5, 6], "example.com", 0),
+        ],
+    );
+    let token = install_credential_management_token(&mut authenticator, None);
 
-    let request = Value::Map(vec![
-        (Value::Integer(1.into()), Value::Integer(1.into())),
-        (Value::Integer(3.into()), Value::Integer(2.into())),
-        (
-            Value::Integer(4.into()),
-            Value::Bytes(management_pin_auth(&token, 1, None)),
-        ),
-    ]);
+    let metadata = credential_management_request(&token, 1, None, true);
+    let response = authenticator.handle_cbor(&metadata);
+    let metadata = response_map(&response);
+    assert_eq!(map_integer(&metadata, 1), Some(2));
+    assert!(map_value(&metadata, 2).is_some());
+
+    let params = cbor_map(
+        cbor!({ 1 => bytes(Sha256::digest(b"example.com")) }).expect("credential parameters"),
+    );
+    let begin = credential_management_request(&token, 4, Some(params), true);
+    let response = authenticator.handle_cbor(&begin);
+    let first = response_map(&response);
+    assert!(map_value(&first, 6).is_some(), "user uses response key 6");
+    assert!(
+        map_value(&first, 7).is_some(),
+        "credential ID uses response key 7"
+    );
+    assert!(
+        map_value(&first, 8).is_some(),
+        "public key uses response key 8"
+    );
+    assert_eq!(map_integer(&first, 9), Some(2));
+
     let response =
-        authenticator.handle_cbor(&ctap_request(Ctap2Command::CredentialManagement, request));
-    assert_eq!(response[0], 0x00);
-    let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR") else {
-        panic!("expected credential-management response");
-    };
-    assert_eq!(map_value(&map, 1), Some(&Value::Integer(1.into())));
+        authenticator.handle_cbor(&credential_management_request(&token, 5, None, false));
+    let next = response_map(&response);
+    assert!(map_value(&next, 6).is_some());
+    assert!(map_value(&next, 9).is_none());
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(&token, 5, None, false)),
+        error_response(ErrorStatus::NotAllowed)
+    );
+}
+
+#[test]
+fn credential_management_continuations_are_unauthenticated_but_strictly_stateful() {
+    let mut authenticator = authenticator_with_credential("first.example", vec![1, 2, 3]);
+    let mut second = authenticator.credentials[0].clone();
+    second.id = vec![4, 5, 6];
+    second.rp_id = "second.example".to_owned();
+    authenticator.credentials.push(second);
+    let token = install_credential_management_token(&mut authenticator, None);
+
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(&token, 3, None, false)),
+        error_response(ErrorStatus::NotAllowed)
+    );
+
+    let begin = authenticator.handle_cbor(&credential_management_request(&token, 2, None, true));
+    let first = response_map(&begin);
+    assert!(map_value(&first, 3).is_some(), "RP uses response key 3");
+    assert!(
+        map_value(&first, 4).is_some(),
+        "RP hash uses response key 4"
+    );
+    assert_eq!(map_integer(&first, 5), Some(2));
+
+    let next = authenticator.handle_cbor(&credential_management_request(&token, 3, None, false));
+    let next = response_map(&next);
+    assert!(map_value(&next, 3).is_some());
+    assert!(map_value(&next, 5).is_none());
+
+    // An unrelated operation interrupts the completed enumeration, and an
+    // additional continuation fails with the stateful-command status.
+    let metadata = credential_management_request(&token, 1, None, true);
+    assert_eq!(authenticator.handle_cbor(&metadata)[0], 0x00);
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(&token, 3, None, false)),
+        error_response(ErrorStatus::NotAllowed)
+    );
+}
+
+#[test]
+fn credential_management_requires_authentication_and_valid_subcommands() {
+    let mut authenticator = authenticator_with_credential("example.com", vec![1, 2, 3]);
+    let token = install_credential_management_token(&mut authenticator, None);
+
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(&token, 1, None, false)),
+        error_response(ErrorStatus::PuatRequired)
+    );
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(&token, 8, None, true)),
+        error_response(ErrorStatus::InvalidSubcommand)
+    );
+}
+
+#[test]
+fn credential_management_update_preserves_user_id_and_removes_empty_names() {
+    let mut authenticator = authenticator_with_credential("example.com", vec![1, 2, 3]);
+    let token = install_credential_management_token(&mut authenticator, Some("example.com"));
+    let descriptor = credential_descriptor(vec![1, 2, 3]);
+    let wrong_params = cbor_map(
+        cbor!({
+            2 => descriptor.clone(),
+            3 => { "id" => bytes([9, 9, 9]) },
+        })
+        .expect("update parameters"),
+    );
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(
+            &token,
+            7,
+            Some(wrong_params),
+            true,
+        )),
+        error_response(ErrorStatus::InvalidParameter)
+    );
+
+    let token = install_credential_management_token(&mut authenticator, Some("example.com"));
+    let params = cbor_map(
+        cbor!({
+            2 => descriptor,
+            3 => {
+                "id" => bytes([5, 6, 7, 8]),
+                "name" => "",
+                "displayName" => "",
+            },
+        })
+        .expect("update parameters"),
+    );
+    assert_eq!(
+        authenticator.handle_cbor(&credential_management_request(
+            &token,
+            7,
+            Some(params),
+            true,
+        ))[0],
+        0x00
+    );
+    assert_eq!(authenticator.credentials[0].user_handle, vec![5, 6, 7, 8]);
+    assert_eq!(authenticator.credentials[0].user_name, None);
+    assert_eq!(authenticator.credentials[0].user_display_name, None);
 }
 
 #[test]
@@ -925,17 +940,12 @@ fn allow_list_non_matching_rejects_credential() {
 
 #[test]
 fn credential_descriptor_requires_public_key_type_and_matching_id() {
-    let wrong_type = Value::Map(vec![
-        (
-            Value::Text("type".to_owned()),
-            Value::Text("not-public-key".to_owned()),
-        ),
-        (Value::Text("id".to_owned()), Value::Bytes(vec![1, 2, 3, 4])),
-    ]);
-    let malformed = Value::Map(vec![(
-        Value::Text("type".to_owned()),
-        Value::Text("public-key".to_owned()),
-    )]);
+    let wrong_type = cbor!({
+        "type" => "not-public-key",
+        "id" => bytes([1, 2, 3, 4]),
+    })
+    .expect("wrong-type descriptor");
+    let malformed = cbor!({ "type" => "public-key" }).expect("malformed descriptor");
 
     assert!(!credential_descriptor_list_contains(
         &[wrong_type, malformed],
@@ -949,17 +959,8 @@ fn credential_descriptor_requires_public_key_type_and_matching_id() {
 
 #[test]
 fn make_credential_validates_every_algorithm_entry() {
-    let valid = Value::Map(vec![
-        (
-            Value::Text("type".to_owned()),
-            Value::Text("public-key".to_owned()),
-        ),
-        (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
-    ]);
-    let malformed = Value::Map(vec![(
-        Value::Text("type".to_owned()),
-        Value::Text("public-key".to_owned()),
-    )]);
+    let valid = cbor!({ "type" => "public-key", "alg" => -7 }).expect("valid algorithm entry");
+    let malformed = cbor!({ "type" => "public-key" }).expect("malformed algorithm entry");
     assert_eq!(
         validate_pub_key_cred_params(&[valid.clone(), malformed]),
         Err(ErrorStatus::InvalidCbor)
@@ -969,13 +970,9 @@ fn make_credential_validates_every_algorithm_entry() {
         Err(ErrorStatus::InvalidCbor)
     );
     assert_eq!(
-        validate_pub_key_cred_params(&[Value::Map(vec![
-            (
-                Value::Text("type".to_owned()),
-                Value::Text("public-key".to_owned()),
-            ),
-            (Value::Text("alg".to_owned()), Value::Integer((-257).into())),
-        ])]),
+        validate_pub_key_cred_params(&[
+            cbor!({ "type" => "public-key", "alg" => -257 }).expect("unsupported algorithm entry"),
+        ]),
         Err(ErrorStatus::UnsupportedAlgorithm)
     );
 }
@@ -988,14 +985,12 @@ fn zero_length_pin_uv_auth_uses_selection_statuses() {
     let request = || {
         ctap_request(
             Ctap2Command::GetAssertion,
-            Value::Map(vec![
-                (
-                    Value::Integer(1.into()),
-                    Value::Text("example.com".to_owned()),
-                ),
-                (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-                (Value::Integer(6.into()), Value::Bytes(Vec::new())),
-            ]),
+            cbor!({
+                1 => "example.com",
+                2 => bytes([0xaa; 32]),
+                6 => bytes([]),
+            })
+            .expect("zero-length PIN/UV-auth request"),
         )
     };
     assert_eq!(
@@ -1056,11 +1051,11 @@ fn make_credential_options_accept_absent_up_true_and_rk() {
 fn attestation_format_preferences_require_strings() {
     assert_eq!(validate_attestation_formats(None), Ok(()));
     assert_eq!(
-        validate_attestation_formats(Some(&[Value::Text("none".to_owned())])),
+        validate_attestation_formats(Some(&[cbor!("none").expect("format")])),
         Ok(())
     );
     assert_eq!(
-        validate_attestation_formats(Some(&[Value::Integer(1.into())])),
+        validate_attestation_formats(Some(&[cbor!(1).expect("invalid format")])),
         Err(ErrorStatus::InvalidCbor)
     );
 }
@@ -1127,17 +1122,12 @@ fn get_assertion_respects_the_requested_user_presence_flag() {
             authenticator_with_credential("example.com", vec![u8::from(requested)]);
         let response = authenticator.handle_cbor(&ctap_request(
             Ctap2Command::GetAssertion,
-            Value::Map(vec![
-                (
-                    Value::Integer(1.into()),
-                    Value::Text("example.com".to_owned()),
-                ),
-                (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-                (
-                    Value::Integer(5.into()),
-                    Value::Map(options_map(&[("up", requested)])),
-                ),
-            ]),
+            cbor!({
+                1 => "example.com",
+                2 => bytes([0xaa; 32]),
+                5 => { "up" => requested },
+            })
+            .expect("assertion request"),
         ));
         assert_eq!(response[0], 0x00);
         let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
@@ -1162,20 +1152,14 @@ fn multiple_matching_credentials_include_number_of_credentials_and_support_next_
 
     let response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-        ]),
+        cbor!({ 1 => "example.com", 2 => bytes([0xaa; 32]) }).expect("assertion request"),
     ));
 
     assert_eq!(response[0], 0x00);
     let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR") else {
         panic!("expected assertion map");
     };
-    assert_eq!(map_value(&map, 5), Some(&Value::Integer(2.into())));
+    assert_eq!(map_integer(&map, 5), Some(2));
 
     let next = authenticator.handle_cbor(&[Ctap2Command::GetNextAssertion.into()]);
     assert_eq!(next[0], 0x00);
@@ -1211,24 +1195,13 @@ fn allow_list_omits_user_count_and_next_assertion_state() {
     );
     let response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-            (
-                Value::Integer(3.into()),
-                Value::Array(vec![
-                    credential_descriptor(vec![1]),
-                    credential_descriptor(vec![2]),
-                ]),
-            ),
-            (
-                Value::Integer(5.into()),
-                Value::Map(options_map(&[("up", false)])),
-            ),
-        ]),
+        cbor!({
+            1 => "example.com",
+            2 => bytes([0xaa; 32]),
+            3 => [credential_descriptor(vec![1]), credential_descriptor(vec![2])],
+            5 => { "up" => false },
+        })
+        .expect("allow-list assertion request"),
     ));
     assert_eq!(response[0], 0x00);
     let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
@@ -1256,13 +1229,7 @@ fn absent_allow_list_excludes_non_discoverable_credentials() {
 
     let response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-        ]),
+        cbor!({ 1 => "example.com", 2 => bytes([0xaa; 32]) }).expect("assertion request"),
     ));
     let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR") else {
         panic!("expected assertion map");
@@ -1282,54 +1249,26 @@ fn malformed_allow_list_and_exclude_list_are_rejected() {
 
     let make_credential = ctap_request(
         Ctap2Command::MakeCredential,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Bytes(vec![0xaa; 32])),
-            (
-                Value::Integer(2.into()),
-                Value::Map(vec![(
-                    Value::Text("id".to_owned()),
-                    Value::Text("example.com".to_owned()),
-                )]),
-            ),
-            (
-                Value::Integer(3.into()),
-                Value::Map(vec![(Value::Text("id".to_owned()), Value::Bytes(vec![1]))]),
-            ),
-            (
-                Value::Integer(4.into()),
-                Value::Array(vec![Value::Map(vec![
-                    (
-                        Value::Text("type".to_owned()),
-                        Value::Text("public-key".to_owned()),
-                    ),
-                    (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
-                ])]),
-            ),
-            (
-                Value::Integer(5.into()),
-                Value::Array(vec![Value::Text("not-a-descriptor".to_owned())]),
-            ),
-            (
-                Value::Integer(7.into()),
-                Value::Map(vec![(Value::Text("up".to_owned()), Value::Bool(true))]),
-            ),
-        ]),
+        cbor!({
+            1 => bytes([0xaa; 32]),
+            2 => { "id" => "example.com" },
+            3 => { "id" => bytes([1]) },
+            4 => [{ "type" => "public-key", "alg" => -7 }],
+            5 => ["not-a-descriptor"],
+            7 => { "up" => true },
+        })
+        .expect("malformed exclude-list request"),
     );
     assert_eq!(authenticator.handle_cbor(&make_credential)[0], 0x12);
 
     let get_assertion = ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-            (
-                Value::Integer(3.into()),
-                Value::Array(vec![Value::Text("bad-entry".to_owned())]),
-            ),
-        ]),
+        cbor!({
+            1 => "example.com",
+            2 => bytes([0xaa; 32]),
+            3 => ["bad-entry"],
+        })
+        .expect("malformed allow-list request"),
     );
     assert_eq!(authenticator.handle_cbor(&get_assertion)[0], 0x12);
 }
@@ -1340,14 +1279,12 @@ fn empty_allow_list_is_invalid() {
 
     let response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-            (Value::Integer(3.into()), Value::Array(Vec::new())),
-        ]),
+        cbor!({
+            1 => "example.com",
+            2 => bytes([0xaa; 32]),
+            3 => [],
+        })
+        .expect("empty allow-list request"),
     ));
 
     assert_eq!(response, vec![u8::from(ErrorStatus::InvalidParameter)]);
@@ -1359,42 +1296,19 @@ fn client_data_hash_must_be_32_bytes() {
 
     let make_credential = ctap_request(
         Ctap2Command::MakeCredential,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Bytes(vec![0xaa; 31])),
-            (
-                Value::Integer(2.into()),
-                Value::Map(vec![(
-                    Value::Text("id".to_owned()),
-                    Value::Text("example.com".to_owned()),
-                )]),
-            ),
-            (
-                Value::Integer(3.into()),
-                Value::Map(vec![(Value::Text("id".to_owned()), Value::Bytes(vec![1]))]),
-            ),
-            (
-                Value::Integer(4.into()),
-                Value::Array(vec![Value::Map(vec![
-                    (
-                        Value::Text("type".to_owned()),
-                        Value::Text("public-key".to_owned()),
-                    ),
-                    (Value::Text("alg".to_owned()), Value::Integer((-7).into())),
-                ])]),
-            ),
-        ]),
+        cbor!({
+            1 => bytes([0xaa; 31]),
+            2 => { "id" => "example.com" },
+            3 => { "id" => bytes([1]) },
+            4 => [{ "type" => "public-key", "alg" => -7 }],
+        })
+        .expect("short make-credential hash request"),
     );
     assert_eq!(authenticator.handle_cbor(&make_credential)[0], 0x12);
 
     let get_assertion = ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 33])),
-        ]),
+        cbor!({ 1 => "example.com", 2 => bytes([0xaa; 33]) }).expect("long assertion hash request"),
     );
     assert_eq!(authenticator.handle_cbor(&get_assertion)[0], 0x12);
 }
@@ -1429,13 +1343,7 @@ fn unsupported_policy_version_rejects_assertion() {
 
     let get_assertion = ctap_request(
         Ctap2Command::GetAssertion,
-        Value::Map(vec![
-            (
-                Value::Integer(1.into()),
-                Value::Text("example.com".to_owned()),
-            ),
-            (Value::Integer(2.into()), Value::Bytes(vec![0xaa; 32])),
-        ]),
+        cbor!({ 1 => "example.com", 2 => bytes([0xaa; 32]) }).expect("assertion request"),
     );
     let response = authenticator.handle_cbor(&get_assertion);
     assert_eq!(response[0], 0x27);
@@ -1575,23 +1483,33 @@ fn test_store_dir(name: &str) -> PathBuf {
     ))
 }
 
+fn bytes(data: impl AsRef<[u8]>) -> Value {
+    Value::Bytes(data.as_ref().to_vec())
+}
+
+fn map(entries: Vec<(Value, Value)>) -> Value {
+    Value::Map(entries)
+}
+
+fn cbor_map(value: Value) -> Vec<(Value, Value)> {
+    let Value::Map(map) = value else {
+        panic!("expected CBOR map");
+    };
+    map
+}
+
 fn credential_descriptor(id: Vec<u8>) -> Value {
-    Value::Map(vec![
-        (
-            Value::Text("type".to_owned()),
-            Value::Text("public-key".to_owned()),
-        ),
-        (Value::Text("id".to_owned()), Value::Bytes(id)),
-    ])
+    cbor!({
+        "type" => "public-key",
+        "id" => bytes(id),
+    })
+    .expect("credential descriptor")
 }
 
 fn client_pin_key_agreement(authenticator: &mut Authenticator) -> Vec<(Value, Value)> {
     let response = authenticator.handle_cbor(&ctap_request(
         Ctap2Command::ClientPin,
-        Value::Map(vec![
-            (Value::Integer(1.into()), Value::Integer(2.into())),
-            (Value::Integer(2.into()), Value::Integer(2.into())),
-        ]),
+        cbor!({ 1 => 2, 2 => 2 }).expect("key-agreement request"),
     ));
     let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
     else {
@@ -1614,6 +1532,70 @@ fn pin_auth_param(key: &[u8; 32], message: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+fn install_credential_management_token(
+    authenticator: &mut Authenticator,
+    rp_id: Option<&str>,
+) -> Vec<u8> {
+    let token = vec![0x33; 32];
+    authenticator.client_pin = Some(ClientPinState {
+        pin_salt: vec![0; 32],
+        pin_verifier: vec![0; 32],
+        retries: PIN_RETRIES,
+    });
+    authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        value: token.clone(),
+        permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
+        rp_id: rp_id.map(str::to_owned),
+        session_uid: authenticator.session.uid,
+        session_id: authenticator.session.session_id.clone(),
+        issued_at: Instant::now(),
+        first_used_at: None,
+        user_present_until: None,
+    });
+    token
+}
+
+fn credential_management_request(
+    token: &[u8],
+    sub_command: i128,
+    params: Option<Vec<(Value, Value)>>,
+    authenticated: bool,
+) -> Vec<u8> {
+    let auth_param = management_pin_auth(token, sub_command, params.as_deref());
+    let request = match (params, authenticated) {
+        (Some(params), true) => cbor!({
+            1 => sub_command as i64,
+            2 => map(params),
+            3 => 2,
+            4 => bytes(auth_param),
+        }),
+        (Some(params), false) => cbor!({
+            1 => sub_command as i64,
+            2 => map(params),
+        }),
+        (None, true) => cbor!({
+            1 => sub_command as i64,
+            3 => 2,
+            4 => bytes(auth_param),
+        }),
+        (None, false) => cbor!({ 1 => sub_command as i64 }),
+    }
+    .expect("credential-management request");
+    ctap_request(Ctap2Command::CredentialManagement, request)
+}
+
+fn response_map(response: &[u8]) -> Vec<(Value, Value)> {
+    assert_eq!(
+        response.first(),
+        Some(&0x00),
+        "unexpected response: {response:?}"
+    );
+    let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR") else {
+        panic!("expected response map");
+    };
+    map
+}
+
 fn management_pin_auth(
     key: &[u8],
     sub_command: i128,
@@ -1628,7 +1610,12 @@ fn management_pin_auth(
 fn options_map(options: &[(&str, bool)]) -> Vec<(Value, Value)> {
     options
         .iter()
-        .map(|(key, value)| (Value::Text((*key).to_owned()), Value::Bool(*value)))
+        .map(|(key, value)| {
+            (
+                cbor!(*key).expect("option name"),
+                cbor!(*value).expect("option value"),
+            )
+        })
         .collect()
 }
 
@@ -1637,8 +1624,8 @@ fn options_text_map(options: &[(&str, &str)]) -> Vec<(Value, Value)> {
         .iter()
         .map(|(key, value)| {
             (
-                Value::Text((*key).to_owned()),
-                Value::Text((*value).to_owned()),
+                cbor!(*key).expect("option name"),
+                cbor!(*value).expect("option value"),
             )
         })
         .collect()

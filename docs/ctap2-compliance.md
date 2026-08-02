@@ -209,11 +209,55 @@ enrollment are omitted. Lists are non-empty and contain no duplicates.
 
 Audit status: **complete**.
 
+## `authenticatorCredentialManagement` (`0x0a`)
+
+Normative section: 6.8.
+
+Request keys are `subCommand=0x01` (required unsigned integer),
+`subCommandParams=0x02` (subcommand-specific map), `pinUvAuthProtocol=0x03`
+(unsigned integer), and `pinUvAuthParam=0x04` (byte string). Subcommands and
+parameter requirements are:
+
+| Value | Subcommand | Parameters | Authentication |
+| --- | --- | --- | --- |
+| `0x01` | `getCredsMetadata` | none | `cm`, no permissions RP ID |
+| `0x02` | `enumerateRPsBegin` | none | `cm`, no permissions RP ID |
+| `0x03` | `enumerateRPsGetNextRP` | none | continuation state |
+| `0x04` | `enumerateCredentialsBegin` | `rpIDHash=0x01`, 32-byte string | `cm`, no permissions RP ID |
+| `0x05` | `enumerateCredentialsGetNextCredential` | none | continuation state |
+| `0x06` | `deleteCredential` | `credentialID=0x02`, descriptor | `cm`, unscoped or matching RP ID |
+| `0x07` | `updateUserInformation` | descriptor plus `user=0x03` | `cm`, unscoped or matching RP ID |
+
+Authenticated requests compute `authenticate(pinUvAuthToken, subCommand ||
+canonical-CBOR(subCommandParams))`. A missing authentication parameter is
+`CTAP2_ERR_PUAT_REQUIRED`; an unknown subcommand is
+`CTAP2_ERR_INVALID_SUBCOMMAND`.
+
+Response keys are metadata count `0x01`, remaining count `0x02`, RP `0x03`, RP
+ID hash `0x04`, total RPs `0x05`, user `0x06`, credential descriptor `0x07`,
+public key `0x08`, and total credentials `0x09`. Optional implemented-feature
+fields begin at `0x0a`. Totals occur only in the corresponding begin response.
+
+RP and credential continuation requests do not repeat token authentication.
+Their state is bound to the initiating token and login-session UID/session ID,
+expires after 30 seconds without a matching continuation, and is interrupted by
+any other operation. Missing, mismatched, expired, interrupted, or exhausted
+state returns `CTAP2_ERR_NOT_ALLOWED`; each successful continuation resets the
+30-second interval.
+
+Updating user information requires the supplied user ID to equal the stored user
+ID. It changes only `name` and `displayName`; absent or empty names remove those
+fields. Deletion and update validate a public-key credential descriptor and
+return `CTAP2_ERR_NO_CREDENTIALS` when no matching discoverable credential
+exists.
+
+Audit status: **complete for implemented credential-management fields**.
+
 ## Remaining Audit Order
 
 1. Complete ClientPIN inputs, errors, permissions, and retry state.
 2. Complete makeCredential and getAssertion request/response tables.
 3. Audit getInfo capability claims against implemented behavior.
-4. Audit credential management and stateful continuation commands.
+4. Complete credential management and stateful continuation commands.
 5. Audit reset, selection, and unsupported command behavior.
 6. Audit CTAPHID framing, channels, cancellation, keepalive, and errors.
