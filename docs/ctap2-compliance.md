@@ -105,34 +105,81 @@ commands are tracked by the makeCredential/getAssertion audits.
 
 Normative section: 6.1.
 
-Request keys currently relevant to this implementation:
+Request keys:
 
-| Key | Name | Type |
-| --- | --- | --- |
-| `0x01` | `clientDataHash` | 32-byte string |
-| `0x02` | `rp` | map |
-| `0x03` | `user` | map |
-| `0x04` | `pubKeyCredParams` | array |
-| `0x05` | `excludeList` | array |
-| `0x06` | `extensions` | map |
-| `0x07` | `options` | map |
-| `0x08` | `pinUvAuthParam` | byte string |
-| `0x09` | `pinUvAuthProtocol` | unsigned integer |
+| Key | Name | Type | Required |
+| --- | --- | --- | --- |
+| `0x01` | `clientDataHash` | 32-byte string | yes |
+| `0x02` | `rp` | map | yes |
+| `0x03` | `user` | map | yes |
+| `0x04` | `pubKeyCredParams` | array | yes |
+| `0x05` | `excludeList` | non-empty array | no |
+| `0x06` | `extensions` | map | no |
+| `0x07` | `options` | map | no |
+| `0x08` | `pinUvAuthParam` | byte string | no |
+| `0x09` | `pinUvAuthProtocol` | unsigned integer | with auth parameter |
+| `0x0a` | `enterpriseAttestation` | unsigned integer | no |
+| `0x0b` | `attestationFormatsPreference` | array of strings | no |
 
-For PIN/UV authentication, verify
-`authenticate(pinUvAuthToken, clientDataHash)`. The RP ID is not appended to the
-HMAC input. Separately require the `mc` permission and enforce or associate the
-token's permissions RP ID.
+Response keys are `fmt=0x01` (required string), `authData=0x02` (required byte
+string), `attStmt=0x03` (optional map), `epAtt=0x04` (optional boolean),
+`largeBlobKey=0x05` (optional byte string), and
+`unsignedExtensionOutputs=0x06` (optional map).
 
-Audit status: **PIN/UV input checked; full command pending**.
+Normative behavior retained here:
+
+- Validate every `pubKeyCredParams` entry even after selecting a supported
+  algorithm; reject malformed and duplicate entries.
+- `excludeList`, when present, is non-empty. Do not reveal a matching credential
+  until user presence has been collected.
+- CTAP options are `rk`, `up`, and `uv`, all booleans. `up=false` is
+  `CTAP2_ERR_INVALID_OPTION`; unknown keys are ignored. WebAuthn fields such as
+  `residentKey` are not CTAP options.
+- A discoverable (`rk=true`) credential requires UV when this authenticator is
+  protected by built-in UV or a PIN. Creating another discoverable credential
+  for the same RP ID and user ID overwrites the old credential.
+- Verify `authenticate(pinUvAuthToken, clientDataHash)`. The RP ID is not
+  appended to the HMAC input. Separately require `mc` permission and enforce or
+  associate the token's permissions RP ID.
+- A zero-length `pinUvAuthParam` performs authenticator selection and then
+  returns `PIN_NOT_SET` or `PIN_INVALID`.
+- User presence consumes cached UP, UV, and all token permissions except `lbw`.
+
+Audit status: **complete for implemented algorithms and extensions**.
 
 ## `authenticatorGetAssertion` (`0x02`)
 
-Normative section: 6.2. PIN/UV authentication likewise verifies
-`authenticate(pinUvAuthToken, clientDataHash)`, then independently checks the
-`ga` permission and RP-ID scope.
+Normative sections: 6.2 and 6.3.
 
-Audit status: **PIN/UV input checked; full command pending**.
+| Request key | Name | Type | Required |
+| --- | --- | --- | --- |
+| `0x01` | `rpId` | string | yes |
+| `0x02` | `clientDataHash` | 32-byte string | yes |
+| `0x03` | `allowList` | non-empty array | no |
+| `0x04` | `extensions` | map | no |
+| `0x05` | `options` | map | no |
+| `0x06` | `pinUvAuthParam` | byte string | no |
+| `0x07` | `pinUvAuthProtocol` | unsigned integer | with auth parameter |
+
+Response keys are `credential=0x01`, `authData=0x02`, `signature=0x03`, optional
+`user=0x04`, optional `numberOfCredentials=0x05`, optional `userSelected=0x06`,
+optional `largeBlobKey=0x07`, and optional `unsignedExtensionOutputs=0x08`.
+
+- Verify the PIN/UV parameter over `clientDataHash`, require `ga`, and enforce or
+  associate RP-ID scope separately.
+- `up` defaults to true and may be false for silent/pre-flight assertions. `uv`
+  defaults to false. An `rk` option is `CTAP2_ERR_UNSUPPORTED_OPTION`.
+- With an allow list, select one matching credential, omit user/count when not
+  needed, and do not initialize GetNextAssertion state.
+- Without an allow list, consider discoverable credentials only, newest first.
+  Return user ID, omit identifying names without UV, and return
+  `numberOfCredentials` when more than one credential matches.
+- GetNextAssertion has no input, omits the count, resets its 30-second timer per
+  response, and returns `CTAP2_ERR_NOT_ALLOWED` for absent, exhausted, or expired
+  state.
+- User presence consumes cached UP, UV, and all token permissions except `lbw`.
+
+Audit status: **complete for implemented algorithms and extensions**.
 
 ## Remaining Audit Order
 

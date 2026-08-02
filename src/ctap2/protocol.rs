@@ -66,6 +66,7 @@ pub(super) enum ErrorStatus {
     CredentialExcluded = 0x19,
     UnsupportedAlgorithm = 0x26,
     OperationDenied = 0x27,
+    KeyStoreFull = 0x28,
     UnsupportedOption = 0x2b,
     InvalidOption = 0x2c,
     NoCredentials = 0x2e,

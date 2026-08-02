@@ -319,6 +319,7 @@ impl Authenticator {
         validate_client_data_hash(client_data_hash)?;
         let rp = map_map(&request, 2).ok_or(ErrorStatus::MissingParameter)?;
         let user = map_map(&request, 3).ok_or(ErrorStatus::MissingParameter)?;
+        validate_make_credential_entities(rp, user)?;
         let params = map_array(&request, 4).ok_or(ErrorStatus::MissingParameter)?;
         validate_pub_key_cred_params(params)?;
         let exclude_list = optional_array(&request, 5)?;
@@ -358,6 +359,26 @@ impl Authenticator {
             && options.is_some_and(|options| map_bool(options, "uv") == Some(true));
         let discoverable = options.and_then(|options| map_bool(options, "rk")) == Some(true);
         validate_credential_descriptor_list(exclude_list, true)?;
+        let replacement_index = discoverable
+            .then(|| {
+                self.credentials.iter().position(|credential| {
+                    credential.discoverable
+                        && credential.rp_id == rp_id
+                        && credential.user_handle == user_handle
+                })
+            })
+            .flatten();
+        if discoverable
+            && replacement_index.is_none()
+            && self
+                .credentials
+                .iter()
+                .filter(|credential| credential.discoverable)
+                .count()
+                >= MAX_RESIDENT_CREDENTIALS
+        {
+            return Err(ErrorStatus::KeyStoreFull);
+        }
         if discoverable && !user_verified && !uv_requested {
             return Err(if self.client_pin.is_some() {
                 ErrorStatus::PuatRequired
@@ -477,6 +498,9 @@ impl Authenticator {
             Some((&credential_id, &public_key)),
             extensions.as_ref(),
         );
+        if let Some(index) = replacement_index {
+            self.credentials.remove(index);
+        }
         self.credentials.push(Credential {
             id: credential_id,
             rp_id: rp_id.to_owned(),
@@ -1734,6 +1758,29 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
             == 0
 }
 
+fn validate_make_credential_entities(
+    rp: &[(Value, Value)],
+    user: &[(Value, Value)],
+) -> Result<(), ErrorStatus> {
+    if map_text(rp, "id").is_none() || map_bytes(user, "id").is_none() {
+        return Err(ErrorStatus::InvalidCbor);
+    }
+    for (map, key) in [
+        (rp, "name"),
+        (rp, "icon"),
+        (user, "name"),
+        (user, "displayName"),
+        (user, "icon"),
+    ] {
+        if let Some(value) = map_value(map, key)
+            && value.as_text().is_none()
+        {
+            return Err(ErrorStatus::InvalidCbor);
+        }
+    }
+    Ok(())
+}
+
 fn validate_pub_key_cred_params(params: &[Value]) -> Result<(), ErrorStatus> {
     let mut supported_algorithm = false;
     let mut seen = Vec::new();
@@ -1813,6 +1860,15 @@ fn validate_credential_descriptor_list(
         }
         if map_bytes(map, "id").is_none() {
             return Err(ErrorStatus::InvalidCbor);
+        }
+        if let Some(transports) = map_value(map, "transports") {
+            let transports = transports.as_array().ok_or(ErrorStatus::InvalidCbor)?;
+            if transports
+                .iter()
+                .any(|transport| transport.as_text().is_none())
+            {
+                return Err(ErrorStatus::InvalidCbor);
+            }
         }
     }
 
