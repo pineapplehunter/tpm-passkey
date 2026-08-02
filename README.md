@@ -27,6 +27,22 @@ Daemon:
 linux-tpm-fido2 daemon --store-dir .linux-tpm-fido2-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
 ```
 
+Management examples:
+
+```sh
+linux-tpm-fido2 list-credentials
+linux-tpm-fido2 config show
+linux-tpm-fido2 config set default-pcr-policy 1 7
+linux-tpm-fido2 config set recovery-passphrase
+```
+
+`list-credentials` prints tab-separated credential ID, RP ID, user name,
+registration time, last-use time, and bound PCR indices. `config show` reports
+the effective default PCR policy and whether recovery passphrase material is
+configured. Setting the recovery passphrase also updates each credential's
+recovery slot; the existing `update-passphrase` command remains as a compatible
+alias.
+
 Useful flags:
 
 - `--dry-run` on the daemon prints the resolved configuration without opening devices.

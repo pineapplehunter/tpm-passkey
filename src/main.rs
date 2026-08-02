@@ -33,8 +33,8 @@ enum Command {
     UpdatePcrReference,
     /// Update PCR policy with a new PCR selection
     UpdatePcrPolicy(PcrPolicyArgs),
-    /// Set the default PCR policy for newly created credentials
-    SetDefaultPcrPolicy(DefaultPcrPolicyArgs),
+    /// Show or change persistent daemon configuration
+    Config(ConfigArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -71,6 +71,34 @@ struct PcrPolicyArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Show effective persistent configuration
+    Show,
+    /// Set a persistent configuration value
+    Set(ConfigSetArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct ConfigSetArgs {
+    #[command(subcommand)]
+    setting: ConfigSetCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigSetCommand {
+    /// Set the default PCR policy for newly created credentials
+    DefaultPcrPolicy(DefaultPcrPolicyArgs),
+    /// Set or rotate the recovery passphrase and credential recovery slots
+    RecoveryPassphrase,
+}
+
+#[derive(Debug, clap::Args)]
 struct DefaultPcrPolicyArgs {
     /// PCR indices for the default policy (e.g. 1 7)
     pcr_indices: Vec<u32>,
@@ -88,7 +116,7 @@ fn main() -> Result<()> {
         Command::UpdatePassphrase => run_update_passphrase(),
         Command::UpdatePcrReference => run_update_pcr_reference(),
         Command::UpdatePcrPolicy(args) => run_update_pcr_policy(args),
-        Command::SetDefaultPcrPolicy(args) => run_set_default_pcr_policy(args),
+        Command::Config(args) => run_config(args),
     }
 }
 
@@ -263,7 +291,16 @@ fn run_list_credentials() -> Result<()> {
             let user_name = management::value_get(cred, "user_name")
                 .and_then(|v| v.as_text())
                 .unwrap_or("");
-            println!("{id}\t{rp_id}\t{user_name}");
+            let registered_at = management::value_get(cred, "registered_at")
+                .and_then(|v| v.as_text())
+                .unwrap_or("unknown");
+            let last_used_at = management::value_get(cred, "last_used_at")
+                .and_then(|v| v.as_text())
+                .unwrap_or("never");
+            let pcr_indices = management::value_get(cred, "pcr_indices")
+                .map(format_integer_array)
+                .unwrap_or_default();
+            println!("{id}\t{rp_id}\t{user_name}\t{registered_at}\t{last_used_at}\t{pcr_indices}");
         }
     }
     Ok(())
@@ -352,6 +389,37 @@ fn run_update_pcr_policy(args: PcrPolicyArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_config(args: ConfigArgs) -> Result<()> {
+    match args.command {
+        ConfigCommand::Show => run_config_show(),
+        ConfigCommand::Set(args) => match args.setting {
+            ConfigSetCommand::DefaultPcrPolicy(args) => run_set_default_pcr_policy(args),
+            ConfigSetCommand::RecoveryPassphrase => run_update_passphrase(),
+        },
+    }
+}
+
+fn run_config_show() -> Result<()> {
+    let response = management::send_request(&management::ManagementRequest::ShowConfig)?;
+    if !response.ok {
+        bail!("daemon error: {}", response.error.unwrap_or_default());
+    }
+    let result = response
+        .result
+        .as_ref()
+        .ok_or_else(|| eyre!("daemon returned no configuration"))?;
+    let default_pcr_policy = management::value_get(result, "default_pcr_policy")
+        .map(format_integer_array)
+        .unwrap_or_default();
+    let recovery_passphrase_configured =
+        management::value_get(result, "recovery_passphrase_configured")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+    println!("default_pcr_policy\t{default_pcr_policy}");
+    println!("recovery_passphrase_configured\t{recovery_passphrase_configured}");
+    Ok(())
+}
+
 fn run_set_default_pcr_policy(args: DefaultPcrPolicyArgs) -> Result<()> {
     tpm::pcr_selection_for_indices(&args.pcr_indices).wrap_err("invalid PCR selection")?;
     let pcr_indices = args.pcr_indices.clone();
@@ -362,6 +430,18 @@ fn run_set_default_pcr_policy(args: DefaultPcrPolicyArgs) -> Result<()> {
     }
     println!("default PCR policy set to {:?}", args.pcr_indices);
     Ok(())
+}
+
+fn format_integer_array(value: &ciborium::value::Value) -> String {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_integer())
+        .filter_map(|value| u64::try_from(value).ok())
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn prompt_password_confirm(prompt: &str) -> Result<String> {
@@ -385,6 +465,52 @@ fn normalize_host_report(data: &[u8]) -> Option<(&[u8], bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_command_uses_show_and_nested_set_hierarchy() {
+        let show =
+            Cli::try_parse_from(["linux-tpm-fido2", "config", "show"]).expect("parse config show");
+        assert!(matches!(
+            show.command,
+            Command::Config(ConfigArgs {
+                command: ConfigCommand::Show
+            })
+        ));
+
+        let set = Cli::try_parse_from([
+            "linux-tpm-fido2",
+            "config",
+            "set",
+            "default-pcr-policy",
+            "1",
+            "7",
+        ])
+        .expect("parse nested default PCR policy");
+        let Command::Config(ConfigArgs {
+            command:
+                ConfigCommand::Set(ConfigSetArgs {
+                    setting: ConfigSetCommand::DefaultPcrPolicy(args),
+                }),
+        }) = set.command
+        else {
+            panic!("unexpected config command");
+        };
+        assert_eq!(args.pcr_indices, vec![1, 7]);
+
+        let recovery =
+            Cli::try_parse_from(["linux-tpm-fido2", "config", "set", "recovery-passphrase"])
+                .expect("parse recovery passphrase setting");
+        assert!(matches!(
+            recovery.command,
+            Command::Config(ConfigArgs {
+                command: ConfigCommand::Set(ConfigSetArgs {
+                    setting: ConfigSetCommand::RecoveryPassphrase
+                })
+            })
+        ));
+
+        assert!(Cli::try_parse_from(["linux-tpm-fido2", "set-default-pcr-policy", "7"]).is_err());
+    }
 
     #[test]
     fn normalize_accepts_plain_report() {

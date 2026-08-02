@@ -1,4 +1,4 @@
-use std::{path::Path, sync::mpsc};
+use std::{collections::HashMap, path::Path, sync::mpsc};
 
 use ciborium::cbor;
 use zeroize::Zeroize;
@@ -42,36 +42,70 @@ fn handle_list_credentials(
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
     peer_uid: u32,
 ) -> ManagementResponse {
-    match store::load_ctap2_credentials_from_dir(store_dir, filter_uid(peer_uid)) {
-        Ok(credentials) => {
-            let creds: Vec<ciborium::value::Value> = credentials
-                .iter()
-                .map(|c| {
-                    let pcr_stale = c
-                        .policy
-                        .as_ref()
-                        .and_then(|p| check_pcr_stale(tpm_cmd_tx, p));
-                    cbor!({
-                        "id" => hex::encode(&c.id),
-                        "rp_id" => c.rp_id.as_str(),
-                        "user_name" => c.user_name.as_deref().unwrap_or(""),
-                        "discoverable" => c.discoverable,
-                        "pcr_stale" => pcr_stale,
-                    })
-                    .unwrap()
-                })
-                .collect();
-            ManagementResponse {
-                ok: true,
-                error: None,
-                result: Some(cbor!({ "credentials" => creds }).unwrap()),
-            }
+    let user_id = filter_uid(peer_uid);
+    let credentials = match store::load_ctap2_credentials_from_dir(store_dir, user_id) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            return ManagementResponse {
+                ok: false,
+                error: Some(format!("{error}")),
+                result: None,
+            };
         }
-        Err(e) => ManagementResponse {
-            ok: false,
-            error: Some(format!("{e}")),
-            result: None,
-        },
+    };
+    let summaries = match store::load_credential_summaries_from_dir(store_dir, user_id) {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            return ManagementResponse {
+                ok: false,
+                error: Some(format!("{error}")),
+                result: None,
+            };
+        }
+    };
+    let summaries: HashMap<_, _> = summaries
+        .into_iter()
+        .map(|summary| (summary.id.clone(), summary))
+        .collect();
+    let mut creds = Vec::with_capacity(credentials.len());
+    for credential in &credentials {
+        let Some(summary) = summaries.get(&credential.id) else {
+            return ManagementResponse {
+                ok: false,
+                error: Some(format!(
+                    "credential {} is missing listing metadata",
+                    hex::encode(&credential.id)
+                )),
+                result: None,
+            };
+        };
+        let pcr_stale = credential
+            .policy
+            .as_ref()
+            .and_then(|policy| check_pcr_stale(tpm_cmd_tx, policy));
+        let pcr_indices = summary
+            .policy_selection
+            .as_deref()
+            .and_then(|selection| tpm::pcr_indices_from_selection(selection).ok())
+            .unwrap_or_default();
+        creds.push(
+            cbor!({
+                "id" => hex::encode(&credential.id),
+                "rp_id" => credential.rp_id.as_str(),
+                "user_name" => credential.user_name.as_deref().unwrap_or(""),
+                "discoverable" => credential.discoverable,
+                "registered_at" => summary.registered_at.as_str(),
+                "last_used_at" => summary.last_used_at.as_deref(),
+                "pcr_indices" => pcr_indices,
+                "pcr_stale" => pcr_stale,
+            })
+            .unwrap(),
+        );
+    }
+    ManagementResponse {
+        ok: true,
+        error: None,
+        result: Some(cbor!({ "credentials" => creds }).unwrap()),
     }
 }
 fn handle_update_passphrase(
@@ -710,6 +744,41 @@ fn handle_set_default_pcr_policy(store_dir: &Path, pcr_indices: &[u32]) -> Manag
     }
 }
 
+fn handle_show_config(store_dir: &Path) -> ManagementResponse {
+    let default_pcr_policy = match store::load_default_pcr_policy(store_dir) {
+        Ok(policy) => policy.unwrap_or_else(|| vec![7]),
+        Err(error) => {
+            return ManagementResponse {
+                ok: false,
+                error: Some(format!("failed to load default PCR policy: {error}")),
+                result: None,
+            };
+        }
+    };
+    let recovery_passphrase_configured = match store::load_daemon_passphrase_from_dir(store_dir) {
+        Ok(passphrase) => passphrase.is_some(),
+        Err(error) => {
+            return ManagementResponse {
+                ok: false,
+                error: Some(format!("failed to load recovery passphrase state: {error}")),
+                result: None,
+            };
+        }
+    };
+
+    ManagementResponse {
+        ok: true,
+        error: None,
+        result: Some(
+            cbor!({
+                "default_pcr_policy" => default_pcr_policy,
+                "recovery_passphrase_configured" => recovery_passphrase_configured,
+            })
+            .unwrap(),
+        ),
+    }
+}
+
 pub(super) fn dispatch(
     store_dir: &Path,
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
@@ -748,5 +817,6 @@ pub(super) fn dispatch(
         ManagementRequest::SetDefaultPcrPolicy { pcr_indices } => {
             handle_set_default_pcr_policy(store_dir, pcr_indices)
         }
+        ManagementRequest::ShowConfig => handle_show_config(store_dir),
     }
 }

@@ -97,10 +97,18 @@
           print("list-credentials (empty):", output)
           assert output.strip() == "", f"Expected empty listing, got: {output}"
 
-          # -- set-default-pcr-policy --
-          output = mgmt("set-default-pcr-policy 1 7")
-          print("set-default-pcr-policy:", output)
+          # -- config show/set --
+          output = mgmt("config show")
+          print("config show (defaults):", output)
+          assert "default_pcr_policy\t7" in output, f"Unexpected output: {output}"
+          assert "recovery_passphrase_configured\tfalse" in output, f"Unexpected output: {output}"
+
+          output = mgmt("config set default-pcr-policy 1 7")
+          print("config set default-pcr-policy:", output)
           assert "default PCR policy set to [1, 7]" in output, f"Unexpected output: {output}"
+
+          output = mgmt("config show")
+          assert "default_pcr_policy\t1,7" in output, f"Unexpected output: {output}"
 
           # -- Set daemon passphrase (first-time: empty old passphrase) --
           mgmt_expect(
@@ -167,6 +175,11 @@
           assert output.count("compliance.example.test") == 2, (
               f"Expected two discoverable compliance credentials, got: {output}"
           )
+          rows = [line.split("\t") for line in output.strip().splitlines()]
+          assert all(len(row) == 6 for row in rows), f"Expected six listing columns: {output}"
+          assert all(row[3] != "unknown" for row in rows), f"Missing registration date: {output}"
+          assert all(row[4] != "never" for row in rows), f"Missing last-used date: {output}"
+          assert all(row[5] == "1,7" for row in rows), f"Missing bound PCR indices: {output}"
 
           # -- PCR update via update-pcr-reference (expect for passphrase) --
           machine.succeed("tpm2_pcrextend 7:sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")

@@ -36,6 +36,14 @@
 - [x] Exercise token-authenticated makeCredential through the CTAP handler and VM.
 - [x] Run Rust and NixOS validation.
 
+## Credential listing and configuration CLI
+
+- [x] Store and report credential registration and last-use timestamps.
+- [x] Show bound PCR indices in `list-credentials`.
+- [x] Move default PCR policy setting to `config set default-pcr-policy`.
+- [x] Add `config show` for current persistent configuration.
+- [ ] Update tests and documentation, then run Rust and NixOS validation.
+
 ## CTAP 2.2 systematic audit
 
 - [x] Create and maintain `docs/ctap2-compliance.md` from the normative specification.
