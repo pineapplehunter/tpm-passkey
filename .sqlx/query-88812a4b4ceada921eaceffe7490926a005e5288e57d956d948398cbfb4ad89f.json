@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE credential_keyslots SET policy_selection = ?1, policy_digest = ?2, policy_ref = ?3, authority_name = ?4, authority_signature = ?5, updated_at = CURRENT_TIMESTAMP WHERE credential_id = ?6 AND slot_kind = 'primary'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "88812a4b4ceada921eaceffe7490926a005e5288e57d956d948398cbfb4ad89f"
+}

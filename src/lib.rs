@@ -5,6 +5,7 @@ pub mod ctaphid;
 pub mod hid;
 pub mod management;
 pub mod polkit;
+pub mod recovery;
 pub mod store;
 mod systemd_logind;
 pub mod tpm;

@@ -1,181 +1,137 @@
-# Credential Storage
+# Credential Storage and Recovery
 
-This document describes the current credential storage model and the intended future direction.
+## Scope and compatibility
 
-## Current Implementation
+This experimental authenticator stores TPM-generated P-256 WebAuthn passkeys.
+There is no U2F or software passkey-signing fallback. One daemon and SQLite
+store serve a single-user machine, with no caller-UID filtering.
 
-### Scope
+Every commit/release may invalidate existing credentials. All schema changes
+are recorded in new `migrations/` files; existing migrations must not be edited.
+A migration may deliberately discard credentials. Migration `20261028060000`
+deletes the old credentials and plaintext-equivalent recovery configuration.
+Migration `20261028070000` removes the legacy owner column/indexes and discards
+records using the old owner-dependent metadata MAC. The user must register
+replacement passkeys with their relying parties.
+Deleting local records does not revoke old website registrations; remove those
+registrations if old recovery material may have been exposed.
 
-The current implementation stores only CTAP2/WebAuthn credentials backed by TPM-created P-256 ECDSA keys.
+## Files and schema
 
-U2F/CTAP1 support has been removed.
+The default store is `.linux-tpm-fido2-store/`, overridden by `daemon --store-dir`.
+The NixOS service uses `/var/lib/linux-tpm-fido2`. The directory contains:
 
-Software credential support has been removed.
+- `credentials.sqlite`: metadata, TPM object blobs, policies, encrypted recovery
+  authorization values, Client PIN state, and daemon configuration.
+- `integrity.hmac-key`: the current development metadata-MAC key. This is not
+  the recovery encryption key and cannot decrypt recovery authorization values.
 
-### Store Location
+The schema is defined by the complete migration history. Current tables are:
 
-Credentials are stored in a project-local directory by default:
+- `credential_metadata`: credential/RP/user information and signature counters.
+- `credential_keyslots`: primary and recovery TPM blobs, public keys, and primary
+  PCR-policy authorization packages.
+- `credential_tokens`: an `encrypted_auth` CBOR envelope for each recovery slot,
+  plus nullable `last_used` and nonnegative `used_count` (default zero).
+- `client_pin_state`: PIN verifier and retry state.
+- `daemon_config`: default PCR selection and an encrypted recovery unlock check.
 
-```text
-.linux-tpm-fido2-store/
-```
+No local owner UID is stored in credential metadata. All credentials belong to
+the single shared namespace. WebAuthn user handles are still required and are
+not local user IDs.
 
-The store directory can be overridden at runtime:
+Stored TPM key blobs contain only the TPM private/public representations. Their
+Rust storage type has no authorization-value field. A TPM private blob is
+protected under a storage parent on the original TPM, not a raw private scalar.
+The daemon recreates a transient owner-hierarchy parent as needed and loads and
+flushes credential objects for signing.
+
+## Recovery policy
+
+For each recovery-enabled credential:
+
+1. The TPM creates a separate recovery authority with a random 32-byte auth value.
+2. The authority approves a PCR policy using a credential-specific `policyRef`.
+3. The primary key's fixed policy trusts that authority through `PolicyAuthorize`
+   and restricts use to `TPM2_Sign`.
+4. The daemon password-encrypts the authority's auth value before persistence.
+
+Normal assertions verify the existing signed approval against the current PCR
+state. They do not decrypt the auth value or require the recovery phrase.
+
+After a boot-state change, the management command decrypts the auth value using
+its supplied phrase. The original TPM uses the recovery authority to approve
+its current measurements. The passkey and its public key do not change. This
+recovers from PCR changes, not a lost/replaced/cleared TPM or lost object blobs.
+The user is responsible for deciding whether the new boot state is trustworthy.
+
+## Password encryption
+
+Format version 1 uses:
+
+- Argon2id v1.3, 64 MiB memory, three passes, one lane, 32-byte output.
+- A random 32-byte salt per encryption configuration.
+- AES-256-GCM with a fresh random 12-byte nonce per encrypted value and its
+  authentication tag appended to the ciphertext.
+- Associated data binding each authorization value to its credential ID,
+  recovery key's TPM public blob, and credential-specific `policyRef`.
+
+The envelope records its version, KDF parameters, salt, nonce, and ciphertext.
+Version 1 accepts only its defined KDF parameters, bounding work for untrusted
+stored input. Swapping slots or changing authenticated data fails decryption.
+
+The daemon configuration contains an encrypted known check value in a separate
+AAD domain. It does not contain the phrase, Argon2 output, wrapping key, or an
+unencrypted TPM authorization value. The configuration and slots share the
+phrase-derived wrapping key, but each credential has an independent random TPM
+authorization secret and each encryption has an independent nonce.
+
+## Enrollment, unlock, and rotation
+
+Configure recovery before creating credentials that need it:
 
 ```sh
-linux-tpm-fido2 daemon --store-dir /path/to/store
+linux-tpm-fido2 config set recovery-passphrase
 ```
 
-Startup logs the resolved SQLite database path.
+This retains a zeroizing wrapping key only in the authenticator worker's memory
+for creating recovery-enabled credentials. After a daemon restart, enrollment
+is locked. Unlock it explicitly with:
 
-### Files
-
-The current implementation uses one SQLite database:
-
-```text
-.linux-tpm-fido2-store/credentials.sqlite
+```sh
+linux-tpm-fido2 config unlock-recovery
 ```
 
-The schema is managed with `sqlx` migrations in `migrations/`.
+While configured but locked, registration fails rather than silently creating a
+credential without recovery. Existing credentials can still authenticate. If no
+recovery configuration exists, registration creates PCR-bound credentials
+without recovery; setting a phrase later does not retrofit their fixed policy.
 
-The store directory is git-ignored.
+Policy-update requests always require their supplied phrase and do not use the
+enrollment unlock cache. Failed decryption happens before any TPM policy update.
+Each successful policy update atomically records `last_used = CURRENT_TIMESTAMP`
+and increments the recovery token's `used_count` with the new policy. Before its
+first use, `last_used` is NULL and `used_count` is zero. Normal passkey assertions,
+enrollment unlock, and passphrase rotation do not count as token uses. Full
+credential saves and rotation preserve the usage history. Failed updates do not
+change it.
 
-### Schema
+Setting a new phrase requires the old phrase when configured. The worker first
+authenticates and decrypts all slots, re-encrypts them under a new salt/key with
+fresh nonces, and atomically commits all ciphertexts and the configuration in
+one SQLite transaction. TPM auth values and keys do not change. Wrong phrases,
+corrupt slots, or failed writes leave the old configuration intact.
 
-The initial migration creates two tables.
+## Remaining security limits
 
-```sql
-CREATE TABLE credentials (
-    credential_id BLOB PRIMARY KEY NOT NULL,
-    rp_id TEXT NOT NULL,
-    user_handle BLOB NOT NULL,
-    user_name TEXT,
-    user_display_name TEXT,
-    sign_count INTEGER NOT NULL CHECK (sign_count >= 0),
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE tpm_keys (
-    credential_id BLOB PRIMARY KEY NOT NULL REFERENCES credentials(credential_id) ON DELETE CASCADE,
-    tpm_private BLOB NOT NULL,
-    tpm_public BLOB NOT NULL,
-    public_key_x BLOB NOT NULL,
-    public_key_y BLOB NOT NULL
-);
-```
-
-`credentials` stores WebAuthn-facing metadata and the signature counter.
-
-`tpm_keys` stores the TPM private/public blobs plus the P-256 public coordinates used for the WebAuthn COSE key.
-
-### CTAP2 TPM Credentials
-
-Behavior:
-
-- During registration, the daemon creates a TPM P-256 ECDSA signing key.
-- The TPM returns private/public blobs for the credential key.
-- `tpm_private` and `tpm_public` are saved so the key can be loaded later.
-- `public_key_x` and `public_key_y` are saved for WebAuthn COSE public key material.
-- During assertion, the daemon creates a transient storage parent, loads the credential key blobs, signs the assertion digest in the TPM, then flushes transient TPM handles.
-- `sign_count` is incremented after assertion signing and persisted back to SQLite.
-
-Current TPM parent strategy:
-
-- The daemon uses a transient owner-hierarchy storage parent.
-- The parent is recreated as needed.
-- Child credential blobs are loadable under that parent template.
-
-Current failure behavior:
-
-- If TPM is unavailable, new CTAP2 credential creation fails.
-- If a stored TPM credential cannot be loaded or signed, assertion fails.
-- There is no software fallback.
-
-Security status:
-
-- TPM private blobs are not raw private keys, but this is still development storage.
-- There is no PCR policy yet.
-- There is no recovery design yet.
-- Metadata is not authenticated as a complete structure yet.
-
-## Current Limitations
-
-- SQLite gives atomic transactions, but the credential schema is still development-oriented.
-- Assertion currently increments the in-memory signature counter before signing and then saves; persistence failure semantics still need tightening.
-- TPM-backed credentials are not PCR-bound yet.
-- TPM-backed credentials do not yet have passphrase recovery slots.
-- The store is intentionally a single-user namespace; there is no UID filtering.
-  Legacy owner metadata is retained only for storage/integrity compatibility.
-- There is no integrity protection over credential metadata as a whole.
-
-## Future Improvements
-
-### Production Metadata Format
-
-Credential storage should evolve toward a LUKS2-inspired SQLite schema:
-
-- Schema migrations for all persistent changes.
-- Atomic updates for registration, counter changes, policy changes, and recovery-slot changes.
-- Metadata checksums or authenticated digests where useful.
-- Clear separation between credential metadata, encrypted secrets, keyslots, tokens, and policy descriptors.
-
-### TPM-Backed Credentials
-
-Future TPM-backed credential records should include:
-
-- TPM public/private blobs.
-- Parent key template or parent key identifier.
-- Algorithm identifiers.
-- Credential creation policy.
-- PCR policy description.
-- Recovery policy description.
-- RP/user metadata.
-- Signature counter state.
-
-The daemon should not store raw software private keys for production credentials.
-
-### PCR Binding
-
-The first production TPM policy target should be secure-boot-state binding.
-
-Future records should describe:
-
-- Hash algorithm.
-- PCR selection.
-- Expected PCR policy digest.
-- Whether the credential is boot-state-bound.
-- Whether the credential has a recovery path.
-
-### Recovery
-
-Recovery should use passphrase-unlocked material that remains TPM-bound but is not PCR-bound.
-
-Future recovery metadata should include:
-
-- Keyslot descriptors.
-- KDF parameters.
-- TPM-wrapped recovery material.
-- Recovery token metadata.
-- Rotation and revocation support.
-
-### Counters And Durability
-
-Signature counters should be updated safely.
-
-Future improvements should include:
-
-- Atomic counter writes.
-- Clear behavior for failed writes after successful signing.
-- Possibly monotonic TPM NV counters or another anti-rollback strategy if needed.
-
-### Single-User Namespace
-
-One daemon instance and store serve one user on a single-user machine. All
-credentials in the store are available to the authenticator and management API;
-there is no caller-UID filtering or login-session binding. Multi-user isolation,
-fast user switching, and multi-seat operation are unsupported.
-
-Existing `user_id` metadata and stored TPM policy references are preserved for
-compatibility, not authorization. New credentials have no local owner UID.
-WebAuthn user handles and RP/user metadata are unchanged.
+- Database disclosure permits offline phrase guessing; use a strong phrase.
+- A live privileged attacker can capture a phrase or the in-memory unlock key.
+- Rotation does not revoke recovery material in old snapshots. Database rollback
+  protection is not implemented.
+- Deleting records is not secure erasure of SQLite free pages, WAL files, SSD
+  storage, or backups. Old insecure stores/backups must not be reused.
+- The current metadata MAC does not authenticate the complete credential record
+  and its key is stored beside the database. Recovery AEAD protects its own
+  authorization value and bindings, not all database metadata.
+- Direct development deployment still depends on file/device permissions; the
+  NixOS service restricts its state directory to `0700`.

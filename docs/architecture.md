@@ -9,8 +9,8 @@ approval flow. Multi-user isolation and session-switch handling are unsupported.
 
 Logind discovery is only for routing polkit prompts. The daemon does not check
 requester UIDs, scope credentials by UID, or bind CTAP state to login sessions.
-File and device permissions remain in place. Legacy owner metadata and stored
-TPM policy references are preserved so existing credentials remain loadable.
+File and device permissions remain in place. Credential compatibility across
+commits is not guaranteed; new SQL migrations may deliberately discard keys.
 
 ## Runtime Request Flow
 
@@ -31,7 +31,12 @@ TPM policy references are preserved so existing credentials remain loadable.
 Management requests use a Unix socket. Socket threads perform validation and
 storage work, while TPM operations are queued to the same authenticator worker.
 This preserves one owner for the TPM context because the NixOS test TPM exposes
-only one usable `/dev/tpm0` opener.
+only one usable `/dev/tpm0` opener. Recovery setup, unlock, rotation, and policy
+updates also run on this worker, so enrollment cannot race passphrase rotation.
+Rotation re-encrypts all recovery authorization values and atomically stores them
+with the new configuration. Normal signing uses existing policy signatures and
+requires no phrase. Policy updates must decrypt authorization using their own
+request's phrase, never the enrollment cache.
 
 ## Source Boundaries
 
@@ -50,6 +55,7 @@ src/
 ├── credential.rs           runtime credential model and store conversion
 ├── store.rs                SQLite schema access and integrity metadata
 ├── tpm.rs                  TPM object, PCR policy, and signing operations
+├── recovery.rs             Argon2id/AES-GCM encryption of recovery authorization
 ├── approval.rs             injectable approval boundary and polkit fallback
 ├── management.rs           management socket server and client transport
 ├── management/
@@ -71,6 +77,8 @@ commands:
 - Client PIN verifier and retry state;
 - ephemeral key agreement and PIN/UV token state;
 - transaction UV state;
+- a zeroizing recovery-enrollment wrapping key, only after setup or explicit
+  unlock; it is never serialized and is forgotten at restart;
 - the lazily opened TPM context.
 
 `ctaphid::PacketHandler` remains on the UHID thread and owns transport state:

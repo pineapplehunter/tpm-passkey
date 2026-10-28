@@ -1,5 +1,11 @@
 # Security Audit
 
+Historical snapshot, not a current security guarantee. The encrypted recovery
+refactor replaces the plaintext recovery auth/hash format described in findings
+1 and 4, and adds a destructive migration. See `agents/encrypted-recovery.md`
+and `docs/credentials.md` for the current design and validation. Other findings
+remain relevant unless independently resolved.
+
 ## Scope
 
 Static review of credential storage, TPM operations, CTAP2 handling, management transport, session/polkit integration, systemd configuration, and database migrations.

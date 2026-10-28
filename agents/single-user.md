@@ -1,5 +1,9 @@
 # Single-user simplification
 
+Follow-up: migration `20261028070000` removes the legacy owner field/indexes and
+MAC fallback retained in this original change. Owner-bound policyRef inputs
+were also removed; records using the old MAC are deliberately discarded.
+
 The supported model is one daemon/store for one user on a single-user machine.
 This supersedes the multi-user/session-isolation tasks in earlier agent plans.
 

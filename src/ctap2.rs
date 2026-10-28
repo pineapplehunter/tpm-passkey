@@ -11,9 +11,14 @@ use std::{
 
 use bitflags::bitflags;
 use color_eyre::eyre::WrapErr;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-use crate::{approval, credential::Credential, store, tpm};
+use crate::{
+    approval,
+    credential::Credential,
+    recovery::{self, UnlockedRecovery},
+    store, tpm,
+};
 use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt};
 use cbc::cipher::{KeyIvInit, block_padding::NoPadding};
@@ -66,6 +71,7 @@ pub struct Authenticator {
     tpm_path: Option<PathBuf>,
     tpm: Option<tpm::Tpm>,
     approval: Box<dyn approval::UserApproval>,
+    recovery_unlock: Option<UnlockedRecovery>,
     credentials: Vec<Credential>,
     pending_assertion: Option<PendingAssertion>,
     client_pin: Option<ClientPinState>,
@@ -152,6 +158,7 @@ impl Authenticator {
             tpm_path,
             tpm,
             approval,
+            recovery_unlock: None,
             credentials,
             pending_assertion: None,
             client_pin,
@@ -219,35 +226,6 @@ impl Authenticator {
             command_name(command),
             body.len()
         );
-
-        #[cfg(not(test))]
-        {
-            if matches!(
-                command,
-                Ctap2Command::MakeCredential
-                    | Ctap2Command::GetAssertion
-                    | Ctap2Command::GetNextAssertion
-                    | Ctap2Command::CredentialManagement
-            ) {
-                match store::load_daemon_passphrase_from_dir(&self.store_dir) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        // No recovery passphrase set: registration/assertion are
-                        // still allowed; credentials simply won't carry
-                        // passphrase-backed recovery material. This keeps a fresh
-                        // authenticator usable out of the box instead of denying
-                        // every operation until a passphrase is configured.
-                        log::error!(
-                            "daemon passphrase not set; credentials will be created without recovery material"
-                        );
-                    }
-                    Err(e) => {
-                        log::error!("failed to check daemon passphrase: {e}");
-                        return error_response(ErrorStatus::OperationDenied);
-                    }
-                }
-            }
-        }
 
         let result = match command {
             Ctap2Command::GetInfo => body
@@ -331,6 +309,7 @@ impl Authenticator {
             )?;
         }
         self.credentials.clear();
+        self.recovery_unlock = None;
         self.client_pin = None;
         self.key_agreement = None;
         self.pin_uv_auth_token = None;
@@ -473,9 +452,24 @@ impl Authenticator {
             return Err(ErrorStatus::OperationDenied);
         }
 
-        let daemon_passphrase = match store::load_daemon_passphrase_from_dir(&self.store_dir) {
-            Ok(Some((salt, hash, kdf))) => Some((salt, hash, kdf)),
-            _ => None,
+        let recovery_config = store::load_recovery_config(&self.store_dir).map_err(|error| {
+            log::warn!("failed to load recovery configuration: {error:?}");
+            ErrorStatus::OperationDenied
+        })?;
+        let recovery_unlock = if recovery_config.is_some() {
+            Some(
+                self.recovery_unlock
+                    .clone()
+                    .filter(|unlocked| {
+                        unlocked.matches_configuration(recovery_config.as_ref().unwrap())
+                    })
+                    .ok_or_else(|| {
+                        log::warn!("recovery enrollment is locked; run config unlock-recovery");
+                        ErrorStatus::OperationDenied
+                    })?,
+            )
+        } else {
+            None
         };
         let pcr_indices = store::load_default_pcr_policy(&self.store_dir)
             .map_err(|error| {
@@ -493,17 +487,13 @@ impl Authenticator {
         })?;
         let mut credential_id = vec![0u8; 32];
         fill_random(&mut credential_id);
-        let recovery_material = match daemon_passphrase {
-            Some((salt, hash, kdf)) => {
-                match tpm.create_recovery_material_with_hash(None, salt, hash, kdf) {
-                    Ok(material) => Some(material),
-                    Err(error) => {
-                        log::warn!("failed to create TPM recovery material: {error:?}");
-                        return Err(ErrorStatus::OperationDenied);
-                    }
-                }
-            }
-            None => None,
+        let recovery_key = if recovery_unlock.is_some() {
+            Some(tpm.create_recovery_key().map_err(|error| {
+                log::warn!("failed to create TPM recovery key: {error:?}");
+                ErrorStatus::OperationDenied
+            })?)
+        } else {
+            None
         };
         let mut policy = match tpm.create_secure_boot_policy() {
             Ok(policy) => policy,
@@ -514,9 +504,9 @@ impl Authenticator {
                 return Err(ErrorStatus::OperationDenied);
             }
         };
-        if let Some(material) = &recovery_material {
+        if let Some(authority) = &recovery_key {
             let policy_ref = tpm::credential_policy_ref(&credential_id);
-            policy = match tpm.create_authorized_policy(&policy, &material.key, &policy_ref) {
+            policy = match tpm.create_authorized_policy(&policy, authority, &policy_ref) {
                 Ok(policy) => policy,
                 Err(error) => {
                     log::warn!("failed to authorize TPM PCR policy: {error:?}");
@@ -532,19 +522,37 @@ impl Authenticator {
             }
         };
         log::info!("created TPM-backed CTAP2 credential key");
-        let recovery = recovery_material.map(|material| store::StoredRecoverySlot {
-            label: material.label,
-            passphrase_salt: material.passphrase_salt,
-            passphrase_hash: material.passphrase_hash,
-            kdf: material.kdf,
-            key: store::StoredTpmKey {
-                private: material.key.private,
-                public: material.key.public,
-                public_key_x: material.key.public_key_x,
-                public_key_y: material.key.public_key_y,
-                auth_value: material.key.auth_value,
-            },
-        });
+        let recovery = match (recovery_key, recovery_unlock) {
+            (Some(authority), Some(unlocked)) => {
+                let aad = recovery::credential_aad(
+                    &credential_id,
+                    &authority.public,
+                    policy.policy_ref.as_deref().expect("authorized policyRef"),
+                );
+                let encrypted_auth = unlocked
+                    .encrypt(
+                        authority.auth_value.as_ref().expect("random recovery auth"),
+                        &aad,
+                    )
+                    .map_err(|error| {
+                        log::warn!("failed to encrypt recovery authorization: {error:?}");
+                        ErrorStatus::OperationDenied
+                    })?;
+                Some(store::StoredRecoverySlot {
+                    label: None,
+                    encrypted_auth,
+                    last_used: None,
+                    used_count: 0,
+                    key: store::StoredTpmKey {
+                        private: authority.private,
+                        public: authority.public,
+                        public_key_x: authority.public_key_x,
+                        public_key_y: authority.public_key_y,
+                    },
+                })
+            }
+            _ => None,
+        };
         let public_key = cose_credential_public_key(&key);
 
         let extensions = cred_props_requested.then(|| cred_props_extension(discoverable));
@@ -562,7 +570,6 @@ impl Authenticator {
             id: credential_id,
             rp_id: rp_id.to_owned(),
             discoverable,
-            user_id: None,
             user_handle: user_handle.to_vec(),
             user_name: user_name.map(str::to_owned),
             user_display_name: user_display_name.map(str::to_owned),
@@ -1529,18 +1536,87 @@ impl Authenticator {
         Ok(true)
     }
 
+    fn set_recovery_passphrase(
+        &mut self,
+        old_passphrase: Option<&str>,
+        new_passphrase: &str,
+    ) -> color_eyre::Result<()> {
+        let config = store::load_recovery_config(&self.store_dir)?;
+        let old_unlock = config
+            .as_ref()
+            .map(|config| {
+                let passphrase = old_passphrase.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("provide the current recovery passphrase to change it")
+                })?;
+                UnlockedRecovery::unlock(config, passphrase)
+            })
+            .transpose()?;
+        let new_unlock = UnlockedRecovery::new(new_passphrase)?;
+        let mut credentials = store::load_ctap2_credentials_from_dir(&self.store_dir)?;
+        let mut slots = Vec::new();
+        for credential in &mut credentials {
+            let Some(slot) = &mut credential.recovery else {
+                continue;
+            };
+            let old_unlock = old_unlock.as_ref().ok_or_else(|| {
+                color_eyre::eyre::eyre!("recovery slot exists without encryption configuration")
+            })?;
+            let policy_ref = credential
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.policy_ref.as_deref())
+                .ok_or_else(|| color_eyre::eyre::eyre!("recovery credential has no policyRef"))?;
+            let aad = recovery::credential_aad(&credential.id, &slot.key.public, policy_ref);
+            let secret = old_unlock.decrypt(&slot.encrypted_auth, &aad)?;
+            if secret.len() != 32 {
+                color_eyre::eyre::bail!("invalid recovery authorization length");
+            }
+            slot.encrypted_auth = new_unlock.encrypt(&secret, &aad)?;
+            slots.push((credential.id.clone(), slot.encrypted_auth.clone()));
+        }
+        store::save_recovery_configuration(&self.store_dir, &new_unlock.configuration()?, &slots)?;
+        self.recovery_unlock = Some(new_unlock);
+        // Registration uses this snapshot too; do not let a later save restore
+        // pre-rotation ciphertext from stale in-memory credentials.
+        self.credentials = credentials.into_iter().map(Credential::from).collect();
+        self.cancel_pending();
+        Ok(())
+    }
+
     /// Execute a TPM command issued by the management thread.
     /// This runs on the main daemon thread which owns the TPM context.
     pub fn handle_tpm_command(&mut self, command: TpmCommand) -> color_eyre::Result<()> {
         match command {
             TpmCommand::PcrPolicyUpdate(cmd) => {
+                let credentials = store::load_ctap2_credentials_from_dir(&self.store_dir)?;
+                let credential = credentials
+                    .iter()
+                    .find(|c| c.id == cmd.credential_id)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("credential not found"))?;
+                let policy = credential
+                    .policy
+                    .as_ref()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("credential has no PCR policy"))?;
+                let policy_ref = policy
+                    .policy_ref
+                    .as_deref()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("credential has no policyRef"))?;
+                let authority_name = policy.authority_name.as_deref().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("credential has no recovery authority")
+                })?;
+                let recovery = credential
+                    .recovery
+                    .as_ref()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("credential has no recovery slot"))?;
+                // Never use the enrollment unlock cache for policy changes.
+                let authority = recovery.unlock(&credential.id, policy_ref, &cmd.passphrase)?;
                 let tpm = self
                     .ensure_tpm()
                     .ok_or_else(|| color_eyre::eyre::eyre!("TPM not available"))?;
                 tpm.set_pcr_indices(&cmd.pcr_indices)
                     .wrap_err("selecting PCRs for policy update")?;
                 let new_policy = tpm
-                    .update_authorized_policy(&cmd.authority, &cmd.authority_name, &cmd.policy_ref)
+                    .update_authorized_policy(&authority, authority_name, policy_ref)
                     .wrap_err("updating PCR policy via management TPM command")?;
                 let stored_policy = store::StoredPcrPolicy {
                     selection: new_policy.selection,
@@ -1550,38 +1626,45 @@ impl Authenticator {
                     authority_signature: new_policy.authority_signature,
                     policy_version: store::StoredPcrPolicy::current_version(),
                 };
-                store::update_ctap2_policy_in_dir(
+                let (last_used, used_count) = store::update_ctap2_policy_in_dir(
                     &self.store_dir,
                     &cmd.credential_id,
                     &stored_policy,
                 )
                 .wrap_err("saving PCR policy after TPM command")?;
+                // A later full credential save must not restore the old policy
+                // or erase token usage from this successful recovery.
+                if let Some(cached) = self
+                    .credentials
+                    .iter_mut()
+                    .find(|c| c.id == cmd.credential_id)
+                {
+                    cached.policy = Some(stored_policy);
+                    if let Some(slot) = &mut cached.recovery {
+                        slot.last_used = Some(last_used);
+                        slot.used_count = used_count;
+                    }
+                }
                 log::info!(
                     "updated PCR policy for credential {}",
                     hex::encode(&cmd.credential_id)
                 );
                 Ok(())
             }
-            TpmCommand::PassphraseChange(cmd) => {
-                let tpm = self
-                    .ensure_tpm()
-                    .ok_or_else(|| color_eyre::eyre::eyre!("TPM not available"))?;
-                let updated_key = tpm
-                    .change_key_auth(&cmd.recovery_key, &cmd.new_passphrase_hash)
-                    .wrap_err("changing TPM recovery key authorization")?;
-                store::update_recovery_slot_in_dir(
-                    &self.store_dir,
-                    &cmd.credential_id,
-                    &updated_key.private,
-                    &cmd.new_salt,
-                    &cmd.new_passphrase_hash,
-                    &cmd.new_kdf,
-                )
-                .wrap_err("saving updated recovery slot after TPM command")?;
-                log::info!(
-                    "changed recovery passphrase for credential {}",
-                    hex::encode(&cmd.credential_id)
-                );
+            TpmCommand::SetRecoveryPassphrase {
+                old_passphrase,
+                new_passphrase,
+            } => self.set_recovery_passphrase(
+                old_passphrase.as_deref().map(String::as_str),
+                &new_passphrase,
+            ),
+            TpmCommand::UnlockRecovery { passphrase } => {
+                let config = store::load_recovery_config(&self.store_dir)?.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("recovery passphrase is not configured")
+                })?;
+                // Clear an earlier unlock on failure, rather than retaining stale state.
+                self.recovery_unlock = None;
+                self.recovery_unlock = Some(UnlockedRecovery::unlock(&config, &passphrase)?);
                 Ok(())
             }
             TpmCommand::PcrDigestCheck(cmd) => {
@@ -1609,7 +1692,13 @@ impl Default for Authenticator {
 /// A TPM-bound operation requested by the management thread.
 pub enum TpmCommand {
     PcrPolicyUpdate(PcrPolicyUpdateCommand),
-    PassphraseChange(PassphraseChangeCommand),
+    SetRecoveryPassphrase {
+        old_passphrase: Option<Zeroizing<String>>,
+        new_passphrase: Zeroizing<String>,
+    },
+    UnlockRecovery {
+        passphrase: Zeroizing<String>,
+    },
     PcrDigestCheck(PcrDigestCheckCommand),
 }
 
@@ -1617,18 +1706,7 @@ pub enum TpmCommand {
 pub struct PcrPolicyUpdateCommand {
     pub credential_id: Vec<u8>,
     pub pcr_indices: Vec<u32>,
-    pub authority: tpm::TpmCredential,
-    pub authority_name: Vec<u8>,
-    pub policy_ref: Vec<u8>,
-}
-
-/// Data needed to change a credential's recovery passphrase via `change_key_auth`.
-pub struct PassphraseChangeCommand {
-    pub credential_id: Vec<u8>,
-    pub recovery_key: tpm::TpmCredential,
-    pub new_passphrase_hash: Vec<u8>,
-    pub new_salt: Vec<u8>,
-    pub new_kdf: tpm::RecoveryKdf,
+    pub passphrase: Zeroizing<String>,
 }
 
 /// Data needed to check the current PCR digest for a given selection.
@@ -2263,13 +2341,7 @@ fn sign_credential(
         authority_name: policy.authority_name.clone(),
         authority_signature: policy.authority_signature.clone(),
     });
-    let authority_key = authority.map(|authority| tpm::TpmCredential {
-        private: authority.key.private.clone(),
-        public: authority.key.public.clone(),
-        public_key_x: authority.key.public_key_x.clone(),
-        public_key_y: authority.key.public_key_y.clone(),
-        auth_value: authority.key.auth_value.clone(),
-    });
+    let authority_key = authority.map(store::StoredRecoverySlot::authority);
     tpm.sign_digest_with_policy(
         key,
         policy_binding.as_ref(),
@@ -2289,154 +2361,6 @@ fn management_auth_message(sub_command: i128, params: Option<&[(Value, Value)]>)
         ciborium::into_writer(&value, &mut encoded).expect("serializing management parameters");
     }
     encoded
-}
-
-pub fn update_pcr_policy_for_credential(
-    store_dir: &std::path::Path,
-    tpm_path: Option<&std::path::Path>,
-    credential_id: &[u8],
-    recovery_passphrase: &str,
-    pcr_indices: &[u32],
-) -> color_eyre::Result<()> {
-    let credentials = store::load_ctap2_credentials_from_dir(store_dir)?;
-    let credential = credentials
-        .iter()
-        .find(|c| c.id == credential_id)
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential not found"))?;
-    let policy = credential
-        .policy
-        .as_ref()
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential has no PCR policy"))?;
-    let recovery = credential
-        .recovery
-        .as_ref()
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential has no recovery slot"))?;
-    let policy_ref = policy
-        .policy_ref
-        .as_ref()
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential has no policyRef"))?;
-    let authority_name = policy
-        .authority_name
-        .as_ref()
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential has no authority name"))?;
-
-    let mut passphrase_hash = tpm::recovery_passphrase_hash(
-        &recovery.kdf,
-        &recovery.passphrase_salt,
-        recovery_passphrase,
-    )?;
-    let passphrase_ok = passphrase_hash == recovery.passphrase_hash;
-    passphrase_hash.zeroize();
-    if !passphrase_ok {
-        color_eyre::eyre::bail!("recovery passphrase does not match");
-    }
-
-    let tpm_path = tpm_path.unwrap_or(std::path::Path::new("/dev/tpmrm0"));
-    let mut tpm = tpm::Tpm::open(tpm_path, Some(pcr_indices))
-        .wrap_err("opening TPM for PCR policy update")?;
-
-    let authority = tpm::TpmCredential {
-        private: recovery.key.private.clone(),
-        public: recovery.key.public.clone(),
-        public_key_x: recovery.key.public_key_x.clone(),
-        public_key_y: recovery.key.public_key_y.clone(),
-        auth_value: recovery.key.auth_value.clone(),
-    };
-
-    let new_policy = tpm
-        .update_authorized_policy(&authority, authority_name, policy_ref)
-        .wrap_err("updating authorized PCR policy")?;
-
-    let stored_policy = store::StoredPcrPolicy {
-        selection: new_policy.selection,
-        digest: new_policy.digest,
-        policy_ref: new_policy.policy_ref,
-        authority_name: new_policy.authority_name,
-        authority_signature: new_policy.authority_signature,
-        policy_version: store::StoredPcrPolicy::current_version(),
-    };
-
-    println!(
-        "credential={} old_policy={}={} proposed_policy={}={}",
-        hex::encode(credential_id),
-        policy.selection,
-        hex::encode(&policy.digest),
-        stored_policy.selection,
-        hex::encode(&stored_policy.digest),
-    );
-
-    store::update_ctap2_policy_in_dir(store_dir, credential_id, &stored_policy)
-        .wrap_err("saving updated PCR policy")?;
-
-    log::info!(
-        "updated PCR policy for credential {}",
-        hex::encode(credential_id)
-    );
-    Ok(())
-}
-
-pub fn change_recovery_passphrase(
-    store_dir: &std::path::Path,
-    tpm_path: Option<&std::path::Path>,
-    credential_id: &[u8],
-    old_passphrase: &str,
-    new_passphrase: &str,
-) -> color_eyre::Result<()> {
-    let credentials = store::load_ctap2_credentials_from_dir(store_dir)?;
-    let credential = credentials
-        .iter()
-        .find(|c| c.id == credential_id)
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential not found"))?;
-    let recovery = credential
-        .recovery
-        .as_ref()
-        .ok_or_else(|| color_eyre::eyre::eyre!("credential has no recovery slot"))?;
-
-    let mut old_hash =
-        tpm::recovery_passphrase_hash(&recovery.kdf, &recovery.passphrase_salt, old_passphrase)?;
-    if old_hash != recovery.passphrase_hash {
-        old_hash.zeroize();
-        color_eyre::eyre::bail!("recovery passphrase does not match");
-    }
-    old_hash.zeroize();
-
-    let mut new_salt = vec![0u8; 32];
-    getrandom::fill(&mut new_salt).wrap_err("generating new recovery passphrase salt")?;
-    let new_kdf = tpm::RecoveryKdf::argon2id_default();
-    let new_hash = tpm::recovery_passphrase_hash(&new_kdf, &new_salt, new_passphrase)?;
-
-    let tpm_path = tpm_path.unwrap_or(std::path::Path::new("/dev/tpmrm0"));
-    let pcr_indices = store::load_default_pcr_policy(store_dir).unwrap_or(None);
-    let mut tpm = tpm::Tpm::open(tpm_path, pcr_indices.as_deref())
-        .wrap_err("opening TPM for passphrase change")?;
-
-    let recovery_key = tpm::TpmCredential {
-        private: recovery.key.private.clone(),
-        public: recovery.key.public.clone(),
-        public_key_x: recovery.key.public_key_x.clone(),
-        public_key_y: recovery.key.public_key_y.clone(),
-        auth_value: recovery.key.auth_value.clone(),
-    };
-    let updated_key = tpm
-        .change_key_auth(&recovery_key, &new_hash)
-        .wrap_err("changing TPM recovery key authorization")?;
-
-    store::update_recovery_slot_in_dir(
-        store_dir,
-        credential_id,
-        &updated_key.private,
-        &new_salt,
-        &new_hash,
-        &new_kdf,
-    )
-    .wrap_err("saving updated recovery slot")?;
-
-    new_salt.zeroize();
-    log::info!(
-        "changed recovery passphrase for credential {}",
-        hex::encode(credential_id)
-    );
-    Ok(())
 }
 
 #[cfg(test)]

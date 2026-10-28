@@ -5,6 +5,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use zeroize::Zeroizing;
 
 mod protocol;
 mod service;
@@ -42,7 +43,7 @@ fn handle_client(
     tpm_cmd_tx: Option<ctap2::TpmCmdSender>,
 ) {
     let data = match recv_message(&mut stream) {
-        Ok(d) => d,
+        Ok(d) => Zeroizing::new(d),
         Err(e) => {
             log::warn!("management: failed to read request: {e}");
             return;
@@ -137,8 +138,8 @@ pub fn send_request(request: &ManagementRequest) -> Result<ManagementResponse> {
         )
     })?;
 
-    let mut encoded = Vec::new();
-    ciborium::into_writer(request, &mut encoded)
+    let mut encoded = Zeroizing::new(Vec::new());
+    ciborium::into_writer(request, &mut *encoded)
         .map_err(|e| color_eyre::eyre::eyre!("encoding request: {e}"))?;
 
     send_message(&mut stream, &encoded)

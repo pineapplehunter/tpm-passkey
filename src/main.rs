@@ -81,6 +81,8 @@ struct ConfigArgs {
 enum ConfigCommand {
     /// Show effective persistent configuration
     Show,
+    /// Unlock recovery-enabled registration until the daemon restarts
+    UnlockRecovery,
     /// Set a persistent configuration value
     Set(ConfigSetArgs),
 }
@@ -337,6 +339,17 @@ fn run_update_passphrase() -> Result<()> {
     Ok(())
 }
 
+fn run_unlock_recovery() -> Result<()> {
+    let passphrase = prompt_password("Enter recovery passphrase: ")?;
+    let response =
+        management::send_request(&management::ManagementRequest::UnlockRecovery { passphrase })?;
+    if !response.ok {
+        bail!("daemon error: {}", response.error.unwrap_or_default());
+    }
+    println!("Recovery enrollment unlocked until daemon restart.");
+    Ok(())
+}
+
 fn run_update_pcr_reference() -> Result<()> {
     let passphrase = prompt_password_confirm("Enter recovery passphrase: ")?;
     let request = management::ManagementRequest::UpdatePcrReference { passphrase };
@@ -406,6 +419,7 @@ fn run_update_pcr_policy(args: PcrPolicyArgs) -> Result<()> {
 fn run_config(args: ConfigArgs) -> Result<()> {
     match args.command {
         ConfigCommand::Show => run_config_show(),
+        ConfigCommand::UnlockRecovery => run_unlock_recovery(),
         ConfigCommand::Set(args) => match args.setting {
             ConfigSetCommand::DefaultPcrPolicy(args) => run_set_default_pcr_policy(args),
             ConfigSetCommand::RecoveryPassphrase => run_update_passphrase(),

@@ -131,11 +131,21 @@ A recovery mechanism may be defined to authorize migration to a new accepted PCR
 
 #### Passphrase-Based Authorization
 
-Use of the credential private key may require an authorization secret derived from a user-supplied passphrase.
+Each recovery-enabled credential has a separate TPM recovery authority with an
+independent random authorization value. The user-supplied phrase does not directly
+become a TPM auth value: Argon2id derives an encryption key, and AES-256-GCM
+protects the random authorization value. Associated data binds the ciphertext to
+the credential ID, authority public blob, and `policyRef`.
 
-The passphrase shall be processed using a costed password-based key derivation function. A fast hash of the passphrase is insufficient because it permits inexpensive offline guessing after credential-store disclosure.
+The database stores salt, bounded KDF parameters, nonces, ciphertext, and TPM
+object blobs, but no plaintext authorization value or derived encryption key.
+The daemon configuration contains only an encrypted known unlock-check value.
+A database copy permits offline phrase guessing, not immediate recovery use.
 
-The passphrase mechanism must authorize the same private key that was registered with the relying party. Creating an unrelated recovery signing key does not recover the original WebAuthn credential.
+The recovery authority signs a new PCR approval via `PolicyAuthorize`; the
+original registered passkey and its fixed TPM policy remain unchanged. Recovery
+requires the original TPM, relevant blobs, and the phrase. See
+[`credentials.md`](credentials.md) for the format and enrollment lifecycle.
 
 #### Combined Authorization Policies
 
@@ -167,8 +177,8 @@ Credential metadata is not necessarily confidential. Depending on the database f
 
 All stored credentials share one namespace. The daemon does not check caller
 UIDs, filter credentials by owner, bind CTAP state to login sessions, or revoke
-access on session switches. Existing owner metadata and TPM policy references
-are retained only for compatibility with stored records.
+access on session switches. Credential metadata has no local owner UID or
+owner-dependent compatibility format.
 
 Keep the `hidraw` device, management socket, and store access restricted.
 The existing udev `uaccess` rule and root-only management socket remain, but do
@@ -207,7 +217,6 @@ Unauthorized modification of security-sensitive credential records should be det
 The authenticated record should include, at minimum:
 
 * Credential ID.
-* Legacy credential-owner metadata, where retained for compatibility.
 * RP ID.
 * User handle.
 * TPM private and public blobs.
@@ -299,11 +308,15 @@ The daemon should implement bounded request sizes, per-channel state limits, req
 
 The current source tree is experimental and does not yet satisfy all properties defined by this document.
 
-Before production security claims are made, at least the following issues must be resolved:
+Recovery now uses random, encrypted TPM authorization values and an Argon2id
+wrapping key. The old plaintext-equivalent format is discarded by a new SQL
+migration, not upgraded. This does not securely erase old stores or backups.
+The enrollment wrapping key is retained in zeroizing worker memory after setup
+or explicit unlock, and forgotten at restart. Policy changes always require
+the phrase supplied in their own request. Passphrase rotation rewraps all slots
+and configuration atomically but does not prevent reuse of older snapshots.
 
-* TPM keys protected exclusively by PCR policy must not retain an empty authorization-value bypass.
-* Recovery must authorize the original registered credential key rather than an independent signing key.
-* Passphrases must be protected using an offline-resistant password KDF.
+Before production security claims are made, at least the following issues must be resolved:
 * Security-sensitive credential metadata must receive integrity protection.
 * Approval reuse and stale authorization state must be eliminated or formally justified.
 * Rollback behavior must be documented and, where required, mitigated. (Documented in § Rollback Resistance; mitigation deferred.)

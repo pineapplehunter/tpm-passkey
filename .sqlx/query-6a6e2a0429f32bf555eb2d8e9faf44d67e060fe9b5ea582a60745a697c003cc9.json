@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE credential_tokens SET encrypted_auth = ?1, updated_at = CURRENT_TIMESTAMP WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots WHERE credential_id = ?2 AND slot_kind = 'recovery') AND token_type = 'passphrase'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "6a6e2a0429f32bf555eb2d8e9faf44d67e060fe9b5ea582a60745a697c003cc9"
+}

@@ -18,11 +18,13 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-use base64::Engine as _;
 use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToSec1Point;
 
-use crate::tpm::RecoveryKdf;
+use crate::{
+    recovery::{self, EncryptedSecret},
+    tpm,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -45,8 +47,6 @@ pub struct StoredCtap2Credential {
     pub id: Vec<u8>,
     pub rp_id: String,
     pub discoverable: bool,
-    // Legacy local owner metadata, retained for existing MACs; never a filter.
-    pub user_id: Option<u32>,
     pub user_handle: Vec<u8>,
     pub user_name: Option<String>,
     pub user_display_name: Option<String>,
@@ -81,10 +81,10 @@ impl StoredPcrPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRecoverySlot {
     pub label: Option<String>,
-    pub passphrase_salt: Vec<u8>,
-    pub passphrase_hash: Vec<u8>,
-    pub kdf: RecoveryKdf,
+    pub encrypted_auth: EncryptedSecret,
     pub key: StoredTpmKey,
+    pub last_used: Option<String>,
+    pub used_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +93,34 @@ pub struct StoredTpmKey {
     pub public: Vec<u8>,
     pub public_key_x: Vec<u8>,
     pub public_key_y: Vec<u8>,
-    pub auth_value: Option<Vec<u8>>,
+}
+
+impl StoredRecoverySlot {
+    pub fn authority(&self) -> tpm::TpmCredential {
+        tpm::TpmCredential {
+            private: self.key.private.clone(),
+            public: self.key.public.clone(),
+            public_key_x: self.key.public_key_x.clone(),
+            public_key_y: self.key.public_key_y.clone(),
+            auth_value: None,
+        }
+    }
+
+    pub fn unlock(
+        &self,
+        credential_id: &[u8],
+        policy_ref: &[u8],
+        passphrase: &str,
+    ) -> Result<tpm::TpmCredential> {
+        let aad = recovery::credential_aad(credential_id, &self.key.public, policy_ref);
+        let auth = self.encrypted_auth.decrypt(passphrase, &aad)?;
+        if auth.len() != 32 {
+            return Err(eyre!("invalid recovery authorization length"));
+        }
+        let mut authority = self.authority();
+        authority.auth_value = Some(auth);
+        Ok(authority)
+    }
 }
 
 fn sec1_encode_point(x: &[u8], y: &[u8]) -> String {
@@ -119,14 +146,12 @@ fn sec1_decode_point(data: &str) -> Result<(Vec<u8>, Vec<u8>)> {
 struct TpmKeyBlob {
     private: Vec<u8>,
     public: Vec<u8>,
-    auth_value: Option<Vec<u8>>,
 }
 
 fn tpm_key_to_blob(key: &StoredTpmKey) -> Vec<u8> {
     let blob = TpmKeyBlob {
         private: key.private.clone(),
         public: key.public.clone(),
-        auth_value: key.auth_value.clone(),
     };
     let mut buf = Vec::new();
     ciborium::into_writer(&blob, &mut buf).expect("serializing TPM key blob");
@@ -142,67 +167,7 @@ fn tpm_key_from_blob(data: &[u8], public_key: &str) -> Result<StoredTpmKey> {
         public: blob.public,
         public_key_x,
         public_key_y,
-        auth_value: blob.auth_value,
     })
-}
-
-fn kdf_params_to_string(kdf: &RecoveryKdf, salt: &[u8], hash: &[u8]) -> String {
-    use argon2::password_hash::{Ident, Output, ParamsString, PasswordHash, Salt};
-    let salt_b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(salt);
-    let mut params = ParamsString::new();
-    match *kdf {
-        RecoveryKdf::Argon2id {
-            memory_kib,
-            iterations,
-            parallelism,
-        } => {
-            params.add_decimal("m", memory_kib).expect("adding m");
-            params.add_decimal("t", iterations).expect("adding t");
-            params.add_decimal("p", parallelism).expect("adding p");
-        }
-    }
-    let ph = PasswordHash {
-        algorithm: Ident::new("argon2id").expect("valid algorithm"),
-        version: Some(19),
-        params,
-        salt: Some(Salt::from_b64(&salt_b64).expect("valid salt base64")),
-        hash: Some(Output::new(hash).expect("valid hash length")),
-    };
-    ph.to_string()
-}
-
-fn kdf_params_from_string(s: &str) -> Result<(Vec<u8>, Vec<u8>, RecoveryKdf)> {
-    use argon2::password_hash::PasswordHash;
-    let ph = PasswordHash::new(s).map_err(|e| eyre!("invalid KDF params PHC string: {e}"))?;
-    if ph.algorithm.as_str() != "argon2id" {
-        return Err(eyre!("unsupported KDF algorithm: {}", ph.algorithm));
-    }
-    let salt = ph.salt.ok_or_else(|| eyre!("PHC string missing salt"))?;
-    let hash = ph.hash.ok_or_else(|| eyre!("PHC string missing hash"))?;
-    let mut salt_buf = vec![0u8; 64];
-    let salt_bytes = salt
-        .decode_b64(&mut salt_buf)
-        .map_err(|e| eyre!("decoding PHC salt from B64: {e}"))?;
-    let salt_vec = salt_bytes.to_vec();
-    let memory_kib = ph
-        .params
-        .get_decimal("m")
-        .ok_or_else(|| eyre!("missing argon2id m parameter"))?;
-    let iterations = ph
-        .params
-        .get_decimal("t")
-        .ok_or_else(|| eyre!("missing argon2id t parameter"))?;
-    let parallelism = ph
-        .params
-        .get_decimal("p")
-        .ok_or_else(|| eyre!("missing argon2id p parameter"))?;
-    let hash_bytes: &[u8] = hash.as_ref();
-    let kdf = RecoveryKdf::Argon2id {
-        memory_kib,
-        iterations,
-        parallelism,
-    };
-    Ok((salt_vec, hash_bytes.to_vec(), kdf))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,33 +225,16 @@ pub fn update_ctap2_sign_count_in_dir(
     ))
 }
 
+/// Commit a recovery-approved policy and its token usage together.
 pub fn update_ctap2_policy_in_dir(
     dir: impl AsRef<Path>,
     credential_id: &[u8],
     policy: &StoredPcrPolicy,
-) -> Result<()> {
+) -> Result<(String, u64)> {
     block_on_store(update_ctap2_policy_async(
         dir.as_ref(),
         credential_id,
         policy,
-    ))
-}
-
-pub fn update_recovery_slot_in_dir(
-    dir: impl AsRef<Path>,
-    credential_id: &[u8],
-    new_private: &[u8],
-    new_salt: &[u8],
-    new_hash: &[u8],
-    kdf: &RecoveryKdf,
-) -> Result<()> {
-    block_on_store(update_recovery_slot_async(
-        dir.as_ref(),
-        credential_id,
-        new_private,
-        new_salt,
-        new_hash,
-        kdf,
     ))
 }
 
@@ -355,80 +303,60 @@ async fn save_default_pcr_policy_async(dir: &Path, indices: &[u32]) -> Result<()
     Ok(())
 }
 
-type DaemonPassphraseData = (Vec<u8>, Vec<u8>, RecoveryKdf);
-
-pub fn load_daemon_passphrase_from_dir(
-    dir: impl AsRef<Path>,
-) -> Result<Option<DaemonPassphraseData>> {
-    block_on_store(load_daemon_passphrase_async(dir.as_ref()))
+pub fn load_recovery_config(dir: impl AsRef<Path>) -> Result<Option<EncryptedSecret>> {
+    block_on_store(async {
+        let pool = open_database(dir.as_ref()).await?;
+        let row = sqlx::query!("SELECT value FROM daemon_config WHERE key = 'recovery_encryption'")
+            .fetch_optional(&pool)
+            .await?;
+        row.map(|row| {
+            ciborium::from_reader(row.value.as_slice())
+                .wrap_err("decoding recovery encryption configuration")
+        })
+        .transpose()
+    })
 }
 
-pub fn save_daemon_passphrase_to_dir(
+/// Rotate all encrypted authorization values and their unlock configuration
+/// together. A missing slot or failed write rolls back the entire change.
+pub fn save_recovery_configuration(
     dir: impl AsRef<Path>,
-    salt: &[u8],
-    hash: &[u8],
-    kdf: &RecoveryKdf,
+    config: &EncryptedSecret,
+    slots: &[(Vec<u8>, EncryptedSecret)],
 ) -> Result<()> {
-    block_on_store(save_daemon_passphrase_async(dir.as_ref(), salt, hash, kdf))
-}
-
-async fn load_daemon_passphrase_async(dir: &Path) -> Result<Option<DaemonPassphraseData>> {
-    let pool = open_database(dir).await?;
-    let row = sqlx::query("SELECT value FROM daemon_config WHERE key = 'daemon_passphrase'")
-        .fetch_optional(&pool)
-        .await
-        .wrap_err("loading daemon passphrase from database")?;
-
-    match row {
-        Some(r) => {
-            let blob: Vec<u8> = r.get("value");
-            let (hash, salt, memory_kib, iterations, parallelism): (
-                Vec<u8>,
-                Vec<u8>,
-                u32,
-                u32,
-                u32,
-            ) = ciborium::from_reader(&blob[..])
-                .wrap_err("deserializing daemon passphrase from database")?;
-            let kdf = RecoveryKdf::Argon2id {
-                memory_kib,
-                iterations,
-                parallelism,
-            };
-            Ok(Some((salt, hash, kdf)))
+    block_on_store(async {
+        let pool = open_database(dir.as_ref()).await?;
+        let mut tx = pool.begin().await?;
+        for (id, encrypted) in slots {
+            let mut blob = Vec::new();
+            ciborium::into_writer(encrypted, &mut blob)
+                .wrap_err("encoding recovery authorization")?;
+            let result = sqlx::query!(
+                "UPDATE credential_tokens SET encrypted_auth = ?1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots \
+                                    WHERE credential_id = ?2 AND slot_kind = 'recovery') \
+                   AND token_type = 'passphrase'",
+                blob,
+                id,
+            )
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(eyre!("recovery slot not found during passphrase rotation"));
+            }
         }
-        None => Ok(None),
-    }
-}
-
-async fn save_daemon_passphrase_async(
-    dir: &Path,
-    salt: &[u8],
-    hash: &[u8],
-    kdf: &RecoveryKdf,
-) -> Result<()> {
-    let pool = open_database(dir).await?;
-    let (memory_kib, iterations, parallelism) = match *kdf {
-        RecoveryKdf::Argon2id {
-            memory_kib,
-            iterations,
-            parallelism,
-        } => (memory_kib, iterations, parallelism),
-    };
-    let mut blob = Vec::new();
-    ciborium::into_writer(
-        &(hash, salt, memory_kib, iterations, parallelism),
-        &mut blob,
-    )
-    .wrap_err("serializing daemon passphrase")?;
-    sqlx::query(
-        "INSERT OR REPLACE INTO daemon_config (key, value, updated_at) VALUES ('daemon_passphrase', ?, datetime('now'))",
-    )
-    .bind(blob)
-    .execute(&pool)
-    .await
-    .wrap_err("saving daemon passphrase to database")?;
-    Ok(())
+        let mut blob = Vec::new();
+        ciborium::into_writer(config, &mut blob).wrap_err("encoding recovery configuration")?;
+        sqlx::query!(
+            "INSERT INTO daemon_config (key, value) VALUES ('recovery_encryption', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            blob,
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    })
 }
 
 async fn load_credential_summaries_async(dir: &Path) -> Result<Vec<StoredCredentialSummary>> {
@@ -476,13 +404,13 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
 
     let pool = open_database(dir).await?;
     let rows = sqlx::query(
-        "SELECT m.credential_id, m.rp_id, m.discoverable, m.user_id, m.user_handle, m.user_name, m.user_display_name, \
+        "SELECT m.credential_id, m.rp_id, m.discoverable, m.user_handle, m.user_name, m.user_display_name, \
                 m.sign_count, m.integrity_mac, \
                  p.policy_selection, p.policy_digest, p.policy_ref, p.authority_name, p.authority_signature, p.policy_version, \
                 p.tpm_key AS primary_tpm_key, p.public_key AS primary_public_key, \
                 r.slot_label AS recovery_label, \
                 r.tpm_key AS recovery_tpm_key, r.public_key AS recovery_public_key, \
-                 t.kdf_params \
+                 t.encrypted_auth, t.last_used AS token_last_used, t.used_count AS token_used_count \
          FROM credential_metadata m \
          JOIN credential_keyslots p \
            ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' \
@@ -498,7 +426,6 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
     rows.into_iter()
         .map(|row| {
             let sign_count: i64 = row.try_get("sign_count")?;
-            let stored_user_id: Option<i64> = row.try_get("user_id")?;
             let policy_selection: Option<String> = row.try_get("policy_selection")?;
             let policy_digest: Option<Vec<u8>> = row.try_get("policy_digest")?;
             let policy_ref: Option<Vec<u8>> = row.try_get("policy_ref")?;
@@ -513,7 +440,7 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
             let primary_public_key: String = row.try_get("primary_public_key")?;
             let recovery_tpm_key: Option<Vec<u8>> = row.try_get("recovery_tpm_key")?;
             let recovery_public_key: Option<String> = row.try_get("recovery_public_key")?;
-            let recovery_kdf_params: Option<String> = row.try_get("kdf_params")?;
+            let encrypted_auth: Option<Vec<u8>> = row.try_get("encrypted_auth")?;
             let integrity_mac: Option<Vec<u8>> = row.try_get("integrity_mac")?;
 
             let primary_key = tpm_key_from_blob(&primary_tpm_key, &primary_public_key)?;
@@ -522,33 +449,29 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                 recovery_label,
                 recovery_tpm_key,
                 recovery_public_key,
-                recovery_kdf_params,
+                encrypted_auth,
             ) {
-                (label, Some(tpm_key_data), Some(pub_key_data), Some(kdf_data)) => {
-                    let (passphrase_salt, passphrase_hash, kdf) =
-                        kdf_params_from_string(&kdf_data)?;
+                (label, Some(tpm_key_data), Some(pub_key_data), Some(encrypted)) => {
+                    let encrypted_auth = ciborium::from_reader(encrypted.as_slice())
+                        .wrap_err("decoding encrypted recovery authorization")?;
                     let key = tpm_key_from_blob(&tpm_key_data, &pub_key_data)?;
                     Some(StoredRecoverySlot {
                         label,
-                        passphrase_salt,
-                        passphrase_hash,
-                        kdf,
+                        encrypted_auth,
                         key,
+                        last_used: row.try_get("token_last_used")?,
+                        used_count: u64::try_from(row.try_get::<i64, _>("token_used_count")?)
+                            .wrap_err("invalid recovery token use count")?,
                     })
                 }
-                _ => None,
+                (None, None, None, None) => None,
+                _ => return Err(eyre!("incomplete recovery slot")),
             };
 
             let stored = StoredCtap2Credential {
                 id: row.try_get("credential_id")?,
                 rp_id: row.try_get("rp_id")?,
                 discoverable: row.try_get::<i64, _>("discoverable")? != 0,
-                // Preserve legacy owner metadata for existing integrity MACs;
-                // it no longer selects or authorizes credentials.
-                user_id: stored_user_id
-                    .map(u32::try_from)
-                    .transpose()
-                    .wrap_err("invalid legacy user_id")?,
                 user_handle: row.try_get("user_handle")?,
                 user_name: row.try_get("user_name")?,
                 user_display_name: row.try_get("user_display_name")?,
@@ -579,9 +502,7 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                     }
                 };
                 let computed = compute_credential_mac(&key, &stored)?;
-                if computed != expected_mac as &[u8]
-                    && compute_credential_mac_legacy(&key, &stored)? != expected_mac as &[u8]
-                {
+                if computed != expected_mac as &[u8] {
                     log::error!(
                         "credential integrity check failed for rp_id={} id={}",
                         stored.rp_id,
@@ -639,12 +560,11 @@ async fn save_ctap2_credentials_async(
             .unwrap_or((None, None));
         sqlx::query!(
             "INSERT INTO credential_metadata \
-             (credential_id, rp_id, discoverable, user_id, user_handle, user_name, user_display_name, sign_count, integrity_mac, created_at, last_used_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, COALESCE(?10, CURRENT_TIMESTAMP), ?11)",
+             (credential_id, rp_id, discoverable, user_handle, user_name, user_display_name, sign_count, integrity_mac, created_at, last_used_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, CURRENT_TIMESTAMP), ?10)",
             &credential.id,
             &credential.rp_id,
             i64::from(credential.discoverable),
-            credential.user_id.map(i64::from),
             &credential.user_handle,
             credential.user_name.as_deref(),
             credential.user_display_name.as_deref(),
@@ -695,19 +615,20 @@ async fn save_ctap2_credentials_async(
             .wrap_err_with(|| format!("saving recovery keyslot for rp_id={}", credential.rp_id))?
             .last_insert_rowid();
 
-            let kdf_params = kdf_params_to_string(
-                &recovery.kdf,
-                &recovery.passphrase_salt,
-                &recovery.passphrase_hash,
-            );
-            sqlx::query(
+            let mut encrypted_auth = Vec::new();
+            ciborium::into_writer(&recovery.encrypted_auth, &mut encrypted_auth)
+                .wrap_err("encoding encrypted recovery authorization")?;
+            sqlx::query!(
                 "INSERT INTO credential_tokens \
-                 (keyslot_id, token_type, label, kdf_params) \
-                 VALUES (?1, 'passphrase', ?2, ?3)",
+                 (keyslot_id, token_type, label, encrypted_auth, last_used, used_count) \
+                 VALUES (?1, 'passphrase', ?2, ?3, ?4, ?5)",
+                recovery_keyslot_id,
+                recovery.label,
+                encrypted_auth,
+                recovery.last_used,
+                i64::try_from(recovery.used_count)
+                    .wrap_err("recovery token count exceeds SQLite range")?,
             )
-            .bind(recovery_keyslot_id)
-            .bind(recovery.label.clone())
-            .bind(kdf_params)
             .execute(&mut *tx)
             .await
             .wrap_err_with(|| format!("saving recovery token for rp_id={}", credential.rp_id))?;
@@ -751,110 +672,45 @@ async fn update_ctap2_policy_async(
     dir: &Path,
     credential_id: &[u8],
     policy: &StoredPcrPolicy,
-) -> Result<()> {
+) -> Result<(String, u64)> {
     let pool = open_database(dir).await?;
-    let result = sqlx::query(
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query!(
         "UPDATE credential_keyslots \
          SET policy_selection = ?1, policy_digest = ?2, policy_ref = ?3, \
              authority_name = ?4, authority_signature = ?5, updated_at = CURRENT_TIMESTAMP \
          WHERE credential_id = ?6 AND slot_kind = 'primary'",
+        policy.selection,
+        policy.digest,
+        policy.policy_ref,
+        policy.authority_name,
+        policy.authority_signature,
+        credential_id,
     )
-    .bind(&policy.selection)
-    .bind(&policy.digest)
-    .bind(policy.policy_ref.as_deref())
-    .bind(policy.authority_name.as_deref())
-    .bind(policy.authority_signature.as_deref())
-    .bind(credential_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .wrap_err("updating CTAP2 credential PCR policy")?;
-
     if result.rows_affected() != 1 {
         return Err(eyre!(
-            "updated {} rows while updating PCR policy for credential ID length {}; expected 1",
-            result.rows_affected(),
-            credential_id.len()
+            "primary credential slot not found during policy update"
         ));
     }
-
-    Ok(())
-}
-
-async fn update_recovery_slot_async(
-    dir: &Path,
-    credential_id: &[u8],
-    new_private: &[u8],
-    new_salt: &[u8],
-    new_hash: &[u8],
-    kdf: &RecoveryKdf,
-) -> Result<()> {
-    let pool = open_database(dir).await?;
-    let mut tx = pool
-        .begin()
-        .await
-        .wrap_err("beginning transaction for recovery slot update")?;
-
-    let row = sqlx::query(
-        "SELECT tpm_key, public_key FROM credential_keyslots \
-         WHERE credential_id = ?1 AND slot_kind = 'recovery'",
-    )
-    .bind(credential_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .wrap_err("reading recovery keyslot for update")?
-    .ok_or_else(|| eyre!("recovery keyslot not found"))?;
-
-    let old_tpm_key: Vec<u8> = row.try_get("tpm_key")?;
-    let old_public_key: String = row.try_get("public_key")?;
-    let old_key = tpm_key_from_blob(&old_tpm_key, &old_public_key)?;
-
-    let new_key = StoredTpmKey {
-        private: new_private.to_vec(),
-        public: old_key.public,
-        public_key_x: old_key.public_key_x,
-        public_key_y: old_key.public_key_y,
-        auth_value: Some(new_hash.to_vec()),
-    };
-    let new_tpm_key_blob = tpm_key_to_blob(&new_key);
-
-    let result = sqlx::query(
-        "UPDATE credential_keyslots \
-         SET tpm_key = ?1, updated_at = CURRENT_TIMESTAMP \
-         WHERE credential_id = ?2 AND slot_kind = 'recovery'",
-    )
-    .bind(new_tpm_key_blob)
-    .bind(credential_id)
-    .execute(&mut *tx)
-    .await
-    .wrap_err("updating recovery keyslot TPM key")?;
-
-    if result.rows_affected() != 1 {
-        return Err(eyre!(
-            "updated {} rows for recovery slot of credential ID length {}; expected 1",
-            result.rows_affected(),
-            credential_id.len()
-        ));
-    }
-
-    let kdf_params = kdf_params_to_string(kdf, new_salt, new_hash);
-    sqlx::query(
+    let usage = sqlx::query!(
         "UPDATE credential_tokens \
-          SET kdf_params = ?1, updated_at = CURRENT_TIMESTAMP \
-          WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots \
-                              WHERE credential_id = ?2 AND slot_kind = 'recovery') \
-           AND token_type = 'passphrase'",
-    )
-    .bind(kdf_params)
-    .bind(credential_id)
-    .execute(&mut *tx)
-    .await
-    .wrap_err("updating recovery passphrase tokens")?;
-
-    tx.commit()
-        .await
-        .wrap_err("committing recovery slot update transaction")?;
-
-    Ok(())
+         SET last_used = CURRENT_TIMESTAMP, used_count = used_count + 1, updated_at = CURRENT_TIMESTAMP \
+         WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots \
+                            WHERE credential_id = ?1 AND slot_kind = 'recovery') \
+           AND token_type = 'passphrase' AND used_count < 9223372036854775807 \
+         RETURNING last_used, used_count",
+        credential_id,
+    ).fetch_optional(&mut *tx).await?
+        .ok_or_else(|| eyre!("recovery token missing or use count exhausted"))?;
+    let last_used = usage
+        .last_used
+        .ok_or_else(|| eyre!("missing recovery use timestamp"))?;
+    let used_count = u64::try_from(usage.used_count).wrap_err("invalid recovery use count")?;
+    tx.commit().await?;
+    Ok((last_used, used_count))
 }
 
 async fn delete_ctap2_credential_async(dir: &Path, credential_id: &[u8]) -> Result<()> {
@@ -1012,7 +868,6 @@ fn compute_credential_mac(key: &[u8; 32], credential: &StoredCtap2Credential) ->
     mac.update(&[u8::from(credential.discoverable)]);
     mac.update(&(credential.user_handle.len() as u64).to_be_bytes());
     mac.update(&credential.user_handle);
-    mac.update(&credential.user_id.unwrap_or(0).to_be_bytes());
 
     let user_name = credential.user_name.as_deref().unwrap_or("");
     mac.update(&(user_name.len() as u64).to_be_bytes());
@@ -1022,27 +877,6 @@ fn compute_credential_mac(key: &[u8; 32], credential: &StoredCtap2Credential) ->
     mac.update(&(display_name.len() as u64).to_be_bytes());
     mac.update(display_name.as_bytes());
 
-    Ok(mac.finalize().into_bytes().to_vec())
-}
-
-fn compute_credential_mac_legacy(
-    key: &[u8; 32],
-    credential: &StoredCtap2Credential,
-) -> Result<Vec<u8>> {
-    let mut mac = HmacSha256::new_from_slice(key).wrap_err("creating HMAC-SHA256")?;
-    mac.update(&(credential.id.len() as u64).to_be_bytes());
-    mac.update(&credential.id);
-    mac.update(&(credential.rp_id.len() as u64).to_be_bytes());
-    mac.update(credential.rp_id.as_bytes());
-    mac.update(&(credential.user_handle.len() as u64).to_be_bytes());
-    mac.update(&credential.user_handle);
-    mac.update(&credential.user_id.unwrap_or(0).to_be_bytes());
-    let user_name = credential.user_name.as_deref().unwrap_or("");
-    mac.update(&(user_name.len() as u64).to_be_bytes());
-    mac.update(user_name.as_bytes());
-    let display_name = credential.user_display_name.as_deref().unwrap_or("");
-    mac.update(&(display_name.len() as u64).to_be_bytes());
-    mac.update(display_name.as_bytes());
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
@@ -1132,7 +966,6 @@ mod tests {
             id: vec![1, 2, 3, 4],
             rp_id: "example.com".to_owned(),
             discoverable: true,
-            user_id: Some(1000),
             user_handle: vec![5, 6, 7, 8],
             user_name: Some("user".to_owned()),
             user_display_name: Some("Test User".to_owned()),
@@ -1141,7 +974,6 @@ mod tests {
                 public: vec![11, 12],
                 public_key_x: point_1().0,
                 public_key_y: point_1().1,
-                auth_value: None,
             },
             policy: Some(StoredPcrPolicy {
                 selection: "sha256:7".to_owned(),
@@ -1153,15 +985,17 @@ mod tests {
             }),
             recovery: Some(StoredRecoverySlot {
                 label: Some("backup".to_owned()),
-                passphrase_salt: vec![16; 32],
-                passphrase_hash: vec![17; 32],
-                kdf: RecoveryKdf::argon2id_default(),
+                last_used: None,
+                used_count: 0,
+                encrypted_auth: recovery::UnlockedRecovery::new("round trip test phrase")
+                    .unwrap()
+                    .encrypt(&[17; 32], b"round-trip")
+                    .unwrap(),
                 key: StoredTpmKey {
                     private: vec![18, 19],
                     public: vec![20, 21],
                     public_key_x: point_2().0,
                     public_key_y: point_2().1,
-                    auth_value: None,
                 },
             }),
             sign_count: 10,
@@ -1191,7 +1025,6 @@ mod tests {
             id: vec![1],
             rp_id: "first.example".to_owned(),
             discoverable: true,
-            user_id: Some(1000),
             user_handle: vec![1],
             user_name: None,
             user_display_name: None,
@@ -1200,7 +1033,6 @@ mod tests {
                 public: vec![2],
                 public_key_x: point_3().0,
                 public_key_y: point_3().1,
-                auth_value: None,
             },
             policy: None,
             recovery: None,
@@ -1211,7 +1043,6 @@ mod tests {
             id: vec![2],
             rp_id: "second.example".to_owned(),
             discoverable: true,
-            user_id: Some(1000),
             user_handle: vec![2],
             user_name: None,
             user_display_name: None,
@@ -1220,7 +1051,6 @@ mod tests {
                 public: vec![6],
                 public_key_x: point_4().0,
                 public_key_y: point_4().1,
-                auth_value: None,
             },
             policy: None,
             recovery: None,
@@ -1317,43 +1147,187 @@ mod tests {
     }
 
     #[test]
-    fn recovery_slot_update_replaces_private_blob_and_authorization_material() {
-        let dir = test_store_dir("update-recovery-slot");
+    fn recovery_rotation_is_atomic_and_stores_only_ciphertext() {
+        let dir = test_store_dir("encrypted-recovery");
+        let old = recovery::UnlockedRecovery::new("old recovery phrase").unwrap();
+        let old_config = old.configuration().unwrap();
+        let new = recovery::UnlockedRecovery::new("new recovery phrase").unwrap();
+        let new_config = new.configuration().unwrap();
+        let secret = [0xa5; 32];
         let mut credential = test_credential(vec![1], "example.com", 1);
+        let key = StoredTpmKey {
+            private: vec![3],
+            public: vec![4],
+            public_key_x: point_5().0,
+            public_key_y: point_5().1,
+        };
+        let aad = recovery::credential_aad(&credential.id, &key.public, b"policy-ref");
+        let old_encrypted = old.encrypt(&secret, &aad).unwrap();
         credential.recovery = Some(StoredRecoverySlot {
-            label: Some("recovery".to_owned()),
-            passphrase_salt: vec![1; 32],
-            passphrase_hash: vec![2; 32],
-            kdf: RecoveryKdf::argon2id_default(),
-            key: StoredTpmKey {
-                private: vec![3],
-                public: vec![4],
-                public_key_x: point_5().0,
-                public_key_y: point_5().1,
-                auth_value: Some(vec![2; 32]),
-            },
+            label: None,
+            key: key.clone(),
+            encrypted_auth: old_encrypted.clone(),
+            last_used: None,
+            used_count: 0,
         });
-        save_ctap2_credentials_to_dir(&dir, std::slice::from_ref(&credential))
-            .expect("save credential");
-
-        update_recovery_slot_in_dir(
+        save_ctap2_credentials_to_dir(
             &dir,
-            &credential.id,
-            &[7],
-            &[8; 32],
-            &[9; 32],
-            &RecoveryKdf::argon2id_default(),
+            &[
+                credential.clone(),
+                test_credential(vec![2], "example.com", 0),
+            ],
         )
-        .expect("update recovery slot");
+        .unwrap();
+        save_recovery_configuration(&dir, &old_config, &[]).unwrap();
+        let new_encrypted = new.encrypt(&secret, &aad).unwrap();
+        // Updating one valid slot followed by a missing slot must roll back both
+        // the first slot and the configuration change.
+        assert!(
+            save_recovery_configuration(
+                &dir,
+                &new_config,
+                &[
+                    (credential.id.clone(), new_encrypted.clone()),
+                    (vec![99], new_encrypted.clone()),
+                ]
+            )
+            .is_err()
+        );
+        assert_eq!(load_recovery_config(&dir).unwrap(), Some(old_config));
+        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
+        assert_eq!(
+            loaded[0].recovery.as_ref().unwrap().encrypted_auth,
+            old_encrypted
+        );
+        assert_eq!(loaded[0].recovery.as_ref().unwrap().last_used, None);
+        assert_eq!(loaded[0].recovery.as_ref().unwrap().used_count, 0);
+        let policy = StoredPcrPolicy {
+            selection: "sha256:7".into(),
+            digest: vec![9; 32],
+            policy_ref: Some(b"policy-ref".to_vec()),
+            authority_name: Some(vec![8]),
+            authority_signature: Some(vec![7]),
+            policy_version: 1,
+        };
+        let (last_used, used_count) =
+            update_ctap2_policy_in_dir(&dir, &credential.id, &policy).unwrap();
+        assert!(!last_used.is_empty());
+        assert_eq!(used_count, 1);
+        let (_, used_count) = update_ctap2_policy_in_dir(&dir, &credential.id, &policy).unwrap();
+        assert_eq!(used_count, 2);
+        // A primary-slot write must roll back if its recovery token is missing.
+        assert!(update_ctap2_policy_in_dir(&dir, &[2], &policy).is_err());
+        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
+        assert_eq!(loaded[1].policy, None);
+        // Normal assertions, full saves, and phrase rotation must not add uses
+        // or reset existing usage history.
+        update_ctap2_sign_count_in_dir(&dir, &credential.id, 3).unwrap();
+        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
+        save_ctap2_credentials_to_dir(&dir, &loaded).unwrap();
+        save_recovery_configuration(&dir, &new_config, &[(credential.id.clone(), new_encrypted)])
+            .unwrap();
+        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
+        let slot = loaded[0].recovery.as_ref().unwrap();
+        assert_eq!(slot.used_count, 2);
+        assert!(slot.last_used.is_some());
+        assert_eq!(slot.key, key);
+        assert!(
+            slot.unlock(&credential.id, b"policy-ref", "old recovery phrase")
+                .is_err()
+        );
+        assert_eq!(
+            slot.unlock(&credential.id, b"policy-ref", "new recovery phrase")
+                .unwrap()
+                .auth_value
+                .unwrap()
+                .as_slice(),
+            secret
+        );
+        assert_eq!(load_recovery_config(&dir).unwrap(), Some(new_config));
+        let serialized = tpm_key_to_blob(&slot.key);
+        let fields: ciborium::value::Value = ciborium::from_reader(serialized.as_slice()).unwrap();
+        let fields = fields.as_map().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert!(
+            fields
+                .iter()
+                .all(|(key, _)| key.as_text() != Some("auth_value"))
+        );
+        let database = fs::read(credentials_database_path_in_dir(&dir)).unwrap();
+        assert!(!database.windows(secret.len()).any(|bytes| bytes == secret));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
-        let loaded = load_ctap2_credentials_from_dir(&dir).expect("load credential");
-        let recovery = loaded[0].recovery.as_ref().expect("recovery slot");
-        assert_eq!(recovery.key.private, vec![7]);
-        assert_eq!(recovery.key.auth_value, Some(vec![9; 32]));
-        assert_eq!(recovery.passphrase_salt, vec![8; 32]);
-        assert_eq!(recovery.passphrase_hash, vec![9; 32]);
-        assert_eq!(recovery.kdf, RecoveryKdf::argon2id_default());
-        fs::remove_dir_all(&dir).expect("remove test store");
+    #[test]
+    fn encrypted_recovery_migration_discards_insecure_records() {
+        let dir = test_store_dir("legacy-recovery-migration");
+        fs::create_dir_all(&dir).unwrap();
+        block_on_store(async {
+            let options = SqliteConnectOptions::new()
+                .filename(credentials_database_path_in_dir(&dir))
+                .create_if_missing(true)
+                .foreign_keys(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await?;
+            let migrations = sqlx::migrate!("./migrations");
+            let old = sqlx::migrate::Migrator::with_migrations(
+                migrations
+                    .iter()
+                    .filter(|migration| migration.version < 20261028060000)
+                    .cloned()
+                    .collect(),
+            );
+            old.run(&pool).await?;
+            sqlx::raw_sql(
+                "INSERT INTO credential_metadata (credential_id, rp_id, user_handle, sign_count) \
+                 VALUES (X'01', 'legacy.example', X'02', 0); \
+                 INSERT INTO credential_keyslots (credential_id, slot_kind, tpm_key, public_key) \
+                 VALUES (X'01', 'recovery', X'03', 'legacy'); \
+                 INSERT INTO credential_tokens (keyslot_id, token_type, kdf_params) \
+                 VALUES (1, 'passphrase', 'plaintext-equivalent-secret'); \
+                 INSERT INTO daemon_config (key, value) VALUES ('daemon_passphrase', X'04'); \
+                 INSERT INTO daemon_config (key, value) VALUES ('default_pcr_policy', X'8107');",
+            )
+            .execute(&pool)
+            .await?;
+            migrations.run(&pool).await?;
+            for query in [
+                "SELECT count(*) FROM credential_metadata",
+                "SELECT count(*) FROM credential_keyslots",
+                "SELECT count(*) FROM credential_tokens",
+            ] {
+                let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await?;
+                assert_eq!(count, 0, "old secrets left: {query}");
+            }
+            let old_config: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM daemon_config WHERE key = 'daemon_passphrase'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(old_config, 0);
+            let owner_columns: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pragma_table_info('credential_metadata') WHERE name = 'user_id'",
+            ).fetch_one(&pool).await?;
+            assert_eq!(owner_columns, 0);
+            let owner_indexes: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('credential_metadata_user_id_idx', 'credential_metadata_owner_rp_discoverable_idx')",
+            ).fetch_one(&pool).await?;
+            assert_eq!(owner_indexes, 0);
+            let default_policy: Vec<u8> = sqlx::query_scalar(
+                "SELECT value FROM daemon_config WHERE key = 'default_pcr_policy'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(default_policy, vec![0x81, 7]);
+            // Migrations are recorded and can be safely checked again.
+            migrations.run(&pool).await?;
+            pool.close().await;
+            Ok(())
+        })
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1371,7 +1345,6 @@ mod tests {
             id,
             rp_id: rp_id.to_owned(),
             discoverable: true,
-            user_id: Some(1000),
             user_handle: vec![1, 2, 3, 4],
             user_name: None,
             user_display_name: None,
@@ -1380,7 +1353,6 @@ mod tests {
                 public: vec![6],
                 public_key_x: point_4().0,
                 public_key_y: point_4().1,
-                auth_value: None,
             },
             policy: None,
             recovery: None,

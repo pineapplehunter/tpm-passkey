@@ -11,6 +11,8 @@ pub enum ManagementRequest {
         old_passphrase: Option<String>,
         new_passphrase: String,
     },
+    #[serde(rename = "unlock-recovery")]
+    UnlockRecovery { passphrase: String },
     #[serde(rename = "update-pcr-reference")]
     UpdatePcrReference { passphrase: String },
     #[serde(rename = "update-pcr-policy")]
@@ -24,6 +26,25 @@ pub enum ManagementRequest {
     SetDefaultPcrPolicy { pcr_indices: Vec<u32> },
     #[serde(rename = "show-config")]
     ShowConfig,
+}
+
+impl Drop for ManagementRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match self {
+            Self::UpdatePassphrase {
+                old_passphrase,
+                new_passphrase,
+            } => {
+                old_passphrase.zeroize();
+                new_passphrase.zeroize();
+            }
+            Self::UnlockRecovery { passphrase }
+            | Self::UpdatePcrReference { passphrase }
+            | Self::UpdatePcrPolicy { passphrase, .. } => passphrase.zeroize(),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

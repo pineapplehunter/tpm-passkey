@@ -51,6 +51,18 @@
         };
 
         testScript = ''
+          import shlex
+
+          def check_token_usage(expected):
+              script = (
+                  'import sqlite3; '
+                  'db = sqlite3.connect("/var/lib/linux-tpm-fido2/credentials.sqlite"); '
+                  'rows = db.execute("SELECT used_count, last_used FROM credential_tokens").fetchall(); '
+                  f'assert rows and all(count == {expected} and ((used is None) == ({expected} == 0)) '
+                  'for count, used in rows), rows'
+              )
+              machine.succeed(f"python3 -c {shlex.quote(script)}")
+
           def login_alice():
               machine.send_key("ctrl-alt-f1")
               machine.wait_until_tty_matches("1", "login:")
@@ -181,6 +193,8 @@
           assert all(row[4] != "never" for row in rows), f"Missing last-used date: {output}"
           assert all(row[5] == "1,7" for row in rows), f"Missing bound PCR indices: {output}"
 
+          check_token_usage(0)  # Ordinary assertions do not use recovery tokens.
+
           # -- PCR update via update-pcr-reference (expect for passphrase) --
           machine.succeed("tpm2_pcrextend 7:sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
           machine.fail(
@@ -198,6 +212,8 @@
               + "login.example.test 'assert credential challenge'"
           )
 
+          check_token_usage(1)
+
           # -- Passphrase change via update-passphrase (expect for old+new) --
           mgmt_expect(
               "update-passphrase",
@@ -208,8 +224,22 @@
               'expect eof',
           )
 
-          # -- Old passphrase rejected, new passphrase works --
+          check_token_usage(1)  # Rewrapping does not count as token use.
+
+          # -- Old passphrase rejected even while enrollment is unlocked --
           machine.succeed("tpm2_pcrextend 7:sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+          machine.fail(
+              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              + "login.example.test 'assert credential challenge'"
+          )
+          rejected = mgmt_expect(
+              "update-pcr-reference",
+              'expect "Enter recovery passphrase: "; '
+              'send "test-recovery-passphrase\\r"; '
+              'expect eof',
+          )
+          assert any("error" in line.split() for line in rejected.splitlines()), rejected
+          check_token_usage(1)
           machine.fail(
               "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
               + "login.example.test 'assert credential challenge'"
@@ -224,6 +254,8 @@
               "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
               + "login.example.test 'assert credential challenge'"
           )
+
+          check_token_usage(2)
 
           # -- update-pcr-policy with --all (expect for passphrase) --
           machine.succeed("tpm2_pcrextend 7:sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
@@ -241,6 +273,8 @@
               "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
               + "login.example.test 'assert credential challenge'"
           )
+
+          check_token_usage(3)
 
           # -- regression check for reboot persistence --
           machine.shutdown()
@@ -260,6 +294,24 @@
               "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
               + "login.example.test 'assert credential challenge'"
           )
+
+          check_token_usage(4)
+
+          # Ordinary assertions work while recovery enrollment is locked. New
+          # recovery-enabled credentials require an explicit password unlock.
+          machine.succeed("mkdir -p /tmp/locked-enrollment")
+          register_after_restart = (
+              "python3 ${./tests/smoke_register.py} /tmp/locked-enrollment "
+              + "enrollment.example.test alice user-enrollment 'enrollment challenge' false"
+          )
+          machine.fail(register_after_restart)
+          mgmt_expect(
+              "config unlock-recovery",
+              'expect "Enter recovery passphrase: "; '
+              'send "new-recovery-passphrase\\r"; '
+              'expect eof',
+          )
+          machine.succeed(register_after_restart)
 
           # -- list-credentials after reboot --
           output = mgmt("list-credentials")

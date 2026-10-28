@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use argon2::{Algorithm, Argon2, Params, Version};
 use color_eyre::{
     Result,
     eyre::{WrapErr, eyre},
@@ -35,6 +34,7 @@ use tss_esapi::{
     tss2_esys::TPMT_TK_HASHCHECK,
     utils::{self, PublicKey},
 };
+use zeroize::Zeroizing;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PcrPolicyBinding {
     pub selection: String,
@@ -44,42 +44,22 @@ pub struct PcrPolicyBinding {
     pub authority_signature: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecoveryKdf {
-    Argon2id {
-        memory_kib: u32,
-        iterations: u32,
-        parallelism: u32,
-    },
-}
-
-impl RecoveryKdf {
-    pub const fn argon2id_default() -> Self {
-        Self::Argon2id {
-            memory_kib: 65_536,
-            iterations: 3,
-            parallelism: 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryMaterial {
-    pub label: Option<String>,
-    pub passphrase_salt: Vec<u8>,
-    pub passphrase_hash: Vec<u8>,
-    pub kdf: RecoveryKdf,
-    pub key: TpmCredential,
-    pub authority_name: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TpmCredential {
     pub private: Vec<u8>,
     pub public: Vec<u8>,
     pub public_key_x: Vec<u8>,
     pub public_key_y: Vec<u8>,
-    pub auth_value: Option<Vec<u8>>,
+    pub auth_value: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl std::fmt::Debug for TpmCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TpmCredential")
+            .field("has_authorization", &self.auth_value.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,11 +90,8 @@ pub fn public_name(public_blob: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn credential_policy_ref(credential_id: &[u8]) -> Vec<u8> {
-    let mut value = b"linux-tpm-fido2/pcr-policy/v1".to_vec();
+    let mut value = b"linux-tpm-fido2/pcr-policy/v2".to_vec();
     value.extend_from_slice(credential_id);
-    // Retain the v1 layout with the former owner field fixed to zero.
-    // Existing credentials continue to use their stored policyRef unchanged.
-    value.extend_from_slice(&0_u32.to_be_bytes());
     Sha256::digest(value).to_vec()
 }
 
@@ -194,36 +171,12 @@ impl Tpm {
         self.create_credential_key_with_auth(None)
     }
 
-    pub fn create_recovery_material(
-        &mut self,
-        label: Option<String>,
-        passphrase: &str,
-    ) -> Result<RecoveryMaterial> {
-        let mut passphrase_salt = vec![0u8; 32];
-        getrandom::fill(&mut passphrase_salt).wrap_err("generating recovery passphrase salt")?;
-        let kdf = RecoveryKdf::argon2id_default();
-        let passphrase_hash = recovery_passphrase_hash(&kdf, &passphrase_salt, passphrase)?;
-        self.create_recovery_material_with_hash(label, passphrase_salt, passphrase_hash, kdf)
-    }
-
-    pub fn create_recovery_material_with_hash(
-        &mut self,
-        label: Option<String>,
-        passphrase_salt: Vec<u8>,
-        passphrase_hash: Vec<u8>,
-        kdf: RecoveryKdf,
-    ) -> Result<RecoveryMaterial> {
-        let key = self.create_credential_key_with_auth(Some(&passphrase_hash))?;
-        let authority_name = public_name(&key.public)?;
-
-        Ok(RecoveryMaterial {
-            label,
-            passphrase_salt,
-            passphrase_hash,
-            kdf,
-            key,
-            authority_name,
-        })
+    /// A distinct TPM recovery authority with a random authorization value.
+    /// The caller must encrypt that value before persisting any recovery data.
+    pub fn create_recovery_key(&mut self) -> Result<TpmCredential> {
+        let mut auth = Zeroizing::new(vec![0; 32]);
+        getrandom::fill(&mut auth).wrap_err("generating TPM recovery authorization")?;
+        self.create_credential_key_with_auth(Some(&auth))
     }
 
     pub fn create_credential_key_with_policy(
@@ -273,7 +226,7 @@ impl Tpm {
                 .wrap_err("marshalling TPM credential public blob")?,
             public_key_x: x,
             public_key_y: y,
-            auth_value: auth_value.map(ToOwned::to_owned),
+            auth_value: auth_value.map(|value| Zeroizing::new(value.to_vec())),
         })
     }
 
@@ -340,7 +293,7 @@ impl Tpm {
             .execute_with_nullauth_session(|context| context.load(parent, private, public))?;
         if let Some(auth_value) = &authority.auth_value {
             self.context
-                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.clone())?)?;
+                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.as_slice())?)?;
         }
         let digest = Digest::try_from(to_sign)?;
         let validation = TPMT_TK_HASHCHECK {
@@ -388,7 +341,7 @@ impl Tpm {
         let authority_name_bytes = authority_name.value().to_vec();
         if let Some(auth_value) = &authority.auth_value {
             self.context
-                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.clone())?)?;
+                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.as_slice())?)?;
         }
         log::debug!(
             "create_authorized_policy: policy_digest={} hex={}, to_sign={} hex={}, policy_ref={} bytes, key_name={} bytes",
@@ -493,7 +446,7 @@ impl Tpm {
             .wrap_err("loading authority key for PCR update")?;
         if let Some(auth_value) = &authority.auth_value {
             self.context
-                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.clone())?)?;
+                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.as_slice())?)?;
         }
         let validation = TPMT_TK_HASHCHECK {
             tag: TPM2_ST_HASHCHECK,
@@ -658,10 +611,6 @@ impl Tpm {
             if actual_name.value() != authority_name.as_slice() {
                 color_eyre::eyre::bail!("recovery authority name does not match the credential");
             }
-            if let Some(auth_value) = &authority.auth_value {
-                self.context
-                    .tr_set_auth(authority_handle.into(), Auth::try_from(auth_value.clone())?)?;
-            }
             log::debug!(
                 "policy_authorize: approved_policy={} hex={}, policy_ref={} bytes, key_name={} bytes, key_name_hex={}",
                 approved_policy.len(),
@@ -773,47 +722,6 @@ impl Tpm {
             signature.signature_r().value(),
             signature.signature_s().value(),
         ))
-    }
-
-    pub fn change_key_auth(
-        &mut self,
-        credential: &TpmCredential,
-        new_auth_value: &[u8],
-    ) -> Result<TpmCredential> {
-        let parent = self.create_storage_parent()?;
-        let private =
-            Private::try_from(credential.private.clone()).wrap_err("building TPM private blob")?;
-        let public =
-            Public::unmarshall(&credential.public).wrap_err("unmarshalling TPM public blob")?;
-        let key_handle = self
-            .context
-            .execute_with_nullauth_session(|context| context.load(parent, private, public))
-            .wrap_err("loading TPM credential for auth change")?;
-
-        if let Some(auth_value) = &credential.auth_value {
-            self.context
-                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.clone())?)?;
-        }
-
-        let new_auth_data = new_auth_value.to_vec();
-        let tpm_new_auth = Auth::try_from(new_auth_data.clone())?;
-        let new_private = self
-            .context
-            .execute_with_session(Some(AuthSession::Password), |context| {
-                context.object_change_auth(key_handle.into(), parent.into(), tpm_new_auth)
-            })
-            .wrap_err("changing TPM credential authorization")?;
-
-        self.context.flush_context(key_handle.into())?;
-        self.context.flush_context(parent.into())?;
-
-        Ok(TpmCredential {
-            private: new_private.value().to_vec(),
-            public: credential.public.clone(),
-            public_key_x: credential.public_key_x.clone(),
-            public_key_y: credential.public_key_y.clone(),
-            auth_value: Some(new_auth_data),
-        })
     }
 
     pub fn current_pcr_digest(&mut self, selection_list: &PcrSelectionList) -> Result<Vec<u8>> {
@@ -988,43 +896,6 @@ fn default_pcr_selection(pcr_indices: Option<&[u32]>) -> Result<(PcrSelectionLis
     Ok((selection, name))
 }
 
-pub fn recovery_passphrase_hash(
-    kdf: &RecoveryKdf,
-    passphrase_salt: &[u8],
-    passphrase: &str,
-) -> Result<Vec<u8>> {
-    let mut output = vec![0u8; 32];
-    match kdf {
-        RecoveryKdf::Argon2id {
-            memory_kib,
-            iterations,
-            parallelism,
-        } => {
-            let params = Params::new(*memory_kib, *iterations, *parallelism, Some(output.len()))
-                .map_err(|error| {
-                    color_eyre::eyre::eyre!("building Argon2id recovery KDF parameters: {error:?}")
-                })?;
-            Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-                .hash_password_into(passphrase.as_bytes(), passphrase_salt, &mut output)
-                .map_err(|error| {
-                    color_eyre::eyre::eyre!(
-                        "deriving Argon2id recovery authorization value: {error:?}"
-                    )
-                })?;
-        }
-    }
-    Ok(output)
-}
-
-pub fn recovery_passphrase_matches(
-    kdf: &RecoveryKdf,
-    passphrase_salt: &[u8],
-    passphrase: &str,
-    expected_hash: &[u8],
-) -> Result<bool> {
-    Ok(recovery_passphrase_hash(kdf, passphrase_salt, passphrase)? == expected_hash)
-}
-
 fn ecdsa_der(r: &[u8], s: &[u8]) -> Vec<u8> {
     let r = der_integer(r);
     let s = der_integer(s);
@@ -1059,10 +930,7 @@ fn der_integer(value: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        RecoveryKdf, pcr_indices_from_selection, pcr_selection_for_indices,
-        recovery_passphrase_hash, recovery_passphrase_matches,
-    };
+    use super::{pcr_indices_from_selection, pcr_selection_for_indices};
 
     #[test]
     fn pcr_selection_validation_rejects_invalid_input() {
@@ -1080,59 +948,5 @@ mod tests {
         );
         assert!(pcr_indices_from_selection("sha1:7").is_err());
         assert!(pcr_indices_from_selection("sha256:").is_err());
-    }
-
-    #[test]
-    fn recovery_passphrase_hash_is_deterministic() {
-        let salt = b"0123456789abcdef0123456789abcdef";
-        let kdf = RecoveryKdf::argon2id_default();
-        let hash = recovery_passphrase_hash(&kdf, salt, "correct horse battery staple")
-            .expect("derive Argon2id hash");
-
-        assert_eq!(hash.len(), 32, "Argon2id output should be 32 bytes");
-        assert_eq!(
-            hash,
-            recovery_passphrase_hash(&kdf, salt, "correct horse battery staple")
-                .expect("derive Argon2id hash"),
-            "Argon2id should be deterministic with same salt and passphrase"
-        );
-        assert!(
-            recovery_passphrase_matches(&kdf, salt, "correct horse battery staple", &hash)
-                .expect("verify correct passphrase")
-        );
-        assert!(
-            !recovery_passphrase_matches(&kdf, salt, "wrong horse battery staple", &hash)
-                .expect("verify wrong passphrase")
-        );
-    }
-
-    #[test]
-    fn recovery_passphrase_hash_different_salt_gives_different_hash() {
-        let kdf = RecoveryKdf::argon2id_default();
-        let hash1 = recovery_passphrase_hash(&kdf, b"salt-one", "passphrase")
-            .expect("derive Argon2id hash");
-        let hash2 = recovery_passphrase_hash(&kdf, b"salt-two", "passphrase")
-            .expect("derive Argon2id hash");
-        assert_ne!(
-            hash1, hash2,
-            "different salts must produce different hashes"
-        );
-    }
-
-    #[test]
-    fn recovery_argon2id_rejects_wrong_passphrase() {
-        let kdf = RecoveryKdf::argon2id_default();
-        let salt = b"0123456789abcdef0123456789abcdef";
-        let hash = recovery_passphrase_hash(&kdf, salt, "correct horse battery staple")
-            .expect("derive Argon2id hash");
-
-        assert!(
-            recovery_passphrase_matches(&kdf, salt, "correct horse battery staple", &hash,)
-                .expect("verify correct passphrase")
-        );
-        assert!(
-            !recovery_passphrase_matches(&kdf, salt, "wrong passphrase", &hash)
-                .expect("verify wrong passphrase")
-        );
     }
 }

@@ -877,7 +877,7 @@ fn credential_management_requires_authentication_and_valid_subcommands() {
 }
 
 #[test]
-fn credential_management_update_preserves_user_id_and_removes_empty_names() {
+fn credential_management_update_preserves_user_handle_and_removes_empty_names() {
     let mut authenticator = authenticator_with_credential("example.com", vec![1, 2, 3]);
     let token = install_credential_management_token(&mut authenticator, Some("example.com"));
     let descriptor = credential_descriptor(vec![1, 2, 3]);
@@ -1353,7 +1353,125 @@ fn unsupported_policy_version_rejects_assertion() {
 }
 
 #[test]
-fn single_user_authenticator_loads_all_legacy_owners() {
+fn recovery_unlock_rotation_and_policy_updates_require_the_phrase() {
+    let mut authenticator = authenticator_with_credentials(
+        "example.com",
+        vec![
+            test_credential(vec![1], "example.com", 0),
+            test_credential(vec![2], "example.com", 0),
+        ],
+    );
+    authenticator
+        .set_recovery_passphrase(None, "first recovery phrase")
+        .unwrap();
+    let unlocked = authenticator.recovery_unlock.as_ref().unwrap();
+    let mut stored = store::load_ctap2_credentials_from_dir(&authenticator.store_dir).unwrap();
+    for credential in &mut stored {
+        let aad = recovery::credential_aad(&credential.id, &credential.key.public, b"policy-ref");
+        credential.recovery = Some(store::StoredRecoverySlot {
+            label: None,
+            last_used: None,
+            used_count: 0,
+            key: credential.key.clone(),
+            encrypted_auth: unlocked.encrypt(&[credential.id[0]; 32], &aad).unwrap(),
+        });
+        credential.policy = Some(store::StoredPcrPolicy {
+            selection: "sha256:7".to_owned(),
+            digest: vec![0; 32],
+            policy_ref: Some(b"policy-ref".to_vec()),
+            authority_name: Some(vec![1]),
+            authority_signature: Some(vec![2]),
+            policy_version: 1,
+        });
+    }
+    store::save_ctap2_credentials_to_dir(&authenticator.store_dir, &stored).unwrap();
+    let first_config = store::load_recovery_config(&authenticator.store_dir).unwrap();
+    assert!(
+        authenticator
+            .set_recovery_passphrase(Some("wrong"), "second recovery phrase")
+            .is_err()
+    );
+    assert_eq!(
+        store::load_recovery_config(&authenticator.store_dir).unwrap(),
+        first_config
+    );
+    authenticator
+        .handle_tpm_command(TpmCommand::SetRecoveryPassphrase {
+            old_passphrase: Some(Zeroizing::new("first recovery phrase".into())),
+            new_passphrase: Zeroizing::new("second recovery phrase".into()),
+        })
+        .unwrap();
+    for credential in store::load_ctap2_credentials_from_dir(&authenticator.store_dir).unwrap() {
+        let slot = credential.recovery.as_ref().unwrap();
+        assert_eq!(slot.used_count, 0);
+        assert_eq!(slot.last_used, None);
+        assert!(
+            slot.unlock(&credential.id, b"policy-ref", "first recovery phrase")
+                .is_err()
+        );
+        assert_eq!(
+            slot.unlock(&credential.id, b"policy-ref", "second recovery phrase")
+                .unwrap()
+                .auth_value
+                .unwrap()
+                .as_slice(),
+            [credential.id[0]; 32]
+        );
+    }
+    // A later registration save cannot restore old encrypted slots from memory.
+    authenticator.save_credentials();
+    let config = store::load_recovery_config(&authenticator.store_dir)
+        .unwrap()
+        .unwrap();
+    assert!(UnlockedRecovery::unlock(&config, "second recovery phrase").is_ok());
+    let mut restarted = Authenticator::new_with_approval(
+        authenticator.store_dir.clone(),
+        None,
+        Box::new(AlwaysApprove),
+    );
+    assert!(restarted.recovery_unlock.is_none());
+    assert!(
+        restarted
+            .handle_tpm_command(TpmCommand::UnlockRecovery {
+                passphrase: Zeroizing::new("wrong".into()),
+            })
+            .is_err()
+    );
+    assert!(restarted.recovery_unlock.is_none());
+    restarted
+        .handle_tpm_command(TpmCommand::UnlockRecovery {
+            passphrase: Zeroizing::new("second recovery phrase".into()),
+        })
+        .unwrap();
+    // Even with enrollment unlocked, policy updates must authenticate their own
+    // request phrase before touching a TPM.
+    let error = restarted
+        .handle_tpm_command(TpmCommand::PcrPolicyUpdate(PcrPolicyUpdateCommand {
+            credential_id: vec![1],
+            pcr_indices: vec![7],
+            passphrase: Zeroizing::new("wrong".into()),
+        }))
+        .unwrap_err();
+    assert!(error.to_string().contains("incorrect recovery passphrase"));
+    assert!(restarted.tpm.is_none());
+    let stored = store::load_ctap2_credentials_from_dir(&authenticator.store_dir).unwrap();
+    assert!(stored.iter().all(|credential| {
+        let slot = credential.recovery.as_ref().unwrap();
+        slot.used_count == 0 && slot.last_used.is_none()
+    }));
+    assert!(
+        restarted
+            .handle_tpm_command(TpmCommand::UnlockRecovery {
+                passphrase: Zeroizing::new("wrong".into()),
+            })
+            .is_err()
+    );
+    assert!(restarted.recovery_unlock.is_none());
+    std::fs::remove_dir_all(&authenticator.store_dir).unwrap();
+}
+
+#[test]
+fn single_user_authenticator_reloads_the_shared_namespace() {
     let original = authenticator_with_credentials(
         "example.com",
         vec![
@@ -1362,20 +1480,14 @@ fn single_user_authenticator_loads_all_legacy_owners() {
             test_credential(vec![3], "example.com", 0),
         ],
     );
-    let mut credentials =
+    let credentials =
         store::load_ctap2_credentials_from_dir(&original.store_dir).expect("load credentials");
-    for (credential, owner) in credentials.iter_mut().zip([Some(0), Some(u32::MAX), None]) {
-        credential.user_id = owner;
-    }
-    store::save_ctap2_credentials_to_dir(&original.store_dir, &credentials)
-        .expect("save legacy owner metadata");
 
     let authenticator =
         Authenticator::new_with_approval(original.store_dir.clone(), None, Box::new(AlwaysApprove));
     assert_eq!(authenticator.credentials.len(), 3);
     for (loaded, stored) in authenticator.credentials.iter().zip(&credentials) {
         assert_eq!(loaded.id, stored.id);
-        assert_eq!(loaded.user_id, stored.user_id);
     }
     let summaries = store::load_credential_summaries_from_dir(&original.store_dir)
         .expect("load all credential summaries");
@@ -1415,7 +1527,6 @@ fn authenticator_with_credentials(
             id: credential.id.clone(),
             rp_id: rp_id.to_owned(),
             discoverable: true,
-            user_id: Some(1000),
             user_handle: credential.user_handle.clone(),
             user_name: credential.user_name.clone(),
             user_display_name: credential.user_display_name.clone(),
@@ -1424,7 +1535,6 @@ fn authenticator_with_credentials(
                 public: credential.key.public.clone(),
                 public_key_x: credential.key.public_key_x.clone(),
                 public_key_y: credential.key.public_key_y.clone(),
-                auth_value: credential.key.auth_value.clone(),
             },
             policy: None,
             recovery: None,
@@ -1439,13 +1549,13 @@ fn authenticator_with_credentials(
         tpm_path: None,
         tpm: None,
         approval: Box::new(AlwaysApprove),
+        recovery_unlock: None,
         credentials: credentials
             .into_iter()
             .map(|credential| Credential {
                 id: credential.id,
                 rp_id: rp_id.to_owned(),
                 discoverable: true,
-                user_id: Some(1000),
                 user_handle: credential.user_handle,
                 user_name: credential.user_name,
                 user_display_name: credential.user_display_name,
