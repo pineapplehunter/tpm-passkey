@@ -1,5 +1,5 @@
 [package]
-name = "linux-tpm-fido2"
+name = "tpm-passkey"
 version = "0.1.0"
 edition = "2024"
 license = "GPL3"

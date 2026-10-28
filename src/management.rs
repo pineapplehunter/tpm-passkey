@@ -17,7 +17,7 @@ use crate::ctap2;
 
 /// Returns the well-known path for the management Unix socket.
 pub fn management_socket_path() -> PathBuf {
-    PathBuf::from("/run/linux-tpm-fido2/management.sock")
+    PathBuf::from("/run/tpm-passkey/management.sock")
 }
 
 fn recv_message(stream: &mut UnixStream) -> Result<Vec<u8>> {

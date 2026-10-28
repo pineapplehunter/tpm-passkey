@@ -90,7 +90,7 @@ pub fn public_name(public_blob: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn credential_policy_ref(credential_id: &[u8]) -> Vec<u8> {
-    let mut value = b"linux-tpm-fido2/pcr-policy/v2".to_vec();
+    let mut value = b"tpm-passkey/pcr-policy/v2".to_vec();
     value.extend_from_slice(credential_id);
     Sha256::digest(value).to_vec()
 }

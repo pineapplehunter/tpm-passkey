@@ -5,4 +5,6 @@ result*
 /target
 
 # development credential store
-/.linux-tpm-fido2-store
+/.tpm-passkey-store
+# Keep pre-rename development stores private too.
+/.linux-*-store

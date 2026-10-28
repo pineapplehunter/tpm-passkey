@@ -80,7 +80,7 @@ Use a credential-specific `policyRef`, for example:
 
 ```text
 R = Hash(
-    "linux-tpm-fido2/pcr-policy/v1"
+    "tpm-passkey/pcr-policy/v1"
     || credential_uuid
     || owner_uid
 )
@@ -127,7 +127,7 @@ A single `K_policy` per Linux user is reasonable. The consequence is that compro
 ### 4. Credential creation
 
 * [x] Generate a unique credential UUID before constructing the TPM policy. (finished 26-07-16)
-* [x] Derive the credential-specific `policyRef` — SHA-256("linux-tpm-fido2/pcr-policy/v1" || UUID || UID).
+* [x] Derive the credential-specific `policyRef` — SHA-256("tpm-passkey/pcr-policy/v1" || UUID || UID).
 * [x] Read and record the configured PCR selection ("sha256:7").
 * [x] Construct the initial `PolicyPCR` digest via trial session.
 * [x] Authorize the initial digest using `K_policy` — signs `SHA-256(pcrPolicyDigest || policyRef)` per TPM spec.
@@ -154,7 +154,7 @@ A single `K_policy` per Linux user is reasonable. The consequence is that compro
 * [x] Expose PCR updating through the CLI (`--update-pcr-policy` / `main.rs`).
 * [x] Require explicit user selection of the credentials to update — management commands require a hex credential ID; `--list-credentials` enumerates available IDs.
 * [x] Display the old and proposed PCR selections and digests — `--update-pcr-policy` prints both policy packages before persistence.
-* [x] Require the recovery passphrase (`LINUX_TPM_FIDO2_RECOVERY_PASSPHRASE` env var).
+* [x] Require the recovery passphrase (`TPM_PASSKEY_RECOVERY_PASSPHRASE` env var).
 * [ ] Revalidate the active user session before and after passphrase entry.
 * [x] Read the proposed PCR values directly from the TPM (`tpm.rs:update_authorized_policy`).
 * [x] Construct the new policy digest (`tpm.rs:update_authorized_policy`).

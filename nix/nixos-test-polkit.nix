@@ -8,7 +8,7 @@
     }:
     {
       checks.nixos-polkit = pkgs.testers.runNixOSTest {
-        name = "linux-tpm-fido2-polkit";
+        name = "tpm-passkey-polkit";
 
         nodes.machine = {
           imports = [ ./nixos-module.nix ];
@@ -20,19 +20,19 @@
             password = "alice";
           };
 
-          services.linux-tpm-fido2 = {
+          services.tpm-passkey = {
             enable = true;
             package = config.packages.default;
             tpmPath = "/dev/tpm0";
             uhidPath = "/dev/uhid";
           };
 
-          systemd.services.linux-tpm-fido2.wantedBy = lib.mkForce [ ];
-          systemd.services.linux-tpm-fido2.environment.RUST_LOG = "linux_tpm_fido2=debug,sqlx=warn,zbus=warn";
+          systemd.services.tpm-passkey.wantedBy = lib.mkForce [ ];
+          systemd.services.tpm-passkey.environment.RUST_LOG = "tpm_passkey=debug,sqlx=warn,zbus=warn";
 
           security.polkit.extraConfig = ''
             polkit.addRule(function(action, subject) {
-              if (action.id == "io.github.pineapplehunter.linux-tpm-fido2.approve"
+              if (action.id == "io.github.pineapplehunter.tpm-passkey.approve"
                   && subject.user == "alice") {
                 return polkit.Result.YES;
               }
@@ -56,7 +56,7 @@
           def check_token_usage(expected):
               script = (
                   'import sqlite3; '
-                  'db = sqlite3.connect("/var/lib/linux-tpm-fido2/credentials.sqlite"); '
+                  'db = sqlite3.connect("/var/lib/tpm-passkey/credentials.sqlite"); '
                   'rows = db.execute("SELECT used_count, last_used FROM credential_tokens").fetchall(); '
                   f'assert rows and all(count == {expected} and ((used is None) == ({expected} == 0)) '
                   'for count, used in rows), rows'
@@ -73,13 +73,13 @@
 
           def mgmt(cmd):
               """Run a no-password management subcommand."""
-              return machine.succeed(f"linux-tpm-fido2 {cmd}")
+              return machine.succeed(f"tpm-passkey {cmd}")
 
           def mgmt_expect(cmd, expect_script):
               """Run a management subcommand with an expect script for passphrase input."""
               full = (
                   f"expect -c '"
-                  f"spawn linux-tpm-fido2 {cmd}; "
+                  f"spawn tpm-passkey {cmd}; "
                   + expect_script
                   + "'"
               )
@@ -87,14 +87,14 @@
 
           machine.wait_for_unit("getty@tty1.service")
           login_alice()
-          machine.succeed("systemctl start linux-tpm-fido2")
-          machine.wait_for_unit("linux-tpm-fido2")
+          machine.succeed("systemctl start tpm-passkey")
+          machine.wait_for_unit("tpm-passkey")
 
           # -- fido2-manage subcommands (no PIN needed) --
           output = machine.succeed("fido2-manage -list")
           print("fido2-manage -list output:")
           print(output)
-          assert "FIDO2" in output or "1209" in output or "linux-tpm" in output.lower(), (
+          assert "FIDO2" in output or "1209" in output or "tpm-passkey" in output.lower(), (
               f"Expected device listing, got: {output}"
           )
 
@@ -133,28 +133,28 @@
           assert "default_pcr_policy\t1,7" in output, f"Unexpected output: {output}"
 
           # -- register and assert via polkit authorization --
-          machine.succeed("mkdir -p /tmp/linux-tpm-fido2-smoke")
+          machine.succeed("mkdir -p /tmp/tpm-passkey-smoke")
           ret_reg, output_reg = machine.execute(
-              "python3 ${./tests/smoke_register.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_register.py} /tmp/tpm-passkey-smoke "
               + "login.example.test alice user-123 'make credential challenge' false"
           )
           print("### registration stdout/stderr:")
           print("### " + output_reg.strip().replace("\n", "\n### "))
           if ret_reg != 0:
-              journal = machine.succeed("journalctl -u linux-tpm-fido2 --no-pager -n 50")
+              journal = machine.succeed("journalctl -u tpm-passkey --no-pager -n 50")
               print("### daemon journal after registration failure:")
               for line in journal.strip().split("\n"):
                   print("### " + line)
               raise Exception(f"Registration failed:\n{output_reg}")
 
           ret, output = machine.execute(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
           print("### assertion stdout/stderr:")
           print("### " + output.strip().replace("\n", "\n### "))
           if ret != 0:
-              journal = machine.succeed("journalctl -u linux-tpm-fido2 --no-pager -n 50")
+              journal = machine.succeed("journalctl -u tpm-passkey --no-pager -n 50")
               print("### daemon journal after assertion failure:")
               for line in journal.strip().split("\n"):
                   print("### " + line)
@@ -163,7 +163,7 @@
           # -- regression test for tpm session exhaustion --
           for _ in range(20):
             machine.succeed(
-                "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+                "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
                 + "login.example.test 'assert credential challenge'"
             )
 
@@ -174,7 +174,7 @@
           print("### CTAP compliance stdout/stderr:")
           print("### " + output.strip().replace("\n", "\n### "))
           if ret != 0:
-              journal = machine.succeed("journalctl -u linux-tpm-fido2 --no-pager -n 100")
+              journal = machine.succeed("journalctl -u tpm-passkey --no-pager -n 100")
               print("### daemon journal after CTAP compliance failure:")
               for line in journal.strip().split("\n"):
                   print("### " + line)
@@ -198,7 +198,7 @@
           # -- PCR update via update-pcr-reference (expect for passphrase) --
           machine.succeed("tpm2_pcrextend 7:sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
           machine.fail(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
           mgmt_expect(
@@ -208,7 +208,7 @@
               'expect eof',
           )
           machine.succeed(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
 
@@ -229,7 +229,7 @@
           # -- Old passphrase rejected even while enrollment is unlocked --
           machine.succeed("tpm2_pcrextend 7:sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
           machine.fail(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
           rejected = mgmt_expect(
@@ -241,7 +241,7 @@
           assert any("error" in line.split() for line in rejected.splitlines()), rejected
           check_token_usage(1)
           machine.fail(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
           mgmt_expect(
@@ -251,7 +251,7 @@
               'expect eof',
           )
           machine.succeed(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
 
@@ -260,7 +260,7 @@
           # -- update-pcr-policy with --all (expect for passphrase) --
           machine.succeed("tpm2_pcrextend 7:sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
           machine.fail(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
           mgmt_expect(
@@ -270,7 +270,7 @@
               'expect eof',
           )
           machine.succeed(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
 
@@ -280,8 +280,8 @@
           machine.shutdown()
           machine.wait_for_unit("getty@tty1.service")
           login_alice()
-          machine.succeed("systemctl start linux-tpm-fido2")
-          machine.wait_for_unit("linux-tpm-fido2")
+          machine.succeed("systemctl start tpm-passkey")
+          machine.wait_for_unit("tpm-passkey")
           # Re-sign PCR policy after reboot since the TPM state (and therefore
           # PCR values) may differ from the pre-reboot boot environment.
           mgmt_expect(
@@ -291,7 +291,7 @@
               'expect eof',
           )
           machine.succeed(
-              "python3 ${./tests/smoke_assert.py} /tmp/linux-tpm-fido2-smoke "
+              "python3 ${./tests/smoke_assert.py} /tmp/tpm-passkey-smoke "
               + "login.example.test 'assert credential challenge'"
           )
 
@@ -378,8 +378,8 @@
           )
 
           # -- reset is accepted only just after a new authenticator generation --
-          machine.succeed("systemctl restart linux-tpm-fido2")
-          machine.wait_for_unit("linux-tpm-fido2")
+          machine.succeed("systemctl restart tpm-passkey")
+          machine.wait_for_unit("tpm-passkey")
           reset_output = machine.succeed(
               "expect -c '"
               'spawn fido2-manage -reset -device 1; '

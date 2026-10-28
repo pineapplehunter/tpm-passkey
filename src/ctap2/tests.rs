@@ -1796,7 +1796,7 @@ fn test_store_dir(name: &str) -> PathBuf {
         .expect("system time after Unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "linux-tpm-fido2-ctap2-test-{name}-{}-{nonce}",
+        "tpm-passkey-ctap2-test-{name}-{}-{nonce}",
         std::process::id()
     ))
 }

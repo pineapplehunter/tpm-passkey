@@ -148,7 +148,7 @@ Recovery and PCR-policy migration are intentionally outside this implementation 
 - [x] Dev shell exports `SQLX_OFFLINE=true`.
 - [x] Holistic NixOS test boots a VM, starts the daemon, provisions a virtual TPM, completes register/assert, and verifies restart against the same SQLite store and TPM state.
 - [x] treefmt-nix is wired in for `nix fmt` with `nixfmt`, `rustfmt`, and `taplo`.
-- [x] Recovery slots can be generated during registration from `LINUX_TPM_FIDO2_RECOVERY_PASSPHRASE` and are persisted with the credential.
+- [x] Recovery slots can be generated during registration from `TPM_PASSKEY_RECOVERY_PASSPHRASE` and are persisted with the credential.
 - [x] CTAP2 request handling accepts empty `allowCredentials` for discoverable passkey flows and rejects malformed `clientDataHash` lengths early.
 - [x] SQLite storage now uses normalized metadata, keyslot, and token tables for CTAP2 credentials.
 - [x] Daemon/user-session model is now explicit: a system daemon routes approvals against the active graphical session and logs session identity at startup.
@@ -175,13 +175,13 @@ Recovery and PCR-policy migration are intentionally outside this implementation 
 - [x] Add HMAC-SHA256 integrity protection for credential metadata (2026-07-14 21:56).
 - [x] Add systemd-logind integration for dynamic session detection (2026-07-14 22:00).
 - [x] Add session verification before and after approval (2026-07-14 22:07).
-- [x] Add LINUX_TPM_FIDO2_AUTO_APPROVE env var for testing (2026-07-14 22:08).
-- [x] Add prominent warning when LINUX_TPM_FIDO2_AUTO_APPROVE is set (2026-07-14 22:11).
+- [x] Add TPM_PASSKEY_AUTO_APPROVE env var for testing (2026-07-14 22:08).
+- [x] Add prominent warning when TPM_PASSKEY_AUTO_APPROVE is set (2026-07-14 22:11).
 - [x] Implement polkit authorization in approval flow (2026-07-14 22:17).
 - [x] Refactor CTAP2 and CTAPHID command/error constants into enums (2026-07-14 22:26).
 - [x] Add NixOS module and update test to use it; reboot test verifies credential persistence (2026-07-14 22:30).
 - [x] Investigated virtualisation.tpm.enable — swtpm CUSE approach is correct for QEMU-less VM TPM provisioning.
-- [x] Bind UHID device to active sessions via uaccess in tpm-fido2.rules.
+- [x] Bind UHID device to active sessions via uaccess in tpm-passkey.rules.
 - [x] Remove dead Unix-socket IPC control surface (ipc.rs) — unused since GTK frontend removal (2026-07-14).
 - [x] Refactor NixOS test to use `virtualisation.tpm.enable` instead of manual swtpm CUSE (2026-07-14).
 - [x] Put auto-approve behind a compilation feature flag `auto-approve` (2026-07-14).

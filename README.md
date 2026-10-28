@@ -1,6 +1,6 @@
-# Linux TPM Fido2
+# tpm-passkey
 
-Linux TPM Fido2 is an experimental Linux TPM-backed FIDO2/WebAuthn authenticator.
+`tpm-passkey` is an experimental Linux TPM-backed FIDO2/WebAuthn authenticator.
 
 It exposes a browser-usable virtual HID authenticator, which uses the TPM for signing.
 Its goal is convenient, TPM-bound passkey storage on a single-user machine,
@@ -35,14 +35,24 @@ not to identify the caller or select credentials.
 Daemon:
 
 ```sh
-linux-tpm-fido2 daemon --store-dir .linux-tpm-fido2-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
+tpm-passkey daemon --store-dir .tpm-passkey-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
 ```
+
+The binary, Cargo package, Nix overlay package, and systemd unit are now named
+`tpm-passkey`; the NixOS option is `services.tpm-passkey`. The service stores state
+in `/var/lib/tpm-passkey` and exposes `/run/tpm-passkey/management.sock`.
+
+Existing state directories are **not moved automatically**. Stop the previously
+installed daemon before moving its complete state directory (database and
+supporting key files) to the new service path, preserving restrictive permissions.
+For development, `--store-dir` can point directly to an existing directory.
+The rename does not change existing keys, policies, or encrypted recovery formats.
 
 Management examples:
 
 ```sh
-linux-tpm-fido2 list-credentials
-linux-tpm-fido2 config show
+tpm-passkey list-credentials
+tpm-passkey config show
 ```
 
 `list-credentials` prints the base64 credential ID accepted by
@@ -61,10 +71,10 @@ access to the original TPM can use an unbound key regardless of boot state.
 Opt in before registering credentials that should be PCR-bound:
 
 ```sh
-linux-tpm-fido2 config set recovery-passphrase
-linux-tpm-fido2 config set default-pcr-policy 1 7
+tpm-passkey config set recovery-passphrase
+tpm-passkey config set default-pcr-policy 1 7
 # After a daemon restart, unlock before registering new PCR-bound credentials:
-linux-tpm-fido2 config unlock-recovery
+tpm-passkey config unlock-recovery
 ```
 
 A passphrase alone does **not** enable PCR binding. Enabling requires configured
@@ -75,7 +85,7 @@ never requires a recovery unlock, even when a phrase is configured.
 Disable binding for future registrations explicitly:
 
 ```sh
-linux-tpm-fido2 config set default-pcr-policy --disable
+tpm-passkey config set default-pcr-policy --disable
 ```
 
 These settings affect **future registrations only**. Existing credentials are

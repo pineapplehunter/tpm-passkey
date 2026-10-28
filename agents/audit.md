@@ -54,7 +54,7 @@ Store creation relies on the ambient umask:
 The development store inspected during this audit had these permissions:
 
 ```text
-755 .linux-tpm-fido2-store
+755 .tpm-passkey-store
 644 credentials.sqlite
 644 integrity.hmac-key
 ```

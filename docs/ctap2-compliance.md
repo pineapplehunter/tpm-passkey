@@ -1,6 +1,6 @@
 # CTAP 2.2 Compliance Notes
 
-This document is the maintained protocol checklist for `linux-tpm-fido2`. It is
+This document is the maintained protocol checklist for `tpm-passkey`. It is
 intended to prevent implementation work from relying on memory, comments, or
 client-library permissiveness.
 

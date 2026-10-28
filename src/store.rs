@@ -28,7 +28,7 @@ use crate::{
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub const DEV_STORE_DIR: &str = ".linux-tpm-fido2-store";
+pub const DEV_STORE_DIR: &str = ".tpm-passkey-store";
 const CREDENTIALS_DATABASE_FILE: &str = "credentials.sqlite";
 const HMAC_KEY_FILE: &str = "integrity.hmac-key";
 
@@ -1395,7 +1395,7 @@ mod tests {
             .expect("system time after Unix epoch")
             .as_nanos();
         env::temp_dir().join(format!(
-            "linux-tpm-fido2-store-test-{name}-{}-{nonce}",
+            "tpm-passkey-store-test-{name}-{}-{nonce}",
             std::process::id()
         ))
     }

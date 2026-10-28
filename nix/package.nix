@@ -36,13 +36,13 @@ rustPlatform.buildRustPackage {
   ];
 
   postPatch = ''
-    substituteInPlace assets/tpm-fido2.service \
+    substituteInPlace assets/tpm-passkey.service \
       --replace-fail "/usr/bin" "$out/bin"
   '';
 
   postInstall = ''
-    install -v -D -m 0644 assets/tpm-fido2.rules "$out/lib/udev/rules.d/99-tpm-fido2.rules"
-    install -v -D -m 0644 assets/tpm-fido2.service "$out/lib/systemd/system/tpm-fido2.service"
-    install -v -D -m 0644 assets/tpm-fido2.policy "$out/share/polkit-1/actions/tpm-fido2.policy"
+    install -v -D -m 0644 assets/tpm-passkey.rules "$out/lib/udev/rules.d/99-tpm-passkey.rules"
+    install -v -D -m 0644 assets/tpm-passkey.service "$out/lib/systemd/system/tpm-passkey.service"
+    install -v -D -m 0644 assets/tpm-passkey.policy "$out/share/polkit-1/actions/tpm-passkey.policy"
   '';
 }

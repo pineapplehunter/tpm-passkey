@@ -31,9 +31,9 @@ pub const FIDO_REPORT_DESCRIPTOR: &[u8] = &[
 
 pub fn create_params() -> CreateParams {
     CreateParams {
-        name: "Linux TPM FIDO2".to_owned(),
-        phys: "linux-tpm-fido2/uhid".to_owned(),
-        uniq: "linux-tpm-fido2-dev".to_owned(),
+        name: "tpm-passkey".to_owned(),
+        phys: "tpm-passkey/uhid".to_owned(),
+        uniq: "tpm-passkey-dev".to_owned(),
         bus: Bus::USB,
         vendor: VENDOR_ID,
         product: PRODUCT_ID,

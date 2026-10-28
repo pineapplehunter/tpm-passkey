@@ -8,7 +8,7 @@
     }:
     {
       checks.nixos-pcr = pkgs.testers.runNixOSTest {
-        name = "linux-tpm-fido2-optional-pcr";
+        name = "tpm-passkey-optional-pcr";
         nodes.machine = {
           imports = [ ./nixos-module.nix ];
           virtualisation.tpm.enable = true;
@@ -16,15 +16,15 @@
             isNormalUser = true;
             password = "alice";
           };
-          services.linux-tpm-fido2 = {
+          services.tpm-passkey = {
             enable = true;
             package = config.packages.default;
             tpmPath = "/dev/tpm0";
           };
-          systemd.services.linux-tpm-fido2.wantedBy = lib.mkForce [ ];
+          systemd.services.tpm-passkey.wantedBy = lib.mkForce [ ];
           security.polkit.extraConfig = ''
             polkit.addRule(function(action, subject) {
-              if (action.id == "io.github.pineapplehunter.linux-tpm-fido2.approve"
+              if (action.id == "io.github.pineapplehunter.tpm-passkey.approve"
                   && subject.user == "alice") {
                 return polkit.Result.YES;
               }
@@ -46,12 +46,12 @@
           machine.wait_until_tty_matches("1", "Password:")
           machine.send_chars("alice\n")
           machine.wait_until_tty_matches("1", "alice@")
-          machine.succeed("systemctl start linux-tpm-fido2")
-          machine.wait_for_unit("linux-tpm-fido2")
+          machine.succeed("systemctl start tpm-passkey")
+          machine.wait_for_unit("tpm-passkey")
           try:
               machine.succeed("python3 ${./tests/pcr_binding.py}", timeout=180)
           except Exception:
-              print(machine.succeed("journalctl -u linux-tpm-fido2 --no-pager -n 100"))
+              print(machine.succeed("journalctl -u tpm-passkey --no-pager -n 100"))
               raise
         '';
       };

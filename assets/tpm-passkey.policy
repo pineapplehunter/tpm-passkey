@@ -4,11 +4,11 @@
  "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
 
 <policyconfig>
-  <vendor>io.github.pineapplehunter.linux-tpm-fido2</vendor>
-  <vendor_url>https://github.com/pineapplehunter/linux-tpm-fido2</vendor_url>
+  <vendor>io.github.pineapplehunter.tpm-passkey</vendor>
+  <vendor_url>https://github.com/pineapplehunter/tpm-passkey</vendor_url>
   <icon_name>security-high-symbolic</icon_name>
 
-  <action id="io.github.pineapplehunter.linux-tpm-fido2.approve">
+  <action id="io.github.pineapplehunter.tpm-passkey.approve">
     <description>Use a TPM-backed passkey</description>
     <message>Authentication is required to use a TPM-backed passkey.</message>
 

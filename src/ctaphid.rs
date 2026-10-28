@@ -788,10 +788,8 @@ mod tests {
 
     #[test]
     fn cbor_processing_emits_keepalive_and_cancel_has_no_direct_response() {
-        let store_dir = std::env::temp_dir().join(format!(
-            "linux-tpm-fido2-ctaphid-cancel-{}",
-            std::process::id()
-        ));
+        let store_dir =
+            std::env::temp_dir().join(format!("tpm-passkey-ctaphid-cancel-{}", std::process::id()));
         let mut handler =
             PacketHandler::new_with_user_approval(store_dir.clone(), None, Box::new(SlowApproval));
         let cid = allocate_channel(&mut handler);

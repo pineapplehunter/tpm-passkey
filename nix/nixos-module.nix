@@ -11,13 +11,13 @@ let
     mkEnableOption
     mkOption
     ;
-  cfg = config.services.linux-tpm-fido2;
+  cfg = config.services.tpm-passkey;
 in
 {
-  options.services.linux-tpm-fido2 = {
+  options.services.tpm-passkey = {
     enable = mkEnableOption "TPM-backed FIDO2 authenticator daemon";
 
-    package = lib.mkPackageOption pkgs "linux-tpm-fido2" { };
+    package = lib.mkPackageOption pkgs "tpm-passkey" { };
 
     tpmPath = mkOption {
       type = types.str;
@@ -39,7 +39,7 @@ in
 
     security.polkit.enable = true;
 
-    systemd.services.linux-tpm-fido2 = {
+    systemd.services.tpm-passkey = {
       description = "TPM-backed FIDO2 authenticator";
       after = [
         "systemd-logind.service"
@@ -59,7 +59,7 @@ in
       path = [ cfg.package ];
 
       script = ''
-        exec linux-tpm-fido2 daemon --store-dir /var/lib/linux-tpm-fido2 --tpm-path "${cfg.tpmPath}" --uhid-path "${cfg.uhidPath}"
+        exec tpm-passkey daemon --store-dir /var/lib/tpm-passkey --tpm-path "${cfg.tpmPath}" --uhid-path "${cfg.uhidPath}"
       '';
 
       serviceConfig = {
@@ -70,9 +70,9 @@ in
         ProtectSystem = "strict";
         Restart = "on-failure";
         RestartSec = 2;
-        RuntimeDirectory = "linux-tpm-fido2";
+        RuntimeDirectory = "tpm-passkey";
         RuntimeDirectoryMode = "0700";
-        StateDirectory = "linux-tpm-fido2";
+        StateDirectory = "tpm-passkey";
         StateDirectoryMode = "0700";
         Type = "simple";
       };

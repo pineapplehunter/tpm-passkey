@@ -7,7 +7,7 @@ use zbus::zvariant::Value;
 const POLKIT_AUTHORITY: &str = "org.freedesktop.PolicyKit1";
 const POLKIT_AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
 const POLKIT_AUTHORITY_IFACE: &str = "org.freedesktop.PolicyKit1.Authority";
-const POLKIT_ACTION_ID: &str = "io.github.pineapplehunter.linux-tpm-fido2.approve";
+const POLKIT_ACTION_ID: &str = "io.github.pineapplehunter.tpm-passkey.approve";
 
 /// Request approval through the desktop's polkit agent.
 ///

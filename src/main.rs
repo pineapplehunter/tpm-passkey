@@ -8,8 +8,8 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail, eyre},
 };
-use linux_tpm_fido2::{ctaphid, hid, management, store, tpm};
 use rpassword::prompt_password;
+use tpm_passkey::{ctaphid, hid, management, store, tpm};
 use uhid_virt::{OutputEvent, StreamError, UHIDDevice};
 
 #[derive(Debug, Parser)]
@@ -141,7 +141,7 @@ fn absolute_path(path: &PathBuf) -> PathBuf {
 fn run_daemon(args: DaemonArgs) -> Result<()> {
     let store_dir = absolute_path(&args.store_dir);
 
-    log::info!("linux-tpm-fido2 starting");
+    log::info!("tpm-passkey starting");
     log::info!("uhid path: {}", args.uhid_path.display());
     log::info!("tpm path: {}", args.tpm_path.display());
     log::info!("dev store: {}", store_dir.display());
@@ -171,8 +171,8 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
     let mgmt_stop = Arc::new(AtomicBool::new(false));
     let mgmt_store_dir = store_dir.clone();
     let (tpm_cmd_tx, tpm_cmd_rx) = mpsc::channel::<(
-        linux_tpm_fido2::ctap2::TpmCommand,
-        mpsc::Sender<linux_tpm_fido2::ctap2::TpmCmdResult>,
+        tpm_passkey::ctap2::TpmCommand,
+        mpsc::Sender<tpm_passkey::ctap2::TpmCmdResult>,
     )>();
     let _mgmt_handle = {
         let stop = mgmt_stop.clone();
@@ -524,7 +524,7 @@ mod tests {
     #[test]
     fn config_command_uses_show_and_nested_set_hierarchy() {
         let show =
-            Cli::try_parse_from(["linux-tpm-fido2", "config", "show"]).expect("parse config show");
+            Cli::try_parse_from(["tpm-passkey", "config", "show"]).expect("parse config show");
         assert!(matches!(
             show.command,
             Command::Config(ConfigArgs {
@@ -533,7 +533,7 @@ mod tests {
         ));
 
         let set = Cli::try_parse_from([
-            "linux-tpm-fido2",
+            "tpm-passkey",
             "config",
             "set",
             "default-pcr-policy",
@@ -552,9 +552,8 @@ mod tests {
         };
         assert_eq!(args.pcr_indices, vec![1, 7]);
 
-        let recovery =
-            Cli::try_parse_from(["linux-tpm-fido2", "config", "set", "recovery-passphrase"])
-                .expect("parse recovery passphrase setting");
+        let recovery = Cli::try_parse_from(["tpm-passkey", "config", "set", "recovery-passphrase"])
+            .expect("parse recovery passphrase setting");
         assert!(matches!(
             recovery.command,
             Command::Config(ConfigArgs {
@@ -564,13 +563,13 @@ mod tests {
             })
         ));
 
-        assert!(Cli::try_parse_from(["linux-tpm-fido2", "set-default-pcr-policy", "7"]).is_err());
+        assert!(Cli::try_parse_from(["tpm-passkey", "set-default-pcr-policy", "7"]).is_err());
     }
 
     #[test]
     fn pcr_disable_is_explicit_and_config_output_distinguishes_no_binding() {
         let cli = Cli::try_parse_from([
-            "linux-tpm-fido2",
+            "tpm-passkey",
             "config",
             "set",
             "default-pcr-policy",
@@ -589,12 +588,11 @@ mod tests {
         assert!(args.disable);
         assert!(args.pcr_indices.is_empty());
         assert!(
-            Cli::try_parse_from(["linux-tpm-fido2", "config", "set", "default-pcr-policy",])
-                .is_err()
+            Cli::try_parse_from(["tpm-passkey", "config", "set", "default-pcr-policy",]).is_err()
         );
         assert!(
             Cli::try_parse_from([
-                "linux-tpm-fido2",
+                "tpm-passkey",
                 "config",
                 "set",
                 "default-pcr-policy",

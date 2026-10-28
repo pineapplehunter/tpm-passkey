@@ -1,1 +1,0 @@
-SUBSYSTEM=="hidraw", ATTRS{uniq}=="linux-tpm-fido2-*", TAG+="uaccess"

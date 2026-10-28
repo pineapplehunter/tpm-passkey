@@ -38,7 +38,7 @@ Response format:
 ## Subcommands
 
 ```
-linux-tpm-fido2 <SUBCOMMAND> [options]
+tpm-passkey <SUBCOMMAND> [options]
 
 Subcommands (connect to daemon via Unix socket):
   list-credentials       Print credential ID, RP ID, and user name for each

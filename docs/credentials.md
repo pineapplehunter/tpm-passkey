@@ -18,8 +18,8 @@ registrations if old recovery material may have been exposed.
 
 ## Files and schema
 
-The default store is `.linux-tpm-fido2-store/`, overridden by `daemon --store-dir`.
-The NixOS service uses `/var/lib/linux-tpm-fido2`. The directory contains:
+The default store is `.tpm-passkey-store/`, overridden by `daemon --store-dir`.
+The NixOS service uses `/var/lib/tpm-passkey`. The directory contains:
 
 - `credentials.sqlite`: metadata, TPM object blobs, policies, encrypted recovery
   authorization values, Client PIN state, and daemon configuration.
@@ -117,8 +117,8 @@ authorization secret and each encryption has an independent nonce.
 Configure recovery before creating credentials that need it:
 
 ```sh
-linux-tpm-fido2 config set recovery-passphrase
-linux-tpm-fido2 config set default-pcr-policy 1 7
+tpm-passkey config set recovery-passphrase
+tpm-passkey config set default-pcr-policy 1 7
 ```
 
 This retains a zeroizing wrapping key only in the authenticator worker's memory
@@ -126,7 +126,7 @@ for creating PCR-bound credentials. After a daemon restart, only PCR-bound
 enrollment is locked. Unbound enrollment is unaffected. Unlock explicitly with:
 
 ```sh
-linux-tpm-fido2 config unlock-recovery
+tpm-passkey config unlock-recovery
 ```
 
 While PCR binding is configured but recovery is missing or locked, registration

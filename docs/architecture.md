@@ -2,7 +2,7 @@
 
 ## Overview
 
-`linux-tpm-fido2` is a blocking system daemon that exposes a virtual FIDO2
+`tpm-passkey` is a blocking system daemon that exposes a virtual FIDO2
 authenticator through Linux UHID. The daemon owns the CTAPHID channels, CTAP2
 state machines, TPM context, one single-user credential store, and transaction
 approval flow. Multi-user isolation and session-switch handling are unsupported.
@@ -118,7 +118,7 @@ Logs use consistent `key=value` context and avoid raw CTAP payloads:
 For focused diagnostics, use:
 
 ```sh
-RUST_LOG=linux_tpm_fido2=debug,sqlx=warn,zbus=warn
+RUST_LOG=tpm_passkey=debug,sqlx=warn,zbus=warn
 ```
 
 ## Testing Layers

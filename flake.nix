@@ -40,7 +40,7 @@
           packages.default = pkgs.callPackage ./nix/package.nix { };
 
           overlayAttrs = {
-            linux-tpm-fido2 = config.packages.default;
+            tpm-passkey = config.packages.default;
           };
 
           treefmt = {

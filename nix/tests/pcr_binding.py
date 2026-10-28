@@ -12,8 +12,8 @@ from fido2.ctap2 import Ctap2
 from fido2.hid import CtapHidDevice
 
 PHRASE = "optional PCR recovery test phrase"
-STORE = "/var/lib/linux-tpm-fido2/credentials.sqlite"
-SOCKET = "/run/linux-tpm-fido2/management.sock"
+STORE = "/var/lib/tpm-passkey/credentials.sqlite"
+SOCKET = "/run/tpm-passkey/management.sock"
 
 
 def management(command, params=None, ok=True):
@@ -110,7 +110,7 @@ def extend_pcr(digit):
 
 
 def restart():
-    subprocess.run(["systemctl", "restart", "linux-tpm-fido2"], check=True)
+    subprocess.run(["systemctl", "restart", "tpm-passkey"], check=True)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         try:
@@ -133,7 +133,7 @@ config = management("show-config")
 assert config["default_pcr_policy"] is None
 assert not config["recovery_passphrase_configured"]
 assert "default_pcr_policy\tnone" in subprocess.check_output(
-    ["linux-tpm-fido2", "config", "show"], text=True
+    ["tpm-passkey", "config", "show"], text=True
 )
 a = register("default-unbound")
 unbound(a)
@@ -182,7 +182,7 @@ assert c_approved[4] != c_before_recovery[4]
 assert c_approved[5:] == c_before_recovery[5:]  # Same registered key/blobs.
 
 subprocess.run(
-    ["linux-tpm-fido2", "config", "set", "default-pcr-policy", "--disable"], check=True
+    ["tpm-passkey", "config", "set", "default-pcr-policy", "--disable"], check=True
 )
 assert management("show-config")["default_pcr_policy"] is None
 assert snapshot(c) == c_approved  # Disabling cannot relax an existing policy.

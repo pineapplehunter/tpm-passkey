@@ -1,12 +1,12 @@
 # Security Model
 
-This document defines the threat model, security objectives, assumptions, and known limitations of `linux-tpm-fido2`.
+This document defines the threat model, security objectives, assumptions, and known limitations of `tpm-passkey`.
 
 The project is experimental. Unless explicitly identified as an implemented property, the requirements described in this document represent design objectives rather than verified security guarantees.
 
 ## System Model
 
-`linux-tpm-fido2` implements a virtual CTAP2 authenticator using the Linux UHID subsystem. A privileged daemon processes CTAPHID and CTAP2 requests, stores credential records in a local database, and delegates credential private-key operations to a TPM 2.0 device.
+`tpm-passkey` implements a virtual CTAP2 authenticator using the Linux UHID subsystem. A privileged daemon processes CTAPHID and CTAP2 requests, stores credential records in a local database, and delegates credential private-key operations to a TPM 2.0 device.
 
 The daemon assumes a single-user machine. One daemon instance and credential
 store serve one user, with no per-user namespaces, caller-UID checks, or
@@ -18,7 +18,7 @@ Desktop authentication is requested through polkit.
 
 * **Relying Party (RP):** The remote service that registers a credential and verifies authentication assertions.
 * **Client:** The browser or other CTAP client that communicates with the virtual authenticator.
-* **Daemon:** The privileged `linux-tpm-fido2` process that implements the virtual authenticator.
+* **Daemon:** The privileged `tpm-passkey` process that implements the virtual authenticator.
 * **TPM:** The TPM 2.0 device that generates, protects, and uses credential private keys.
 * **Credential Store:** The persistent database containing TPM object blobs, public-key material, credential metadata, policy information, and signature counters.
 * **Session Manager:** `systemd-logind`, used only to find a desktop subject for routing polkit prompts, not to attribute requests or authorize credential access.
