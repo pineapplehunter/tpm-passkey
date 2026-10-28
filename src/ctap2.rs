@@ -359,10 +359,9 @@ impl Authenticator {
         let params = map_array(&request, 4).ok_or(ErrorStatus::MissingParameter)?;
         validate_pub_key_cred_params(params)?;
         let exclude_list = optional_array(&request, 5)?;
-        let extensions = optional_map(&request, 6)?;
-        validate_cred_props_extension(extensions)?;
-        let cred_props_requested =
-            extensions.is_some_and(|extensions| map_bool(extensions, "credProps") == Some(true));
+        // No authenticator extensions are implemented. Unknown inputs, including
+        // the client-only credProps extension, must not produce signed outputs.
+        let _extensions = optional_map(&request, 6)?;
         validate_attestation_formats(optional_array(&request, 11)?)?;
         if map_value(&request, 10).is_some() {
             return Err(ErrorStatus::InvalidParameter);
@@ -520,13 +519,12 @@ impl Authenticator {
         };
         let public_key = cose_credential_public_key(&key);
 
-        let extensions = cred_props_requested.then(|| cred_props_extension(discoverable));
         let auth_data = make_auth_data(
             rp_id,
             0x41 | if user_verified { 0x04 } else { 0 },
             0,
             Some((&credential_id, &public_key)),
-            extensions.as_ref(),
+            None,
         );
         let previous_credentials = self.credentials.clone();
         if let Some(index) = replacement_index {
@@ -1737,7 +1735,6 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
     encode_response(
         cbor!({
             1 => ["FIDO_2_1", "FIDO_2_0"],
-            2 => ["credProps"],
             3 => byte_string(AAGUID.to_vec()),
             4 => {
                 "plat" => false,
@@ -2117,18 +2114,6 @@ fn validate_credential_descriptor_list(
         }
     }
 
-    Ok(())
-}
-
-fn validate_cred_props_extension(extensions: Option<&[(Value, Value)]>) -> Result<(), ErrorStatus> {
-    let Some(extensions) = extensions else {
-        return Ok(());
-    };
-    if let Some(value) = map_value(extensions, "credProps")
-        && value.as_bool().is_none()
-    {
-        return Err(ErrorStatus::InvalidCbor);
-    }
     Ok(())
 }
 

@@ -32,10 +32,6 @@ pub(super) fn make_auth_data(
     auth_data
 }
 
-pub(super) fn cred_props_extension(discoverable: bool) -> Value {
-    cbor!({ "credProps" => { "rk" => discoverable } }).expect("credProps extension")
-}
-
 pub(super) fn cose_credential_public_key(key: &tpm::TpmCredential) -> Value {
     cose_public_key_coordinates(key.public_key_x.clone(), key.public_key_y.clone())
 }

@@ -25,10 +25,7 @@ fn get_info_uses_project_aaguid_and_algorithm_metadata() {
         map_value(&map, 6),
         Some(&cbor!([2, 1]).expect("protocol list"))
     );
-    assert_eq!(
-        map_value(&map, 2),
-        Some(&cbor!(["credProps"]).expect("extension list"))
-    );
+    assert!(map_value(&map, 2).is_none(), "no authenticator extensions");
 }
 
 #[test]
@@ -83,6 +80,36 @@ fn pin_capabilities_follow_configuration_without_claiming_builtin_uv() {
         assert_eq!(map_bool(options, "pinUvAuthToken"), Some(configured));
         assert!(map_value(options, "uv").is_none());
     }
+}
+
+#[test]
+fn client_only_and_unknown_extension_inputs_are_ignored() {
+    let dir = test_store_dir("client-only-extensions");
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut auth = Authenticator::new_with_approval(
+        dir.clone(),
+        None,
+        Box::new(CountingApproval(count.clone())),
+    );
+    let request = ctap_request(
+        Ctap2Command::MakeCredential,
+        cbor!({
+            1 => bytes([0; 32]), 2 => {"id" => "example.test"},
+            3 => {"id" => bytes([1])}, 4 => [{"type" => "public-key", "alg" => -7}],
+            6 => {"credProps" => "client-only", "unknown-extension" => {"arbitrary" => 7}},
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        auth.handle_cbor(&request),
+        vec![u8::from(ErrorStatus::OperationDenied)]
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "inputs passed validation and reached TPM setup"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -193,7 +220,7 @@ fn make_auth_data_sets_extension_flag_when_extensions_are_present() {
             &[1, 2, 3, 4],
             &cose_public_key_coordinates(vec![5; 32], vec![6; 32]),
         )),
-        Some(&cred_props_extension(true)),
+        Some(&cbor!({"test-extension" => true}).unwrap()),
     );
 
     assert_ne!(auth_data[32] & 0x80, 0);

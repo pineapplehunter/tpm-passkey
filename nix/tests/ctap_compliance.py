@@ -67,7 +67,7 @@ def main():
     assert info.max_msg_size >= 1024
     assert info.pin_uv_protocols == [2, 1]
     assert "usb" in info.transports
-    assert "credProps" in info.extensions
+    assert not info.extensions
     assert info.options.get("rk") is True
     assert info.options.get("up") is True
     assert "uv" not in info.options
@@ -125,7 +125,9 @@ def main():
         assert credential is not None
         assert len(credential.aaguid) == 16
         assert isinstance(credential.public_key, ES256)
-        assert auth_data.extensions == {"credProps": {"rk": True}}
+        # credProps is client-only and must not be signed by the authenticator.
+        assert not auth_data.flags & AuthenticatorData.FLAG.ED
+        assert auth_data.extensions is None
 
     # excludeList must reject a credential already registered for this RP.
     descriptor = {"type": "public-key", "id": credentials[0].credential_id}

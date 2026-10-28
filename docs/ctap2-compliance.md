@@ -30,8 +30,8 @@ match this checklist.
 This is an ongoing audit, **not a full conformance claim**. Section completion
 markers describe scoped wire/behavior checks, not certification or security
 assurance. Known remaining gaps include TPM-equivalent protection of PIN state,
-bounded/cancellable host approval, and incorrectly treating client-only
-`credProps` as an authenticator extension. These require follow-up work.
+bounded/cancellable host approval, and fail-closed persistent-state loading.
+These require follow-up work.
 
 ## Common Rules
 
@@ -162,6 +162,11 @@ Normative behavior retained here:
   returns `PIN_NOT_SET` or `PIN_INVALID`.
 - User presence consumes cached UP, UV, and all token permissions except `lbw`.
 
+No authenticator extensions are implemented. Unknown extension inputs are
+ignored without producing signed outputs. In particular, `credProps` is a
+[WebAuthn client registration extension](https://www.w3.org/TR/webauthn-3/#sctn-authenticator-credential-properties-extension),
+with no authenticator input, processing, or output (§10.1.3).
+
 Audit status: **complete for implemented algorithms and extensions**.
 
 ## `authenticatorGetAssertion` (`0x02`)
@@ -204,7 +209,7 @@ Normative section: 6.4. The command has no input parameters. Current advertised
 members are:
 
 - versions: `FIDO_2_1`, then `FIDO_2_0`;
-- extension: `credProps`;
+- no authenticator extensions (the extensions list is omitted);
 - the project AAGUID (16 bytes);
 - options: `plat=false`, `rk=true`, `up=true`, `clientPin` and `pinUvAuthToken`
   reflecting whether a PIN is configured, `credMgmt=true`, and
@@ -320,9 +325,8 @@ Audit status: **complete**.
 
 ## Remaining Audit Order
 
-1. Remove client-only `credProps` from authenticator capabilities/outputs.
-2. Fail closed when persisted PIN state cannot be loaded.
-3. Make host approval bounded and promptly cancellable, including logind lookup.
-4. Protect PIN verifier/retry state with assurances matching TPM private keys.
-5. Revisit remaining request-type/status and feature-table claims against the
+1. Fail closed when persisted PIN state cannot be loaded.
+2. Make host approval bounded and promptly cancellable, including logind lookup.
+3. Protect PIN verifier/retry state with assurances matching TPM private keys.
+4. Revisit remaining request-type/status and feature-table claims against the
    normative source; rerun browser-critical VM flows after each logical group.
