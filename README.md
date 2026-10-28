@@ -123,6 +123,12 @@ Useful flags:
 The maintained CTAP 2.2 wire-format checklist and audit status are in
 [`docs/ctap2-compliance.md`](docs/ctap2-compliance.md).
 
+Host approval supplies user presence, not built-in user verification. FIDO
+client PINs (Protocols 2 and 1) provide PIN verification and are separate from
+the PCR recovery phrase. Without a PIN, discoverable enrollment can use presence
+alone; after PIN setup, it requires a valid PIN token. PIN-state storage still
+needs TPM-equivalent protection before a full conformance claim is possible.
+
 ## Future Work
 
 - Expand CTAP2 compatibility for additional browser request shapes.

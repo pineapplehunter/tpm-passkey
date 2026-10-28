@@ -25,14 +25,23 @@ For each command:
 An audit is complete only when both the implementation and independent tests
 match this checklist.
 
+## Current scope and gaps
+
+This is an ongoing audit, **not a full conformance claim**. Section completion
+markers describe scoped wire/behavior checks, not certification or security
+assurance. Known remaining gaps include TPM-equivalent protection of PIN state,
+bounded/cancellable host approval, and incorrectly treating client-only
+`credProps` as an authenticator extension. These require follow-up work.
+
 ## Common Rules
 
 - A successful CTAP2 response starts with status `0x00`; the remaining bytes are
   the command's CBOR response map.
 - Error responses contain only the one-byte CTAP status.
 - `clientDataHash` is exactly 32 bytes.
-- For PIN/UV Auth Protocol 2, `pinUvAuthToken` and `authenticate()` output are
-  exactly 32 bytes.
+- PIN/UV Auth Protocols 1 and 2 use 32-byte tokens. Protocol 1 derives its
+  shared key with SHA-256, uses AES-CBC with a zero IV and no IV prefix, and
+  truncates HMAC to 16 bytes. Protocol 2 authenticators prefer Protocol 2.
 - Protocol 2 `kdf(Z)` is two independent HKDF-SHA-256 invocations with a 32-byte
   zero salt. The logical shared secret is `HMAC key || AES key`; info strings are
   `CTAP2 HMAC key` and `CTAP2 AES key` without trailing NUL bytes.
@@ -79,8 +88,8 @@ contain a response-side `pinUvAuthParam`; key `0x03` is `pinRetries`.
 | `0x03` | `setPIN` | protocol, subcommand, key agreement, auth parameter, encrypted new PIN | empty map |
 | `0x04` | `changePIN` | protocol, subcommand, key agreement, auth parameter, encrypted new PIN and old PIN hash | empty map |
 | `0x05` | `getPinToken` (legacy) | protocol, subcommand, key agreement, encrypted PIN hash | encrypted token |
-| `0x06` | `getPinUvAuthTokenUsingUvWithPermissions` | protocol, subcommand, key agreement, permissions; RP ID where required | encrypted token |
-| `0x07` | `getUVRetries` | `subCommand` | `uvRetries` |
+| `0x06` | `getPinUvAuthTokenUsingUvWithPermissions` | unsupported: no built-in UV | `INVALID_COMMAND` |
+| `0x07` | `getUVRetries` | unsupported: no built-in UV | `INVALID_COMMAND` |
 | `0x09` | `getPinUvAuthTokenUsingPinWithPermissions` | protocol, subcommand, key agreement, encrypted PIN hash, permissions; RP ID where required | encrypted token |
 
 Permission bits are `mc=0x01`, `ga=0x02`, `cm=0x04`, `be=0x08`, `lbw=0x10`,
@@ -97,9 +106,10 @@ After a wrong PIN, retries are decremented and the key-agreement key is
 regenerated. Three consecutive mismatches in one power cycle produce
 `CTAP2_ERR_PIN_AUTH_BLOCKED`; zero retries produce `CTAP2_ERR_PIN_BLOCKED`.
 
-A token issued by built-in UV records user presence for at most 30 seconds and
-is consumed by one user-presence operation. A PIN-issued token has no cached
-user presence. All tokens remain cryptographically permission- and RP-scoped.
+PIN-issued tokens have no cached user presence. New token issuance invalidates
+previous tokens across protocols, as required by §6.5.5.7; the active token is
+protocol-tagged, and cross-protocol authentication is rejected even with a valid
+MAC of the requested protocol's length. Tokens are permission- and RP-scoped.
 Under the single-user-machine assumption, tokens are not bound to login sessions.
 
 Audit status: **complete for ClientPIN request/response handling and token
@@ -140,8 +150,10 @@ Normative behavior retained here:
 - CTAP options are `rk`, `up`, and `uv`, all booleans. `up=false` is
   `CTAP2_ERR_INVALID_OPTION`; unknown keys are ignored. WebAuthn fields such as
   `residentKey` are not CTAP options.
-- A discoverable (`rk=true`) credential requires UV when this authenticator is
-  protected by built-in UV or a PIN. Creating another discoverable credential
+- A discoverable (`rk=true`) credential requires a PIN token when a PIN is
+  configured. Without a PIN, discoverable enrollment is permitted with UP only.
+  An effective `uv=true` option without a token returns `INVALID_OPTION` (no
+  built-in UV). A valid PIN token takes precedence over the option. Creating another discoverable credential
   for the same RP ID and user ID overwrites the old credential.
 - Verify `authenticate(pinUvAuthToken, clientDataHash)`. The RP ID is not
   appended to the HMAC input. Separately require `mc` permission and enforce or
@@ -194,11 +206,11 @@ members are:
 - versions: `FIDO_2_1`, then `FIDO_2_0`;
 - extension: `credProps`;
 - the project AAGUID (16 bytes);
-- options: `plat=false`, `rk=true`, `up=true`, `uv=true`, `clientPin` reflecting
-  whether a PIN is configured, `pinUvAuthToken=true`, `credMgmt=true`, and
-  `makeCredUvNotRqd=true`;
+- options: `plat=false`, `rk=true`, `up=true`, `clientPin` and `pinUvAuthToken`
+  reflecting whether a PIN is configured, `credMgmt=true`, and
+  `makeCredUvNotRqd=true`; `uv` is absent (host approval is not built-in UV);
 - maximum message size 1200 bytes;
-- PIN/UV Auth Protocol 2;
+- PIN/UV Auth Protocols `[2, 1]`, in preference order;
 - transport `usb`;
 - ES256 public-key credential creation;
 - minimum PIN length of four Unicode code points.
@@ -308,9 +320,9 @@ Audit status: **complete**.
 
 ## Remaining Audit Order
 
-1. Complete ClientPIN inputs, errors, permissions, and retry state.
-2. Complete makeCredential and getAssertion request/response tables.
-3. Audit getInfo capability claims against implemented behavior.
-4. Complete credential management and stateful continuation commands.
-5. Complete reset, selection, and unsupported command behavior.
-6. Complete CTAPHID framing, channels, cancellation, keepalive, and errors.
+1. Remove client-only `credProps` from authenticator capabilities/outputs.
+2. Fail closed when persisted PIN state cannot be loaded.
+3. Make host approval bounded and promptly cancellable, including logind lookup.
+4. Protect PIN verifier/retry state with assurances matching TPM private keys.
+5. Revisit remaining request-type/status and feature-table claims against the
+   normative source; rerun browser-critical VM flows after each logical group.

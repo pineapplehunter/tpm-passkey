@@ -321,18 +321,7 @@
               f"Expected compliance credentials to survive reboot, got: {output}"
           )
 
-          # -- fido2-manage PIN-dependent subcommands (daemon has no PIN at this point) --
-          machine.succeed(
-              "expect -c '"
-              'spawn fido2-manage -setPIN -device 1; '
-              'expect "Enter new PIN"; '
-              'send "1234\\r"; '
-              'expect "Enter the same PIN again"; '
-              'send "1234\\r"; '
-              'expect eof'
-              "'"
-          )
-
+          # -- PIN-dependent management (1234 was set by the compliance flow) --
           machine.succeed(
               "expect -c '"
               'spawn fido2-manage -storage -device 1; '

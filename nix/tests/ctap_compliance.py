@@ -6,6 +6,7 @@ import traceback
 from fido2.cose import ES256
 from fido2.ctap import CtapError
 from fido2.ctap2 import ClientPin, CredentialManagement, Ctap2
+from fido2.ctap2.pin import PinProtocolV1
 from fido2.hid import CTAPHID, CtapHidDevice
 from fido2.webauthn import AuthenticatorData
 
@@ -42,7 +43,7 @@ def register(ctap, rp_id, user_id, client_pin=None, uv_token=None):
         },
         [{"type": "public-key", "alg": -7}],
         extensions={"credProps": True},
-        options={"rk": True, "up": True, "uv": uv_token is not None},
+        options={"rk": True, "up": True, "uv": False},
         pin_uv_param=pin_uv_param,
         pin_uv_protocol=pin_uv_protocol,
     )
@@ -64,35 +65,52 @@ def main():
     assert "FIDO_2_1" in info.versions
     assert len(info.aaguid) == 16
     assert info.max_msg_size >= 1024
-    assert 2 in info.pin_uv_protocols
+    assert info.pin_uv_protocols == [2, 1]
     assert "usb" in info.transports
     assert "credProps" in info.extensions
     assert info.options.get("rk") is True
     assert info.options.get("up") is True
-    assert info.options.get("uv") is True
-    assert info.options.get("pinUvAuthToken") is True
+    assert "uv" not in info.options
+    assert info.options.get("clientPin") is False
+    assert info.options.get("pinUvAuthToken") is False
     assert info.options.get("credMgmt") is True
     assert any(
         algorithm.get("type") == "public-key" and algorithm.get("alg") == -7
         for algorithm in info.algorithms
     )
 
-    # Browser registration uses subcommand 0x06 when built-in UV and
-    # pinUvAuthToken are advertised, even when no client PIN is configured.
-    client_pin = ClientPin(ctap)
-    assert client_pin.get_uv_retries() == 8
-    uv_token = client_pin.get_uv_token(
-        permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
-        permissions_rpid=rp_id,
+    # Host approval is UP only. Unsupported built-in UV cannot mint tokens.
+    for subcommand in (6, 7):
+        expect_ctap_error(
+            CtapError.ERR.INVALID_COMMAND,
+            lambda subcommand=subcommand: ctap.client_pin(2, subcommand),
+        )
+    expect_ctap_error(
+        CtapError.ERR.INVALID_OPTION,
+        lambda: ctap.get_assertion(rp_id, challenge("unsupported-uv"), options={"uv": True}),
     )
-    assert len(uv_token) == 32
 
-    first = register(ctap, rp_id, "resident-user-1", client_pin, uv_token)
-    second_token = client_pin.get_uv_token(
-        permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
-        permissions_rpid=rp_id,
+    # With no protection configured, rk=true is permitted but never claims UV.
+    first = register(ctap, rp_id, "resident-user-1")
+    assert not first.auth_data.flags & AuthenticatorData.FLAG.UV
+    ClientPin(ctap).set_pin("1234")
+    ctap = Ctap2(device)  # Refresh capabilities after PIN setup.
+    assert "uv" not in ctap.info.options
+    assert ctap.info.options.get("clientPin") is True
+    assert ctap.info.options.get("pinUvAuthToken") is True
+    client_pin = ClientPin(ctap)
+    assert client_pin.protocol.VERSION == 2
+    expect_ctap_error(
+        CtapError.ERR(0x36),  # PUAT_REQUIRED, historically PIN_REQUIRED
+        lambda: register(ctap, rp_id, "requires-pin"),
     )
-    second = register(ctap, rp_id, "resident-user-2", client_pin, second_token)
+
+    # FIDO_2_0 implies Protocol 1 and legacy getPinToken (subcommand 5).
+    legacy_pin = ClientPin(ctap, PinProtocolV1())
+    legacy_token = legacy_pin.get_pin_token("1234")
+    assert len(legacy_token) == 32
+    second = register(ctap, rp_id, "resident-user-2", legacy_pin, legacy_token)
+    assert second.auth_data.flags & AuthenticatorData.FLAG.UV
     credentials = [first.auth_data.credential_data, second.auth_data.credential_data]
 
     for attestation in (first, second):
@@ -111,8 +129,8 @@ def main():
 
     # excludeList must reject a credential already registered for this RP.
     descriptor = {"type": "public-key", "id": credentials[0].credential_id}
-    exclude_token = client_pin.get_uv_token(
-        permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
+    exclude_token = client_pin.get_pin_token(
+        "1234", permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
         permissions_rpid=rp_id,
     )
     exclude_challenge = challenge("excluded-credential")
@@ -151,7 +169,23 @@ def main():
     for assertion in assertions:
         assert assertion.auth_data.rp_id_hash == hashlib.sha256(rp_id.encode()).digest()
         assert assertion.auth_data.flags & AuthenticatorData.FLAG.UP
+        assert not assertion.auth_data.flags & AuthenticatorData.FLAG.UV
+        assert set(assertion.user) == {"id"}
         assertion.verify(assertion_challenge, keys[assertion.credential["id"]])
+
+    # Protocol 2 permissioned PIN tokens authenticate real TPM assertions.
+    verified_challenge = challenge("pin-verified-assertion")
+    assertion_token = client_pin.get_pin_token(
+        "1234", permissions=ClientPin.PERMISSION.GET_ASSERTION, permissions_rpid=rp_id
+    )
+    verified = ctap.get_assertion(
+        rp_id, verified_challenge, allow_list=[descriptor],
+        pin_uv_param=client_pin.protocol.authenticate(assertion_token, verified_challenge),
+        pin_uv_protocol=2,
+    )
+    assert verified.auth_data.flags & AuthenticatorData.FLAG.UV
+    assert verified.auth_data.flags & AuthenticatorData.FLAG.UP
+    verified.verify(verified_challenge, credentials[0].public_key)
 
     # A credential is scoped to its RP, even when its ID is supplied explicitly.
     expect_ctap_error(
@@ -188,8 +222,8 @@ def main():
 
     # Credential-management response keys and unauthenticated continuation
     # commands must interoperate with a strict CTAP client.
-    management_token = client_pin.get_uv_token(
-        permissions=ClientPin.PERMISSION.CREDENTIAL_MGMT,
+    management_token = client_pin.get_pin_token(
+        "1234", permissions=ClientPin.PERMISSION.CREDENTIAL_MGMT,
     )
     credential_management = CredentialManagement(
         ctap, client_pin.protocol, management_token

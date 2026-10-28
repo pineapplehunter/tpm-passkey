@@ -205,14 +205,18 @@ A successful polkit operation establishes that the session user satisfied the co
 
 Authorization shall be associated with one specific CTAP transaction. Authorization results shall not be reused for unrelated requests unless the reuse semantics are explicitly defined and justified.
 
-The CTAP-defined user-presence state of a UV-issued `pinUvAuthToken` is the only current reuse. The UV approval names the requested RP ID, and cached presence may authorize one immediately following token-authenticated operation only when all of these remain true:
+Host approval is user presence (UP), not CTAP built-in user verification (UV).
+The authenticator does not advertise `uv` and does not issue built-in-UV tokens.
+PIN/UV Auth Protocols 1 and 2 provide PIN verification once a PIN is configured;
+only successful token authentication can set the authenticator-data UV bit.
+PIN tokens are scoped by protocol, permissions, and RP ID. They do not cache UP:
+a request requiring presence still needs a separate transaction-specific approval.
+Presence consumes token permissions except the CTAP-defined `lbw` exception.
 
-* The token HMAC is valid and has the required permission.
-* The token's permissions RP ID matches the operation.
-* No more than 30 seconds have elapsed since UV approval.
-* Cached presence has not already been consumed.
-
-The operation clears cached presence and all token permissions except the CTAP-defined `lbw` exception. PIN-issued tokens do not carry cached user presence and therefore still require a separate presence approval. This avoids a second polkit prompt for the built-in-UV browser flow without turning approval into a general same-user or time-based authorization grant.
+PIN verifier and retry state currently reside in SQLite, protected by a local
+metadata MAC and PBKDF2. This is not equivalent to TPM private-key protection,
+and does not meet CTAP 2.2 §6.5.1's PIN-storage assurance requirement. Offline
+PIN guessing and rollback of this state remain security/compliance gaps.
 
 Cancellation, token expiry, and denied approval prevent authorization. Session
 termination and switching are not tracked. If polkit is unavailable, the existing

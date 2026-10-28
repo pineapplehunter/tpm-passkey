@@ -23,7 +23,7 @@ fn get_info_uses_project_aaguid_and_algorithm_metadata() {
     );
     assert_eq!(
         map_value(&map, 6),
-        Some(&cbor!([2]).expect("protocol list"))
+        Some(&cbor!([2, 1]).expect("protocol list"))
     );
     assert_eq!(
         map_value(&map, 2),
@@ -55,8 +55,8 @@ fn get_info_advertises_a_consistent_ctap21_configuration() {
     let options = map_value(&map, 4).and_then(Value::as_map).expect("options");
     assert_eq!(map_bool(options, "rk"), Some(true));
     assert_eq!(map_bool(options, "up"), Some(true));
-    assert_eq!(map_bool(options, "uv"), Some(true));
-    assert_eq!(map_bool(options, "pinUvAuthToken"), Some(true));
+    assert_eq!(map_bool(options, "uv"), None);
+    assert_eq!(map_bool(options, "pinUvAuthToken"), Some(false));
     assert_eq!(map_bool(options, "credMgmt"), Some(true));
     assert_eq!(map_integer(&map, 13), Some(4));
 
@@ -69,6 +69,88 @@ fn get_info_advertises_a_consistent_ctap21_configuration() {
                 && map_text(algorithm, "type") == Some("public-key")
         })
     }));
+}
+
+#[test]
+fn pin_capabilities_follow_configuration_without_claiming_builtin_uv() {
+    for configured in [false, true] {
+        let response = get_info_response(configured);
+        let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).unwrap() else {
+            panic!("getInfo map")
+        };
+        let options = map_map(&map, 4).unwrap();
+        assert_eq!(map_bool(options, "clientPin"), Some(configured));
+        assert_eq!(map_bool(options, "pinUvAuthToken"), Some(configured));
+        assert!(map_value(options, "uv").is_none());
+    }
+}
+
+#[test]
+fn requesting_builtin_uv_never_falls_back_to_host_approval() {
+    let dir = test_store_dir("unsupported-uv-options");
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut auth = Authenticator::new_with_approval(
+        dir.clone(),
+        None,
+        Box::new(CountingApproval(count.clone())),
+    );
+    for request in [
+        ctap_request(
+            Ctap2Command::MakeCredential,
+            cbor!({
+                1 => bytes([0; 32]), 2 => {"id" => "example.test"},
+                3 => {"id" => bytes([1])}, 4 => [{"type" => "public-key", "alg" => -7}],
+                7 => {"uv" => true},
+            })
+            .unwrap(),
+        ),
+        ctap_request(
+            Ctap2Command::GetAssertion,
+            cbor!({
+                1 => "example.test", 2 => bytes([0; 32]), 5 => {"uv" => true},
+            })
+            .unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            auth.handle_cbor(&request),
+            vec![u8::from(ErrorStatus::InvalidOption)]
+        );
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn client_pin_rejects_known_wrong_types_and_out_of_range_integers() {
+    let dir = test_store_dir("client-pin-field-types");
+    let mut auth = Authenticator::new(dir.clone(), None);
+    for key in [1, 3, 4, 5, 6, 9, 10] {
+        let request = cbor!({2 => 1, key => false}).unwrap();
+        assert_eq!(
+            auth.handle_cbor(&ctap_request(Ctap2Command::ClientPin, request)),
+            vec![u8::from(ErrorStatus::CborUnexpectedType)]
+        );
+    }
+    for protocol in [-1, 0, 3, 256] {
+        assert_eq!(
+            auth.handle_cbor(&ctap_request(
+                Ctap2Command::ClientPin,
+                cbor!({1 => protocol, 2 => 2}).unwrap()
+            )),
+            vec![u8::from(ErrorStatus::InvalidParameter)]
+        );
+    }
+    for permissions in [-1, 256] {
+        assert_eq!(
+            auth.handle_cbor(&ctap_request(
+                Ctap2Command::ClientPin,
+                cbor!({1 => 2, 2 => 9, 6 => bytes([0;32]), 9 => permissions}).unwrap()
+            )),
+            vec![u8::from(ErrorStatus::InvalidParameter)]
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -365,79 +447,27 @@ fn protocol2_client_pin_round_trip_and_retry_state_persist() {
 }
 
 #[test]
-fn protocol2_uv_token_uses_subcommand_6_without_a_pin_hash() {
-    let store_dir = test_store_dir("uv-token");
+fn unsupported_builtin_uv_subcommands_do_not_mint_tokens() {
+    let store_dir = test_store_dir("uv-token-unsupported");
     let approval_count = Arc::new(AtomicUsize::new(0));
     let mut authenticator = Authenticator::new_with_approval(
         store_dir.clone(),
         None,
         Box::new(CountingApproval(approval_count.clone())),
     );
-    let client_secret = EphemeralSecret::generate();
-    let server_key = client_pin_key_agreement(&mut authenticator);
-    let server_public = parse_key_agreement(&server_key).expect("valid server public key");
-    let (aes_key, _) = derive_protocol2_keys(
-        client_secret
-            .diffie_hellman(&server_public)
-            .raw_secret_bytes()
-            .as_slice(),
-    )
-    .expect("derive protocol 2 keys");
-
-    let response = authenticator.handle_cbor(&ctap_request(
-        Ctap2Command::ClientPin,
-        cbor!({
-            1 => 2,
-            2 => 6,
-            3 => client_key_agreement(&client_secret),
-            9 => 1,
-            10 => "passkeys.io",
-        })
-        .expect("UV-token request"),
-    ));
-    assert_eq!(response[0], 0x00);
-    let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR")
-    else {
-        panic!("expected UV token response");
-    };
-    let encrypted_token = map_bytes(&response, 2).expect("encrypted token");
-    let token = decrypt_aes(&aes_key, encrypted_token).expect("decrypt token");
-    assert_eq!(token.len(), 32);
-    assert_eq!(response.len(), 1);
-    assert!(map_value(&response, 3).is_none());
-
-    let client_data_hash = [0x44; 32];
-    let mut mac = HmacSha256::new_from_slice(&token).expect("HMAC key");
-    mac.update(&client_data_hash);
-    let make_credential = authenticator.handle_cbor(&ctap_request(
-        Ctap2Command::MakeCredential,
-        cbor!({
-            1 => bytes(client_data_hash),
-            2 => { "id" => "passkeys.io" },
-            3 => { "id" => bytes([0x22; 16]) },
-            4 => [{ "type" => "public-key", "alg" => -7 }],
-            7 => { "rk" => true, "up" => true },
-            8 => bytes(mac.finalize().into_bytes()),
-            9 => 2,
-        })
-        .expect("make-credential request"),
-    ));
-    assert_eq!(
-        make_credential,
-        vec![u8::from(ErrorStatus::OperationDenied)],
-        "the request should pass approval reuse and fail only because tests have no TPM"
-    );
-    assert_eq!(approval_count.load(Ordering::SeqCst), 1);
-
-    let retries = authenticator.handle_cbor(&ctap_request(
-        Ctap2Command::ClientPin,
-        cbor!({ 1 => 2, 2 => 7 }).expect("UV-retries request"),
-    ));
-    let Value::Map(retries) = ciborium::from_reader::<Value, _>(&retries[1..]).expect("CBOR")
-    else {
-        panic!("expected UV retries response");
-    };
-    assert_eq!(map_integer(&retries, 5), Some(UV_RETRIES.into()));
+    for subcommand in [6, 7] {
+        for request in [
+            cbor!({ 1 => 2, 2 => subcommand }).unwrap(),
+            cbor!({ 2 => subcommand }).unwrap(),
+        ] {
+            assert_eq!(
+                authenticator.handle_cbor(&ctap_request(Ctap2Command::ClientPin, request)),
+                vec![u8::from(ErrorStatus::InvalidCommand)]
+            );
+        }
+    }
+    assert_eq!(approval_count.load(Ordering::SeqCst), 0);
+    assert!(authenticator.pin_uv_auth_token.is_none());
     let _ = std::fs::remove_dir_all(store_dir);
 }
 
@@ -467,7 +497,7 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
     ));
     assert_eq!(
         nested_parameters,
-        vec![u8::from(ErrorStatus::MissingParameter)]
+        vec![u8::from(ErrorStatus::CborUnexpectedType)]
     );
 
     assert_eq!(
@@ -512,6 +542,7 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
     mac.update(message);
     let auth_param = mac.finalize().into_bytes();
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        protocol: 2,
         value: token_value,
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: None,
@@ -691,6 +722,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
 
     // Re-inject token (was cleared by the previous error return)
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        protocol: 2,
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: Some(rp_id.to_owned()),
@@ -715,6 +747,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
 
     // A legacy token without an RP ID is associated with the first mc/ga RP.
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        protocol: 2,
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: None,
@@ -750,6 +783,7 @@ fn make_credential_with_pin_uv_auth_token_regression() {
 
     // ── getAssertion HMAC: clientDataHash only (CTAP 2.1 §6.2.1) ───────
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        protocol: 2,
         value: token,
         permissions: Ctap2PermissionFlags::GET_ASSERTION,
         rp_id: Some(rp_id.to_owned()),
@@ -1880,6 +1914,7 @@ fn install_credential_management_token(
         retries: PIN_RETRIES,
     });
     authenticator.pin_uv_auth_token = Some(PinUvAuthToken {
+        protocol: 2,
         value: token.clone(),
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: rp_id.map(str::to_owned),

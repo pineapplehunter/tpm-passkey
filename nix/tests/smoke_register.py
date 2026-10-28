@@ -15,10 +15,12 @@ try:
     client_data_hash = hashlib.sha256(challenge.encode()).digest()
     pin_uv_param = None
     pin_uv_protocol = None
-    if rk:
+    if rk and ctap.info.options.get("clientPin"):
+        # Optional integration-test PIN, needed only for protected rk enrollment.
+        pin = sys.argv[7]
         client_pin = ClientPin(ctap)
-        token = client_pin.get_uv_token(
-            permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
+        token = client_pin.get_pin_token(
+            pin, permissions=ClientPin.PERMISSION.MAKE_CREDENTIAL,
             permissions_rpid=rp_id,
         )
         pin_uv_param = client_pin.protocol.authenticate(token, client_data_hash)
