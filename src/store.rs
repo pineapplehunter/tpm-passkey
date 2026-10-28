@@ -259,6 +259,23 @@ pub fn delete_client_pin_state_from_dir(dir: impl AsRef<Path>) -> Result<()> {
     block_on_store(delete_client_pin_state_async(dir.as_ref()))
 }
 
+/// Factory reset must not clear PIN protection before credential deletion commits,
+/// nor depend on which credential rows the daemon successfully loaded into memory.
+pub fn reset_authenticator_state_from_dir(dir: impl AsRef<Path>) -> Result<()> {
+    block_on_store(async {
+        let pool = open_database(dir.as_ref()).await?;
+        let mut transaction = pool.begin().await?;
+        sqlx::query!("DELETE FROM credential_metadata")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query!("DELETE FROM client_pin_state")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    })
+}
+
 pub fn credentials_database_path_in_dir(dir: impl AsRef<Path>) -> PathBuf {
     dir.as_ref().join(CREDENTIALS_DATABASE_FILE)
 }
@@ -771,12 +788,17 @@ async fn load_client_pin_state_async(dir: &Path) -> Result<Option<StoredClientPi
         integrity_mac: row.try_get("integrity_mac")?,
     };
 
-    if let Some(expected_mac) = &state.integrity_mac {
-        let key = load_or_generate_hmac_key(dir)?;
-        let computed = compute_client_pin_mac(&key, &state)?;
-        if !constant_time_equal(&computed, expected_mac) {
-            return Err(eyre!("clientPIN state integrity check failed"));
-        }
+    if state.pin_salt.len() != 32 || state.pin_verifier.len() != 32 || state.retries > 8 {
+        return Err(eyre!("invalid stored clientPIN state"));
+    }
+    let expected_mac = state
+        .integrity_mac
+        .as_ref()
+        .ok_or_else(|| eyre!("clientPIN state is missing its integrity MAC"))?;
+    let key = read_hmac_key(dir)?;
+    let computed = compute_client_pin_mac(&key, &state)?;
+    if !constant_time_equal(&computed, expected_mac) {
+        return Err(eyre!("clientPIN state integrity check failed"));
     }
 
     Ok(Some(state))
@@ -848,19 +870,24 @@ async fn open_database(dir: &Path) -> Result<SqlitePool> {
     Ok(pool)
 }
 
+fn read_hmac_key(dir: &Path) -> Result<[u8; 32]> {
+    let path = dir.join(HMAC_KEY_FILE);
+    let raw =
+        fs::read(&path).wrap_err_with(|| format!("reading HMAC key from {}", path.display()))?;
+    let length = raw.len();
+    raw.try_into().map_err(|_| {
+        eyre!(
+            "HMAC key file {} has wrong length (expected 32, got {})",
+            path.display(),
+            length
+        )
+    })
+}
+
 fn load_or_generate_hmac_key(dir: &Path) -> Result<[u8; 32]> {
     let path = dir.join(HMAC_KEY_FILE);
     if path.exists() {
-        let raw = fs::read(&path)
-            .wrap_err_with(|| format!("reading HMAC key from {}", path.display()))?;
-        let key: [u8; 32] = raw.clone().try_into().map_err(|_| {
-            eyre!(
-                "HMAC key file {} has wrong length (expected 32, got {})",
-                path.display(),
-                raw.len()
-            )
-        })?;
-        Ok(key)
+        read_hmac_key(dir)
     } else {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).wrap_err("generating HMAC key from system random")?;
@@ -975,6 +1002,94 @@ mod tests {
         assert_eq!(load_default_pcr_policy(&dir).unwrap(), Some(vec![1, 7]));
         clear_default_pcr_policy(&dir).unwrap();
         assert_eq!(load_default_pcr_policy(&dir).unwrap(), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pin_loading_rejects_malformed_or_unauthenticated_state_without_creating_keys() {
+        let dir = test_store_dir("pin-load-integrity");
+        let valid = StoredClientPinState {
+            pin_salt: vec![0x11; 32],
+            pin_verifier: vec![0x22; 32],
+            retries: 8,
+            integrity_mac: None,
+        };
+        for fault in 0..4 {
+            save_client_pin_state_to_dir(&dir, &valid).unwrap();
+            let mut state = load_client_pin_state_from_dir(&dir).unwrap().unwrap();
+            match fault {
+                0 => state.integrity_mac = None,
+                1 => state.integrity_mac = Some(vec![0; 32]),
+                _ => {
+                    if fault == 2 {
+                        state.pin_salt.pop();
+                    } else {
+                        state.pin_verifier.pop();
+                    }
+                    // Even correctly authenticated malformed fields are rejected.
+                    state.integrity_mac = Some(
+                        compute_client_pin_mac(&read_hmac_key(&dir).unwrap(), &state).unwrap(),
+                    );
+                }
+            }
+            block_on_store(async {
+                let pool = open_database(&dir).await?;
+                let salt = &state.pin_salt;
+                let verifier = &state.pin_verifier;
+                let mac = state.integrity_mac.as_deref();
+                sqlx::query!("UPDATE client_pin_state SET pin_salt = ?1, pin_verifier = ?2, integrity_mac = ?3 WHERE state_id = 1", salt, verifier, mac)
+                    .execute(&pool).await?;
+                Ok(())
+            }).unwrap();
+            assert!(load_client_pin_state_from_dir(&dir).is_err());
+        }
+        save_client_pin_state_to_dir(&dir, &valid).unwrap();
+        fs::remove_file(dir.join(HMAC_KEY_FILE)).unwrap();
+        assert!(load_client_pin_state_from_dir(&dir).is_err());
+        assert!(
+            !dir.join(HMAC_KEY_FILE).exists(),
+            "reads must not generate replacement keys"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reset_is_atomic_and_removes_rows_not_loaded_by_the_daemon() {
+        let dir = test_store_dir("atomic-reset");
+        save_ctap2_credentials_to_dir(&dir, &[test_credential(vec![1], "example.test", 0)])
+            .unwrap();
+        save_client_pin_state_to_dir(
+            &dir,
+            &StoredClientPinState {
+                pin_salt: vec![1; 32],
+                pin_verifier: vec![2; 32],
+                retries: 8,
+                integrity_mac: None,
+            },
+        )
+        .unwrap();
+        save_default_pcr_policy(&dir, &[7]).unwrap();
+        block_on_store(async {
+            let pool = open_database(&dir).await?;
+            sqlx::query!("CREATE TRIGGER stop_pin_reset BEFORE DELETE ON client_pin_state BEGIN SELECT RAISE(ABORT, 'test reset failure'); END")
+                .execute(&pool).await?;
+            Ok(())
+        }).unwrap();
+        assert!(reset_authenticator_state_from_dir(&dir).is_err());
+        assert_eq!(load_ctap2_credentials_from_dir(&dir).unwrap().len(), 1);
+        assert!(load_client_pin_state_from_dir(&dir).unwrap().is_some());
+        block_on_store(async {
+            let pool = open_database(&dir).await?;
+            sqlx::query!("DROP TRIGGER IF EXISTS stop_pin_reset")
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        reset_authenticator_state_from_dir(&dir).unwrap();
+        assert!(load_ctap2_credentials_from_dir(&dir).unwrap().is_empty());
+        assert!(load_client_pin_state_from_dir(&dir).unwrap().is_none());
+        assert_eq!(load_default_pcr_policy(&dir).unwrap(), Some(vec![7]));
         fs::remove_dir_all(dir).unwrap();
     }
 

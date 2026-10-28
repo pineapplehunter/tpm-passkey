@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE client_pin_state SET pin_salt = ?1, pin_verifier = ?2, integrity_mac = ?3 WHERE state_id = 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "c6dffd5c1b152e04870eeaae6ce6fbc672fe1cc1e9bc8b9f1f8c907d1b19af7c"
+}

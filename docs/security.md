@@ -217,6 +217,11 @@ PIN verifier and retry state currently reside in SQLite, protected by a local
 metadata MAC and PBKDF2. This is not equivalent to TPM private-key protection,
 and does not meet CTAP 2.2 §6.5.1's PIN-storage assurance requirement. Offline
 PIN guessing and rollback of this state remain security/compliance gaps.
+Malformed or unverifiable PIN records now block credential/PIN operations with
+`INTEGRITY_FAILURE`, rather than silently disabling PIN protection. Restoring
+valid state and restarting repairs this without deleting credentials. Explicit
+factory reset clears all credentials and PIN state atomically; ordinary operation
+never automatically drops or regenerates an unreadable PIN record.
 
 Cancellation, token expiry, and denied approval prevent authorization. Session
 termination and switching are not tracked. If polkit is unavailable, the existing

@@ -180,6 +180,9 @@
                   print("### " + line)
               raise Exception(f"CTAP compliance checks failed:\n{output}")
 
+          # Corrupt/missing PIN MACs must not downgrade protection on restart.
+          machine.succeed("python3 ${./tests/pin_state_fault.py}", timeout=90)
+
           # -- list-credentials (after registration) --
           output = mgmt("list-credentials")
           print("list-credentials (after registration):", output)

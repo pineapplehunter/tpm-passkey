@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "CREATE TRIGGER stop_pin_reset BEFORE DELETE ON client_pin_state BEGIN SELECT RAISE(ABORT, 'test reset failure'); END",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "c620470063468084710a0e58100f61faa954ee3ae36aad4d807a5dfcb72d9c40"
+}

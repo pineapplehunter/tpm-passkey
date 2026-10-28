@@ -73,6 +73,7 @@ pub struct Authenticator {
     credentials: Vec<Credential>,
     pending_assertion: Option<PendingAssertion>,
     client_pin: Option<ClientPinState>,
+    client_pin_load_failed: bool,
     key_agreement: Option<EphemeralSecret>,
     pin_uv_auth_token: Option<PinUvAuthToken>,
     consecutive_pin_mismatches: u8,
@@ -141,6 +142,7 @@ impl Authenticator {
         let tpm = None;
         let credentials = Self::load_credentials_from_disk(&store_dir);
         log::info!("loaded {} TPM-backed CTAP2 credentials", credentials.len());
+        let mut client_pin_load_failed = false;
         let client_pin = match store::load_client_pin_state_from_dir(&store_dir) {
             Ok(Some(state)) => Some(ClientPinState {
                 pin_salt: state.pin_salt,
@@ -149,7 +151,10 @@ impl Authenticator {
             }),
             Ok(None) => None,
             Err(error) => {
-                log::warn!("failed to load clientPIN state: {error:?}");
+                log::warn!(
+                    "failed to load clientPIN state; blocking credential operations: {error:?}"
+                );
+                client_pin_load_failed = true;
                 None
             }
         };
@@ -163,6 +168,7 @@ impl Authenticator {
             credentials,
             pending_assertion: None,
             client_pin,
+            client_pin_load_failed,
             key_agreement: None,
             pin_uv_auth_token: None,
             consecutive_pin_mismatches: 0,
@@ -228,10 +234,27 @@ impl Authenticator {
             body.len()
         );
 
+        // An unreadable PIN record is not an unconfigured authenticator.
+        // Keep discovery/reset available, but never permit a protection downgrade.
+        if self.client_pin_load_failed
+            && matches!(
+                command,
+                Ctap2Command::ClientPin
+                    | Ctap2Command::MakeCredential
+                    | Ctap2Command::GetAssertion
+                    | Ctap2Command::GetNextAssertion
+                    | Ctap2Command::CredentialManagement
+            )
+        {
+            return error_response(ErrorStatus::IntegrityFailure);
+        }
+
         let result = match command {
             Ctap2Command::GetInfo => body
                 .is_empty()
-                .then(|| get_info_response(self.client_pin.is_some()))
+                .then(|| {
+                    get_info_response(self.client_pin.is_some() || self.client_pin_load_failed)
+                })
                 .ok_or(ErrorStatus::InvalidCbor),
             Ctap2Command::ClientPin => self.client_pin(body),
             Ctap2Command::MakeCredential => self.make_credential(body),
@@ -297,21 +320,15 @@ impl Authenticator {
         {
             return Err(ErrorStatus::OperationDenied);
         }
-        store::delete_client_pin_state_from_dir(&self.store_dir).map_err(|error| {
-            log::warn!("failed to delete client PIN state during reset: {error:?}");
+        store::reset_authenticator_state_from_dir(&self.store_dir).map_err(|error| {
+            log::warn!("failed to persist authenticator reset: {error:?}");
             ErrorStatus::OperationDenied
         })?;
-        for credential in &self.credentials {
-            store::delete_ctap2_credential_from_dir(&self.store_dir, &credential.id).map_err(
-                |error| {
-                    log::warn!("failed to delete credential during reset: {error:?}");
-                    ErrorStatus::OperationDenied
-                },
-            )?;
-        }
         self.credentials.clear();
         self.recovery_unlock = None;
         self.client_pin = None;
+        self.client_pin_load_failed = false;
+        self.consecutive_pin_mismatches = 0;
         self.key_agreement = None;
         self.pin_uv_auth_token = None;
         self.pending_assertion = None;

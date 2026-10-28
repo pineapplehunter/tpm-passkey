@@ -46,6 +46,20 @@ protected under a storage parent on the original TPM, not a raw private scalar.
 The daemon recreates a transient owner-hierarchy parent as needed and loads and
 flushes credential objects for signing.
 
+## Client PIN state failures and reset
+
+A stored PIN record must have 32-byte salt/verifier fields, a valid retry count,
+and an authenticated integrity MAC. Unreadable or unverifiable PIN state blocks
+credential/PIN operations with `INTEGRITY_FAILURE`, not an implicit "PIN unset".
+GetInfo conservatively reports PIN protection so discovery and explicit reset
+remain available. Restore a complete valid backup and restart to repair without
+deleting credentials. Legacy PIN rows with no MAC are no longer accepted.
+
+Explicit CTAP reset requires fresh approval within its normal startup window.
+Credential rows (including ones not loaded into memory) and PIN state are deleted
+atomically; a failed transaction leaves both intact. This reset does not change
+the application's PCR enrollment default or recovery-passphrase configuration.
+
 ## Optional PCR binding
 
 New credentials are TPM-bound but **not PCR-bound by default**. An absent

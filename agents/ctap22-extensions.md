@@ -15,3 +15,5 @@ Updated tests: unknown-input acceptance, omitted capability, and real TPM
 registration carrying a client-only input but no signed output/ED flag.
 Passed: nix fmt, cargo check, cargo test (92). The updated VM assertions will
 be run with the next full flake check after the PIN-state loading fix.
+Follow-up: that full check passed on 2026-10-28 (new-queue task 0), including
+registration with client-only inputs and no authenticator extension output.

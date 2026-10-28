@@ -16,6 +16,68 @@ fn new_pin_authenticator() -> Authenticator {
 }
 
 #[test]
+fn pin_load_failure_blocks_operations_until_repair_or_explicit_reset() {
+    struct Consent(Arc<AtomicBool>);
+    impl approval::UserApproval for Consent {
+        fn approve(&self, _: &str) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let auth = new_pin_authenticator();
+    auth.persist_client_pin(auth.client_pin.as_ref().unwrap())
+        .unwrap();
+    let store = auth.store_dir.clone();
+    let key_path = store.join("integrity.hmac-key");
+    let key = std::fs::read(&key_path).unwrap();
+    std::fs::write(&key_path, [0; 31]).unwrap();
+    let consent = Arc::new(AtomicBool::new(false));
+    let mut blocked =
+        Authenticator::new_with_approval(store.clone(), None, Box::new(Consent(consent.clone())));
+    assert!(blocked.client_pin_load_failed);
+    blocked.cancel_pending();
+    for command in [
+        Ctap2Command::ClientPin,
+        Ctap2Command::MakeCredential,
+        Ctap2Command::GetAssertion,
+        Ctap2Command::GetNextAssertion,
+        Ctap2Command::CredentialManagement,
+    ] {
+        assert_eq!(
+            blocked.handle_cbor(&[command.into()]),
+            vec![u8::from(ErrorStatus::IntegrityFailure)]
+        );
+    }
+    let info = blocked.handle_cbor(&[Ctap2Command::GetInfo.into()]);
+    let info = decode_map(&info[1..]).unwrap();
+    assert_eq!(
+        map_bool(map_map(&info, 4).unwrap(), "clientPin"),
+        Some(true)
+    );
+    assert_eq!(
+        blocked.handle_cbor(&[Ctap2Command::Reset.into()]),
+        vec![u8::from(ErrorStatus::OperationDenied)]
+    );
+    assert!(blocked.client_pin_load_failed);
+
+    // Restoring the original file and restarting repairs without deleting PIN state.
+    std::fs::write(&key_path, key).unwrap();
+    let repaired = Authenticator::new(store.clone(), None);
+    assert!(!repaired.client_pin_load_failed);
+    assert!(repaired.client_pin.is_some());
+    // The already-running failed instance remains blocked until successful reset.
+    assert!(blocked.client_pin_load_failed);
+    consent.store(true, Ordering::SeqCst);
+    assert_eq!(blocked.handle_cbor(&[Ctap2Command::Reset.into()]), vec![0]);
+    assert!(!blocked.client_pin_load_failed);
+    assert!(
+        store::load_client_pin_state_from_dir(&store)
+            .unwrap()
+            .is_none()
+    );
+    std::fs::remove_dir_all(store).unwrap();
+}
+
+#[test]
 fn pin_throttle_requires_a_power_cycle_even_for_the_correct_pin() {
     let mut authenticator = new_pin_authenticator();
     for expected in [

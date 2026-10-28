@@ -1800,6 +1800,7 @@ fn authenticator_with_credentials(
             .collect(),
         pending_assertion: None,
         client_pin: None,
+        client_pin_load_failed: false,
         key_agreement: None,
         pin_uv_auth_token: None,
         consecutive_pin_mismatches: 0,

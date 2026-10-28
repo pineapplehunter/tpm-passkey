@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DROP TRIGGER IF EXISTS stop_pin_reset",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "d928d1272c14fa8fc8fd7bbc654c6976ccfa8e97713f56c9ea986d98665d9905"
+}

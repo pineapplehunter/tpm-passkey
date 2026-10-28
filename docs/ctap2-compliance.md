@@ -30,8 +30,8 @@ match this checklist.
 This is an ongoing audit, **not a full conformance claim**. Section completion
 markers describe scoped wire/behavior checks, not certification or security
 assurance. Known remaining gaps include TPM-equivalent protection of PIN state,
-bounded/cancellable host approval, and fail-closed persistent-state loading.
-These require follow-up work.
+bounded/cancellable host approval, and complete credential-record integrity/
+load-failure handling. These require follow-up work.
 
 ## Common Rules
 
@@ -111,6 +111,12 @@ previous tokens across protocols, as required by §6.5.5.7; the active token is
 protocol-tagged, and cross-protocol authentication is rejected even with a valid
 MAC of the requested protocol's length. Tokens are permission- and RP-scoped.
 Under the single-user-machine assumption, tokens are not bound to login sessions.
+
+Malformed fields, missing integrity MACs, missing/unreadable integrity keys, or
+invalid MACs in stored PIN state do not mean "no PIN". Credential/PIN operations
+return `CTAP2_ERR_INTEGRITY_FAILURE` until repair and restart or successful
+explicit reset. GetInfo conservatively reports configured PIN protection so
+standard clients can still discover the authenticator and request reset.
 
 Audit status: **complete for ClientPIN request/response handling and token
 issuance**. Permission consumption and user-presence state during subsequent
@@ -280,9 +286,11 @@ has no physical display, reset is accepted only during the first 10 seconds of
 a new daemon/UHID authenticator generation; a later request returns
 `CTAP2_ERR_NOT_ALLOWED` without prompting.
 
-Reset deletes all credentials and client-PIN state and clears ephemeral token,
-key-agreement, assertion, and credential-management state. Persistence failures
-fail closed with `CTAP2_ERR_OPERATION_DENIED`. Selection does not cache presence
+Reset deletes all credential rows and client-PIN state in one SQLite transaction,
+including credentials not successfully loaded into memory. It clears ephemeral
+token, retry-throttle, key-agreement, assertion, and credential-management state
+only after commit. Persistence failures roll back both PIN and credential
+deletion and return `CTAP2_ERR_OPERATION_DENIED`. Selection does not cache presence
 for a later command.
 
 Recognized but unimplemented bio-enrollment, large-blob, configuration, and
@@ -325,8 +333,8 @@ Audit status: **complete**.
 
 ## Remaining Audit Order
 
-1. Fail closed when persisted PIN state cannot be loaded.
-2. Make host approval bounded and promptly cancellable, including logind lookup.
-3. Protect PIN verifier/retry state with assurances matching TPM private keys.
+1. Make host approval bounded and promptly cancellable, including logind lookup.
+2. Protect PIN verifier/retry state with assurances matching TPM private keys.
+3. Complete credential-record integrity and fail-closed load handling.
 4. Revisit remaining request-type/status and feature-table claims against the
    normative source; rerun browser-critical VM flows after each logical group.

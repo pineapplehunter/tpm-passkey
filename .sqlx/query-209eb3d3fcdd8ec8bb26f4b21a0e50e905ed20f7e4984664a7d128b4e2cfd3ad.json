@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM client_pin_state",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "209eb3d3fcdd8ec8bb26f4b21a0e50e905ed20f7e4984664a7d128b4e2cfd3ad"
+}
