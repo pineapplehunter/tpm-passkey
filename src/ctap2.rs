@@ -566,6 +566,7 @@ impl Authenticator {
             Some((&credential_id, &public_key)),
             extensions.as_ref(),
         );
+        let previous_credentials = self.credentials.clone();
         if let Some(index) = replacement_index {
             self.credentials.remove(index);
         }
@@ -588,7 +589,10 @@ impl Authenticator {
             recovery,
             sign_count: 0,
         });
-        self.save_credentials();
+        if let Err(error) = self.save_credentials() {
+            self.credentials = previous_credentials;
+            return Err(error);
+        }
 
         log::info!(
             "created TPM-backed credential rp_id={} total_credentials={}",
@@ -1145,21 +1149,27 @@ impl Authenticator {
         let id = management_credential_id(params)?;
         let user = validate_management_user(params)?;
         let user_id = map_bytes(user, "id").expect("validated user ID");
-        let credential = self
+        let credential_index = self
             .credentials
-            .iter_mut()
-            .find(|credential| credential.discoverable && credential.id == id)
+            .iter()
+            .position(|credential| credential.discoverable && credential.id == id)
             .ok_or(ErrorStatus::NoCredentials)?;
-        if credential.user_handle != user_id {
+        if self.credentials[credential_index].user_handle != user_id {
             return Err(ErrorStatus::InvalidParameter);
         }
-        credential.user_name = map_text(user, "name")
+        let previous_name = self.credentials[credential_index].user_name.clone();
+        let previous_display_name = self.credentials[credential_index].user_display_name.clone();
+        self.credentials[credential_index].user_name = map_text(user, "name")
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
-        credential.user_display_name = map_text(user, "displayName")
+        self.credentials[credential_index].user_display_name = map_text(user, "displayName")
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
-        self.save_credentials();
+        if let Err(error) = self.save_credentials() {
+            self.credentials[credential_index].user_name = previous_name;
+            self.credentials[credential_index].user_display_name = previous_display_name;
+            return Err(error);
+        }
         self.management = None;
         Ok(encode_empty_response())
     }
@@ -1375,23 +1385,22 @@ impl Authenticator {
         })
     }
 
-    fn save_credentials(&self) {
+    fn save_credentials(&self) -> Result<(), ErrorStatus> {
         let credentials: Vec<store::StoredCtap2Credential> = self
             .credentials
             .iter()
             .map(store::StoredCtap2Credential::from)
             .collect();
-
-        let path = store::credentials_database_path_in_dir(&self.store_dir);
-        if let Err(error) = store::save_ctap2_credentials_to_dir(&self.store_dir, &credentials) {
+        store::save_ctap2_credentials_to_dir(&self.store_dir, &credentials).map_err(|error| {
             log::warn!("failed to save CTAP2 credential store: {error:?}");
-        } else {
-            log::info!(
-                "saved {} TPM-backed CTAP2 credentials to SQLite store {}",
-                credentials.len(),
-                path.display()
-            );
-        }
+            ErrorStatus::OperationDenied
+        })?;
+        log::info!(
+            "saved {} TPM-backed CTAP2 credentials to SQLite store {}",
+            credentials.len(),
+            store::credentials_database_path_in_dir(&self.store_dir).display()
+        );
+        Ok(())
     }
 
     fn ensure_tpm(&mut self) -> Option<&mut tpm::Tpm> {

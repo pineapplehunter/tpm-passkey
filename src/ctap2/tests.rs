@@ -1353,6 +1353,30 @@ fn unsupported_policy_version_rejects_assertion() {
 }
 
 #[test]
+fn credential_metadata_update_rolls_back_when_storage_fails() {
+    let mut authenticator = authenticator_with_credential("example.com", vec![1]);
+    let real_store = authenticator.store_dir.clone();
+    let blocked_store = real_store.with_extension("blocked");
+    std::fs::write(&blocked_store, b"not a directory").unwrap();
+    authenticator.store_dir = blocked_store.clone();
+    let old = authenticator.credentials[0].clone();
+    let params = cbor_map(
+        cbor!({
+            2 => { "type" => "public-key", "id" => bytes(old.id.clone()) },
+            3 => { "id" => bytes(old.user_handle.clone()), "name" => "replacement name" },
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        authenticator.update_user_information(Some(&params)),
+        Err(ErrorStatus::OperationDenied)
+    );
+    assert_eq!(authenticator.credentials[0], old);
+    std::fs::remove_file(blocked_store).unwrap();
+    std::fs::remove_dir_all(real_store).unwrap();
+}
+
+#[test]
 fn recovery_unlock_rotation_and_policy_updates_require_the_phrase() {
     let mut authenticator = authenticator_with_credentials(
         "example.com",
@@ -1419,7 +1443,7 @@ fn recovery_unlock_rotation_and_policy_updates_require_the_phrase() {
         );
     }
     // A later registration save cannot restore old encrypted slots from memory.
-    authenticator.save_credentials();
+    authenticator.save_credentials().expect("save credentials");
     let config = store::load_recovery_config(&authenticator.store_dir)
         .unwrap()
         .unwrap();
