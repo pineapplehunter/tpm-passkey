@@ -131,11 +131,13 @@ RUST_LOG=tpm_passkey=debug,sqlx=warn,zbus=warn
 
 - Unit tests cover CTAP parsing, state transitions, authenticator data,
   Client PIN, CTAPHID framing, storage, and PCR selection.
-- The NixOS VM test exercises UHID discovery, polkit approval, a software TPM,
-  credential creation/assertion, PIN management, PCR recovery, reboot
-  persistence, and CTAP compliance through `python-fido2`. Fault tests stop
-  logind/polkit processes while approval is pending, cancel over real UHID, and
-  verify worker recovery; a D-Bus monitor checks polkit cancellation identity.
+- Independent NixOS tests under `nix/tests/<case>/` exercise focused UHID,
+  protocol, management, PIN, reset, integrity, approval, PCR and recovery cases.
+  Each directory has its Nix test, reason and case-specific assets. Shared
+  machine configuration, driver helpers and credential fixtures stay directly
+  in `nix/tests/`; see its [test index](../nix/tests/README.md).
+  Fault tests stop logind/polkit during approval and cancel over real UHID;
+  a D-Bus monitor checks polkit cancellation identity.
 
 The NixOS VM uses `/dev/tpm0`, so all management TPM operations must pass
 through the daemon-owned TPM command channel.

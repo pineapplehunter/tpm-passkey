@@ -20,8 +20,11 @@ startup/load failure gating, live registration/assertion reload, and repair.
 Extended VM fault injection covers both live corruption and startup failure,
 verifying restored metadata/keyslots exactly match the original snapshot.
 
-Local tests passed (109); an additional CM reload uses the same tested helper.
-Final validation will run after the user-requested NixOS test decomposition.
+Validated nix fmt, cargo check and cargo test (109), including the final CM
+reload wiring. After the user-requested NixOS test decomposition, full flake
+check passed (task 4), including standalone state-integrity corruption/repair
+and real signing after repair. All twelve host-system VM checks passed.
+Evidence: /tmp/nixos-split-final.log.
 
 Remaining observation: assertion candidates are reversed in-memory, but loading
 currently orders by RP/credential ID rather than creation time. Newest-first

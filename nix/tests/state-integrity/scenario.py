@@ -12,13 +12,22 @@ STORE = "/var/lib/tpm-passkey/credentials.sqlite"
 
 
 def restart():
+    # This fixture intentionally cycles the service faster than systemd's
+    # production start-rate limit. Reset that counter, not the daemon policy.
+    subprocess.run(["systemctl", "reset-failed", "tpm-passkey"], check=True, timeout=5)
     subprocess.run(["systemctl", "restart", "tpm-passkey"], check=True, timeout=20)
+    device, _ = connect()  # Wait for the worker before the next corruption.
+    device.close()
 
 
 def connect():
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        devices = list(CtapHidDevice.list_devices())
+        try:
+            devices = list(CtapHidDevice.list_devices())
+        except OSError:
+            time.sleep(0.1)
+            continue
         if devices:
             try:
                 return devices[0], Ctap2(devices[0])
