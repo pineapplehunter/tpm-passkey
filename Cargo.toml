@@ -12,6 +12,7 @@ base64 = "0.23"
 bitflags = { version = "2.13.1", features = ["std"] }
 cbc = "0.2"
 ciborium = "0.2.2"
+ciborium-ll = "0.2.2"
 clap = { version = "4.5.53", features = ["derive"] }
 color-eyre = "0.6.5"
 env_logger = "0.11.8"

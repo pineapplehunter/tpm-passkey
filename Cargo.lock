@@ -1579,6 +1579,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cbc",
  "ciborium",
+ "ciborium-ll",
  "clap",
  "color-eyre",
  "env_logger",

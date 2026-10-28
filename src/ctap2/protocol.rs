@@ -1,3 +1,5 @@
+pub(crate) const MAX_MSG_SIZE: usize = 1200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Ctap2Command {
@@ -61,6 +63,7 @@ impl From<Ctap2Command> for u8 {
 pub(super) enum ErrorStatus {
     InvalidCommand = 0x01,
     InvalidParameter = 0x02,
+    CborUnexpectedType = 0x11,
     InvalidCbor = 0x12,
     MissingParameter = 0x14,
     CredentialExcluded = 0x19,
@@ -79,6 +82,7 @@ pub(super) enum ErrorStatus {
     PinNotSet = 0x35,
     PuatRequired = 0x36,
     PinPolicyViolation = 0x37,
+    RequestTooLarge = 0x39,
     InvalidSubcommand = 0x3e,
     UnauthorizedPermission = 0x40,
 }

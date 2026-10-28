@@ -1,12 +1,123 @@
 use ciborium::{cbor, value::Value};
+use ciborium_ll::{Decoder, Header};
+use std::{cmp::Ordering, ops::Range};
 
 use super::ErrorStatus;
 
 pub(super) fn decode_map(body: &[u8]) -> Result<Vec<(Value, Value)>, ErrorStatus> {
+    validate_canonical(body)?;
     match ciborium::from_reader::<Value, _>(body) {
         Ok(Value::Map(map)) => Ok(map),
-        Ok(_) | Err(_) => Err(ErrorStatus::InvalidCbor),
+        Ok(_) => Err(ErrorStatus::CborUnexpectedType),
+        Err(_) => Err(ErrorStatus::InvalidCbor),
     }
+}
+
+/// Validate CTAP's wire-level canonical form before allocating a Value tree.
+/// Ciborium does the CBOR parsing; this adds the restrictions from CTAP §8.
+/// In particular, round-trip serialization is not a validator: CTAP preserves
+/// float widths, whereas a general-purpose encoder may shorten floats.
+fn validate_canonical(body: &[u8]) -> Result<(), ErrorStatus> {
+    let mut offset = 0;
+    scan_item(body, &mut offset, 0)?;
+    if offset != body.len() {
+        return Err(ErrorStatus::InvalidCbor);
+    }
+    Ok(())
+}
+
+fn integer_width(value: u64) -> usize {
+    match value {
+        0..=23 => 1,
+        24..=0xff => 2,
+        0x100..=0xffff => 3,
+        0x10000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+fn key_order(left: &[u8], right: &[u8]) -> Ordering {
+    (left[0] >> 5)
+        .cmp(&(right[0] >> 5))
+        .then_with(|| left.len().cmp(&right.len()))
+        .then_with(|| left.cmp(right))
+}
+
+fn scan_item(body: &[u8], offset: &mut usize, depth: usize) -> Result<Range<usize>, ErrorStatus> {
+    let start = *offset;
+    let mut decoder = Decoder::from(body.get(start..).ok_or(ErrorStatus::InvalidCbor)?);
+    let header = decoder.pull().map_err(|_| ErrorStatus::InvalidCbor)?;
+    let width = decoder.offset();
+    *offset += width;
+    let value = match header {
+        Header::Positive(value) | Header::Negative(value) => Some(value),
+        Header::Bytes(Some(len))
+        | Header::Text(Some(len))
+        | Header::Array(Some(len))
+        | Header::Map(Some(len)) => Some(len as u64),
+        Header::Float(_) => None, // All three float widths are canonical in CTAP.
+        Header::Simple(value) if value < 24 && width == 1 => None,
+        Header::Simple(value) if value >= 32 && width == 2 => None,
+        _ => return Err(ErrorStatus::InvalidCbor), // No tags or indefinite items.
+    };
+    if value.is_some_and(|value| integer_width(value) != width) {
+        return Err(ErrorStatus::InvalidCbor);
+    }
+    match header {
+        Header::Bytes(Some(len)) | Header::Text(Some(len)) => {
+            *offset = offset
+                .checked_add(len)
+                .filter(|end| *end <= body.len())
+                .ok_or(ErrorStatus::InvalidCbor)?;
+        }
+        Header::Array(Some(len)) => {
+            if depth >= 4 {
+                return Err(ErrorStatus::InvalidCbor);
+            }
+            for _ in 0..len {
+                scan_item(body, offset, depth + 1)?;
+            }
+        }
+        Header::Map(Some(len)) => {
+            if depth >= 4 {
+                return Err(ErrorStatus::InvalidCbor);
+            }
+            let mut previous: Option<Range<usize>> = None;
+            for _ in 0..len {
+                let key = scan_item(body, offset, depth + 1)?;
+                if previous.as_ref().is_some_and(|previous| {
+                    key_order(&body[previous.clone()], &body[key.clone()]) != Ordering::Less
+                }) {
+                    return Err(ErrorStatus::InvalidCbor);
+                }
+                scan_item(body, offset, depth + 1)?;
+                previous = Some(key);
+            }
+        }
+        _ => {}
+    }
+    Ok(start..*offset)
+}
+
+/// Return a parameter's exact canonical bytes (including float widths).
+/// Authenticated command parameters must not be decoded and reserialized before
+/// MAC verification, which would change valid wide-float encodings (§8).
+pub(super) fn encoded_map_value(body: &[u8], key: u64) -> Result<Option<&[u8]>, ErrorStatus> {
+    validate_canonical(body)?;
+    let mut decoder = Decoder::from(body);
+    let Header::Map(Some(len)) = decoder.pull().map_err(|_| ErrorStatus::InvalidCbor)? else {
+        return Err(ErrorStatus::CborUnexpectedType);
+    };
+    let mut offset = decoder.offset();
+    for _ in 0..len {
+        let key_range = scan_item(body, &mut offset, 1)?;
+        let value_range = scan_item(body, &mut offset, 1)?;
+        let mut key_decoder = Decoder::from(&body[key_range]);
+        if matches!(key_decoder.pull(), Ok(Header::Positive(found)) if found == key) {
+            return Ok(Some(&body[value_range]));
+        }
+    }
+    Ok(None)
 }
 
 pub(super) trait MapKey {
@@ -153,7 +264,10 @@ pub(super) fn canonicalize_value(value: Value) -> Value {
                 .map(|(key, value)| (key, canonicalize_value(value)))
                 .collect();
             entries.sort_by(|(left_key, _), (right_key, _)| {
-                canonical_key_bytes(left_key).cmp(&canonical_key_bytes(right_key))
+                key_order(
+                    &canonical_key_bytes(left_key),
+                    &canonical_key_bytes(right_key),
+                )
             });
             Value::Map(entries)
         }

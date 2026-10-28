@@ -35,8 +35,8 @@ mod protocol;
 
 use authenticator_data::*;
 use cbor_codec::*;
-use protocol::ErrorStatus;
 pub use protocol::{Ctap2Command, UnknownCtapCommandError, command_name};
+use protocol::{ErrorStatus, MAX_MSG_SIZE};
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcEncryptor = cbc::Encryptor<Aes256>;
@@ -201,6 +201,9 @@ impl Authenticator {
     }
 
     pub fn handle_cbor(&mut self, payload: &[u8]) -> Vec<u8> {
+        if payload.len() > MAX_MSG_SIZE {
+            return error_response(ErrorStatus::RequestTooLarge);
+        }
         let Some((&command, body)) = payload.split_first() else {
             return error_response(ErrorStatus::InvalidCommand);
         };
@@ -946,7 +949,10 @@ impl Authenticator {
             7 => self.credential_rp_id_for_params(params, true)?,
             _ => unreachable!("continuation commands returned above"),
         };
-        let message = management_auth_message(sub_command, params);
+        let mut message = vec![sub_command as u8];
+        if let Some(params) = encoded_map_value(body, 2)? {
+            message.extend_from_slice(params);
+        }
         self.validate_pin_uv_auth(
             Some(protocol),
             Some(auth_param),
@@ -1744,7 +1750,7 @@ fn get_info_response(client_pin: bool) -> Vec<u8> {
                 "makeCredUvNotRqd" => true,
             },
             6 => [PIN_UV_AUTH_PROTOCOL],
-            5 => 1200,
+            5 => MAX_MSG_SIZE as u64,
             9 => ["usb"],
             10 => [{"type" => "public-key", "alg" => COSE_ALG_ES256}],
             13 => 4,
@@ -2354,6 +2360,7 @@ fn fill_random(bytes: &mut [u8]) {
     getrandom::fill(bytes).expect("kernel random source available");
 }
 
+#[cfg(test)]
 fn management_auth_message(sub_command: i128, params: Option<&[(Value, Value)]>) -> Vec<u8> {
     let mut encoded = vec![sub_command as u8];
     if let Some(params) = params {
@@ -2363,5 +2370,7 @@ fn management_auth_message(sub_command: i128, params: Option<&[(Value, Value)]>)
     encoded
 }
 
+#[cfg(test)]
+mod cbor_compliance_tests;
 #[cfg(test)]
 mod tests;

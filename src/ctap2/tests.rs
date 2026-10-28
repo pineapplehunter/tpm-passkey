@@ -1614,7 +1614,7 @@ fn test_credential(id: Vec<u8>, rp_id: &str, sign_count: u32) -> StoredCredentia
 
 fn ctap_request(command: Ctap2Command, body: Value) -> Vec<u8> {
     let mut payload = vec![command.into()];
-    ciborium::into_writer(&body, &mut payload).expect("serialize CTAP request");
+    ciborium::into_writer(&canonicalize_value(body), &mut payload).expect("serialize CTAP request");
     payload
 }
 
@@ -1676,6 +1676,25 @@ fn pin_auth_param(key: &[u8; 32], message: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
     mac.update(message);
     mac.finalize().into_bytes().to_vec()
+}
+
+#[test]
+fn credential_management_authenticates_exact_canonical_parameter_bytes() {
+    let mut authenticator = authenticator_with_credential("example.com", vec![1]);
+    let token = install_credential_management_token(&mut authenticator, None);
+    let mut params = vec![0xa2, 1, 0x58, 32];
+    params.extend_from_slice(&Sha256::digest(b"example.com"));
+    // Unknown parameter 255 is ignored, but its valid 64-bit float encoding is
+    // part of the authenticated message and MUST NOT be shortened to float16.
+    params.extend_from_slice(&[0x18, 0xff, 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0]);
+    let mut mac = HmacSha256::new_from_slice(&token).unwrap();
+    mac.update(&[4]);
+    mac.update(&params);
+    let mut request = vec![0x0a, 0xa4, 1, 4, 2];
+    request.extend_from_slice(&params);
+    request.extend_from_slice(&[3, 2, 4, 0x58, 32]);
+    request.extend_from_slice(&mac.finalize().into_bytes());
+    assert_eq!(authenticator.handle_cbor(&request)[0], 0);
 }
 
 fn install_credential_management_token(
