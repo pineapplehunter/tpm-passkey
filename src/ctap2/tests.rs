@@ -1353,6 +1353,97 @@ fn unsupported_policy_version_rejects_assertion() {
 }
 
 #[test]
+fn assertion_enumeration_advances_only_after_counter_persistence() {
+    let mut authenticator = authenticator_with_credentials(
+        "example.com",
+        vec![
+            test_credential(vec![1], "example.com", 0),
+            test_credential(vec![2], "example.com", 0),
+            test_credential(vec![3], "example.com", 0),
+        ],
+    );
+    let real_store = authenticator.store_dir.clone();
+    let blocked_store = real_store.with_extension("blocked");
+    std::fs::write(&blocked_store, b"not a directory").unwrap();
+    let request = ctap_request(
+        Ctap2Command::GetAssertion,
+        cbor!({ 1 => "example.com", 2 => bytes([0x11; 32]) }).unwrap(),
+    );
+    authenticator.store_dir = blocked_store.clone();
+    assert_eq!(authenticator.handle_cbor(&request), vec![0x27]);
+    assert!(authenticator.pending_assertion.is_none());
+    authenticator.store_dir = real_store.clone();
+    assert_eq!(authenticator.handle_cbor(&request)[0], 0);
+    let indexes = authenticator
+        .pending_assertion
+        .as_ref()
+        .unwrap()
+        .credential_indexes
+        .clone();
+    authenticator.store_dir = blocked_store.clone();
+    assert_eq!(
+        authenticator.get_next_assertion(&[]),
+        Err(ErrorStatus::OperationDenied)
+    );
+    assert_eq!(
+        authenticator
+            .pending_assertion
+            .as_ref()
+            .unwrap()
+            .credential_indexes,
+        indexes
+    );
+    assert_eq!(authenticator.credentials[indexes[0]].sign_count, 0);
+    authenticator.store_dir = real_store.clone();
+    assert!(authenticator.get_next_assertion(&[]).is_ok());
+    assert_eq!(authenticator.credentials[indexes[0]].sign_count, 1);
+    assert!(authenticator.get_next_assertion(&[]).is_ok());
+    assert_eq!(
+        authenticator.get_next_assertion(&[]),
+        Err(ErrorStatus::NotAllowed)
+    );
+    std::fs::remove_file(blocked_store).unwrap();
+    std::fs::remove_dir_all(real_store).unwrap();
+}
+
+#[test]
+fn assertion_continuation_is_invalidated_by_expired_tokens_and_interruption() {
+    let mut authenticator = authenticator_with_credentials(
+        "example.com",
+        vec![
+            test_credential(vec![1], "example.com", 0),
+            test_credential(vec![2], "example.com", 0),
+        ],
+    );
+    let request = ctap_request(
+        Ctap2Command::GetAssertion,
+        cbor!({ 1 => "example.com", 2 => bytes([0x11; 32]) }).unwrap(),
+    );
+    assert_eq!(authenticator.handle_cbor(&request)[0], 0);
+    let token = install_credential_management_token(&mut authenticator, None);
+    authenticator.pending_assertion.as_mut().unwrap().token = Some(token);
+    authenticator.pin_uv_auth_token.as_mut().unwrap().issued_at =
+        Instant::now() - Duration::from_secs(601);
+    assert_eq!(
+        authenticator.get_next_assertion(&[]),
+        Err(ErrorStatus::NotAllowed)
+    );
+    assert!(authenticator.pending_assertion.is_none());
+    authenticator.pin_uv_auth_token = None;
+    assert_eq!(authenticator.handle_cbor(&request)[0], 0);
+    let interrupt = ctap_request(
+        Ctap2Command::CredentialManagement,
+        cbor!({ 1 => 99 }).unwrap(),
+    );
+    assert_eq!(authenticator.handle_cbor(&interrupt), vec![0x3e]);
+    assert_eq!(
+        authenticator.get_next_assertion(&[]),
+        Err(ErrorStatus::NotAllowed)
+    );
+    std::fs::remove_dir_all(&authenticator.store_dir).unwrap();
+}
+
+#[test]
 fn credential_metadata_update_rolls_back_when_storage_fails() {
     let mut authenticator = authenticator_with_credential("example.com", vec![1]);
     let real_store = authenticator.store_dir.clone();

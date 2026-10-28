@@ -117,12 +117,14 @@ struct ManagementState {
     last_used_at: Instant,
 }
 
+#[derive(Clone)]
 struct PendingAssertion {
     rp_id: String,
     client_data_hash: Vec<u8>,
     credential_indexes: Vec<usize>,
     total_credentials: usize,
     created_at: Instant,
+    token: Option<Vec<u8>>,
     user_presence: bool,
     user_verified: bool,
 }
@@ -214,10 +216,7 @@ impl Authenticator {
             return error_response(ErrorStatus::InvalidCommand);
         };
 
-        if !matches!(
-            command,
-            Ctap2Command::GetNextAssertion | Ctap2Command::CredentialManagement
-        ) {
+        if command != Ctap2Command::GetNextAssertion {
             self.pending_assertion = None;
         }
         if !matches!(command, Ctap2Command::CredentialManagement) {
@@ -664,20 +663,6 @@ impl Authenticator {
             self.consume_pin_uv_auth_token_after_user_presence();
         }
 
-        self.pending_assertion = if remaining_indexes.is_empty() || allow_list.is_some() {
-            None
-        } else {
-            Some(PendingAssertion {
-                rp_id: rp_id.to_owned(),
-                client_data_hash: client_data_hash.to_vec(),
-                credential_indexes: remaining_indexes.to_vec(),
-                total_credentials: credential_indexes.len(),
-                created_at: Instant::now(),
-                user_presence,
-                user_verified,
-            })
-        };
-
         let (auth_data, user, credential_id, key, policy, authority, rp_log, sign_count) = {
             let credential = &self.credentials[credential_index];
             let sign_count = credential.sign_count.saturating_add(1);
@@ -730,6 +715,24 @@ impl Authenticator {
         }
 
         self.credentials[credential_index].sign_count = sign_count;
+        self.pending_assertion = if remaining_indexes.is_empty() || allow_list.is_some() {
+            None
+        } else {
+            Some(PendingAssertion {
+                rp_id: rp_id.to_owned(),
+                client_data_hash: client_data_hash.to_vec(),
+                credential_indexes: remaining_indexes.to_vec(),
+                total_credentials: credential_indexes.len(),
+                created_at: Instant::now(),
+                token: self
+                    .pin_uv_auth_token
+                    .as_ref()
+                    .filter(|_| user_verified)
+                    .map(|token| token.value.clone()),
+                user_presence,
+                user_verified,
+            })
+        };
         log::info!(
             "asserting credential rp_id={} sign_count={}",
             rp_log,
@@ -754,34 +757,37 @@ impl Authenticator {
             return Err(ErrorStatus::InvalidCbor);
         }
 
-        let Some(pending) = self.pending_assertion.take() else {
+        let Some(pending) = self.pending_assertion.clone() else {
             return Err(ErrorStatus::NotAllowed);
         };
 
-        if pending.created_at.elapsed() > Duration::from_secs(30) {
+        if pending.created_at.elapsed() > Duration::from_secs(30)
+            || pending.token.as_ref().is_some_and(|expected| {
+                !self.pin_uv_auth_token.as_ref().is_some_and(|token| {
+                    &token.value == expected
+                        && token.issued_at.elapsed() <= Duration::from_secs(600)
+                })
+            })
+        {
+            self.pending_assertion = None;
             return Err(ErrorStatus::NotAllowed);
         }
 
         let Some((&credential_index, remaining_indexes)) = pending.credential_indexes.split_first()
         else {
+            self.pending_assertion = None;
             return Err(ErrorStatus::NotAllowed);
         };
-
-        self.pending_assertion = if remaining_indexes.is_empty() {
-            None
-        } else {
-            Some(PendingAssertion {
-                rp_id: pending.rp_id.clone(),
-                client_data_hash: pending.client_data_hash.clone(),
-                credential_indexes: remaining_indexes.to_vec(),
-                total_credentials: pending.total_credentials,
-                created_at: Instant::now(),
-                user_presence: pending.user_presence,
-                user_verified: pending.user_verified,
-            })
+        let Some(credential) = self.credentials.get(credential_index) else {
+            self.pending_assertion = None;
+            return Err(ErrorStatus::NotAllowed);
         };
-
-        let credential = &self.credentials[credential_index];
+        if credential.rp_id != pending.rp_id
+            || pending.total_credentials < pending.credential_indexes.len() + 1
+        {
+            self.pending_assertion = None;
+            return Err(ErrorStatus::NotAllowed);
+        }
         let sign_count = credential.sign_count.saturating_add(1);
         let auth_data = make_auth_data(
             &credential.rp_id,
@@ -825,6 +831,15 @@ impl Authenticator {
         }
 
         self.credentials[credential_index].sign_count = sign_count;
+        self.pending_assertion = if remaining_indexes.is_empty() {
+            None
+        } else {
+            Some(PendingAssertion {
+                credential_indexes: remaining_indexes.to_vec(),
+                created_at: Instant::now(),
+                ..pending
+            })
+        };
 
         Ok(encode_assertion_response(
             credential_id,
