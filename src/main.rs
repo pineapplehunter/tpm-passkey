@@ -8,7 +8,7 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail, eyre},
 };
-use linux_tpm_fido2::{ctaphid, hid, management, session, store, tpm};
+use linux_tpm_fido2::{ctaphid, hid, management, store, tpm};
 use rpassword::prompt_password;
 use uhid_virt::{OutputEvent, StreamError, UHIDDevice};
 
@@ -142,9 +142,6 @@ fn run_daemon(args: DaemonArgs) -> Result<()> {
         "credential database: {}",
         store::credentials_database_path_in_dir(&store_dir).display()
     );
-
-    let session = session::SessionContext::detect();
-    log::info!("session model: {}", session.describe());
 
     if args.dry_run {
         log::info!("dry run: not opening UHID or TPM devices");

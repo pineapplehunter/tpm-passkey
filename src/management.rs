@@ -1,7 +1,6 @@
 use color_eyre::Result;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,29 +13,6 @@ pub use protocol::{CredentialTarget, ManagementRequest, ManagementResponse, valu
 use service::dispatch;
 
 use crate::ctap2;
-
-fn peer_uid(stream: &UnixStream) -> Result<u32> {
-    let mut ucred = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut ucred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        Err(color_eyre::eyre::eyre!("SO_PEERCRED failed: {rc}"))
-    } else {
-        Ok(ucred.uid)
-    }
-}
 
 /// Returns the well-known path for the management Unix socket.
 pub fn management_socket_path() -> PathBuf {
@@ -65,14 +41,6 @@ fn handle_client(
     store_dir: PathBuf,
     tpm_cmd_tx: Option<ctap2::TpmCmdSender>,
 ) {
-    let peer_uid = match peer_uid(&stream) {
-        Ok(uid) => uid,
-        Err(e) => {
-            log::warn!("management: failed to get peer UID: {e}");
-            return;
-        }
-    };
-
     let data = match recv_message(&mut stream) {
         Ok(d) => d,
         Err(e) => {
@@ -97,7 +65,7 @@ fn handle_client(
         }
     };
 
-    let response = dispatch(&store_dir, tpm_cmd_tx.as_ref(), peer_uid, &request);
+    let response = dispatch(&store_dir, tpm_cmd_tx.as_ref(), &request);
     let mut encoded = Vec::new();
     if let Err(e) = ciborium::into_writer(&response, &mut encoded) {
         log::warn!("management: failed to encode response: {e}");

@@ -6,10 +6,6 @@ use zeroize::Zeroize;
 use super::{CredentialTarget, ManagementRequest, ManagementResponse};
 use crate::{ctap2, store, tpm};
 
-fn filter_uid(uid: u32) -> Option<u32> {
-    if uid == 0 { None } else { Some(uid) }
-}
-
 fn check_pcr_stale(
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
     policy: &store::StoredPcrPolicy,
@@ -40,10 +36,8 @@ fn check_pcr_stale(
 fn handle_list_credentials(
     store_dir: &Path,
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
-    peer_uid: u32,
 ) -> ManagementResponse {
-    let user_id = filter_uid(peer_uid);
-    let credentials = match store::load_ctap2_credentials_from_dir(store_dir, user_id) {
+    let credentials = match store::load_ctap2_credentials_from_dir(store_dir) {
         Ok(credentials) => credentials,
         Err(error) => {
             return ManagementResponse {
@@ -53,7 +47,7 @@ fn handle_list_credentials(
             };
         }
     };
-    let summaries = match store::load_credential_summaries_from_dir(store_dir, user_id) {
+    let summaries = match store::load_credential_summaries_from_dir(store_dir) {
         Ok(summaries) => summaries,
         Err(error) => {
             return ManagementResponse {
@@ -111,7 +105,6 @@ fn handle_list_credentials(
 fn handle_update_passphrase(
     store_dir: &Path,
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
-    peer_uid: u32,
     old_passphrase: Option<&str>,
     new_passphrase: &str,
 ) -> ManagementResponse {
@@ -187,8 +180,7 @@ fn handle_update_passphrase(
     }
 
     // Update per-credential recovery passphrases to match the new daemon passphrase.
-    let credentials = match store::load_ctap2_credentials_from_dir(store_dir, filter_uid(peer_uid))
-    {
+    let credentials = match store::load_ctap2_credentials_from_dir(store_dir) {
         Ok(c) => c,
         Err(e) => {
             new_salt.zeroize();
@@ -286,12 +278,10 @@ fn handle_update_passphrase(
 }
 fn handle_update_pcr_reference(
     store_dir: &Path,
-    peer_uid: u32,
     passphrase: &str,
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
 ) -> ManagementResponse {
-    let credentials = match store::load_ctap2_credentials_from_dir(store_dir, filter_uid(peer_uid))
-    {
+    let credentials = match store::load_ctap2_credentials_from_dir(store_dir) {
         Ok(c) => c,
         Err(e) => {
             return ManagementResponse {
@@ -492,7 +482,6 @@ fn handle_update_pcr_reference(
 fn handle_update_pcr_policy(
     store_dir: &Path,
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
-    peer_uid: u32,
     passphrase: &str,
     pcr_indices: &[u32],
     credential_target: &CredentialTarget,
@@ -505,8 +494,7 @@ fn handle_update_pcr_policy(
         };
     }
 
-    let credentials = match store::load_ctap2_credentials_from_dir(store_dir, filter_uid(peer_uid))
-    {
+    let credentials = match store::load_ctap2_credentials_from_dir(store_dir) {
         Ok(c) => c,
         Err(e) => {
             return ManagementResponse {
@@ -782,25 +770,21 @@ fn handle_show_config(store_dir: &Path) -> ManagementResponse {
 pub(super) fn dispatch(
     store_dir: &Path,
     tpm_cmd_tx: Option<&ctap2::TpmCmdSender>,
-    peer_uid: u32,
     request: &ManagementRequest,
 ) -> ManagementResponse {
     match request {
-        ManagementRequest::ListCredentials => {
-            handle_list_credentials(store_dir, tpm_cmd_tx, peer_uid)
-        }
+        ManagementRequest::ListCredentials => handle_list_credentials(store_dir, tpm_cmd_tx),
         ManagementRequest::UpdatePassphrase {
             old_passphrase,
             new_passphrase,
         } => handle_update_passphrase(
             store_dir,
             tpm_cmd_tx,
-            peer_uid,
             old_passphrase.as_deref(),
             new_passphrase,
         ),
         ManagementRequest::UpdatePcrReference { passphrase } => {
-            handle_update_pcr_reference(store_dir, peer_uid, passphrase, tpm_cmd_tx)
+            handle_update_pcr_reference(store_dir, passphrase, tpm_cmd_tx)
         }
         ManagementRequest::UpdatePcrPolicy {
             passphrase,
@@ -809,7 +793,6 @@ pub(super) fn dispatch(
         } => handle_update_pcr_policy(
             store_dir,
             tpm_cmd_tx,
-            peer_uid,
             passphrase,
             pcr_indices,
             credential_target,

@@ -13,7 +13,7 @@ use bitflags::bitflags;
 use color_eyre::eyre::WrapErr;
 use zeroize::Zeroize;
 
-use crate::{approval, credential::Credential, session, store, tpm};
+use crate::{approval, credential::Credential, store, tpm};
 use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt};
 use cbc::cipher::{KeyIvInit, block_padding::NoPadding};
@@ -65,7 +65,6 @@ pub struct Authenticator {
     store_dir: PathBuf,
     tpm_path: Option<PathBuf>,
     tpm: Option<tpm::Tpm>,
-    session: session::SessionContext,
     approval: Box<dyn approval::UserApproval>,
     credentials: Vec<Credential>,
     pending_assertion: Option<PendingAssertion>,
@@ -91,8 +90,6 @@ struct PinUvAuthToken {
     value: Vec<u8>,
     permissions: Ctap2PermissionFlags,
     rp_id: Option<String>,
-    session_uid: Option<u32>,
-    session_id: Option<String>,
     issued_at: Instant,
     first_used_at: Option<Instant>,
     user_present_until: Option<Instant>,
@@ -110,8 +107,6 @@ struct ManagementState {
     rp_position: usize,
     credential_indexes: Vec<usize>,
     credential_position: usize,
-    session_uid: Option<u32>,
-    session_id: Option<String>,
     token: Vec<u8>,
     last_used_at: Instant,
 }
@@ -122,7 +117,6 @@ struct PendingAssertion {
     credential_indexes: Vec<usize>,
     total_credentials: usize,
     created_at: Instant,
-    session_uid: Option<u32>,
     user_presence: bool,
     user_verified: bool,
 }
@@ -137,9 +131,8 @@ impl Authenticator {
         tpm_path: Option<PathBuf>,
         approval: Box<dyn approval::UserApproval>,
     ) -> Self {
-        let session = session::SessionContext::detect();
         let tpm = None;
-        let credentials = Self::load_credentials_from_disk(&store_dir, session.uid);
+        let credentials = Self::load_credentials_from_disk(&store_dir);
         log::info!("loaded {} TPM-backed CTAP2 credentials", credentials.len());
         let client_pin = match store::load_client_pin_state_from_dir(&store_dir) {
             Ok(Some(state)) => Some(ClientPinState {
@@ -158,7 +151,6 @@ impl Authenticator {
             store_dir,
             tpm_path,
             tpm,
-            session,
             approval,
             credentials,
             pending_assertion: None,
@@ -173,8 +165,8 @@ impl Authenticator {
         }
     }
 
-    fn load_credentials_from_disk(store_dir: &PathBuf, uid: Option<u32>) -> Vec<Credential> {
-        match store::load_ctap2_credentials_from_dir(store_dir, uid) {
+    fn load_credentials_from_disk(store_dir: &PathBuf) -> Vec<Credential> {
+        match store::load_ctap2_credentials_from_dir(store_dir) {
             Ok(credentials) => credentials.into_iter().map(Credential::from).collect(),
             Err(error) => {
                 log::warn!("failed to reload CTAP2 credential store: {error:?}");
@@ -451,8 +443,8 @@ impl Authenticator {
             });
         }
 
-        if self.operation_is_cancelled() || !self.session.verify_matches_current() {
-            log::error!("session changed or operation cancelled before registration approval");
+        if self.operation_is_cancelled() {
+            log::error!("operation cancelled before registration approval");
             return Err(ErrorStatus::OperationDenied);
         }
 
@@ -476,12 +468,11 @@ impl Authenticator {
             return Err(ErrorStatus::CredentialExcluded);
         }
 
-        if self.operation_is_cancelled() || !self.session.verify_matches_current() {
-            log::error!("session changed or operation cancelled during registration approval");
+        if self.operation_is_cancelled() {
+            log::error!("operation cancelled during registration approval");
             return Err(ErrorStatus::OperationDenied);
         }
 
-        let owner_uid = self.session.uid;
         let daemon_passphrase = match store::load_daemon_passphrase_from_dir(&self.store_dir) {
             Ok(Some((salt, hash, kdf))) => Some((salt, hash, kdf)),
             _ => None,
@@ -524,7 +515,7 @@ impl Authenticator {
             }
         };
         if let Some(material) = &recovery_material {
-            let policy_ref = tpm::credential_policy_ref(&credential_id, owner_uid);
+            let policy_ref = tpm::credential_policy_ref(&credential_id);
             policy = match tpm.create_authorized_policy(&policy, &material.key, &policy_ref) {
                 Ok(policy) => policy,
                 Err(error) => {
@@ -571,7 +562,7 @@ impl Authenticator {
             id: credential_id,
             rp_id: rp_id.to_owned(),
             discoverable,
-            user_id: self.session.uid,
+            user_id: None,
             user_handle: user_handle.to_vec(),
             user_name: user_name.map(str::to_owned),
             user_display_name: user_display_name.map(str::to_owned),
@@ -638,7 +629,7 @@ impl Authenticator {
         // Reload credentials from disk when running as daemon (tpm_path is set)
         // to pick up management-side modifications (e.g., update-pcr-reference).
         if self.tpm_path.is_some() {
-            self.credentials = Self::load_credentials_from_disk(&self.store_dir, self.session.uid);
+            self.credentials = Self::load_credentials_from_disk(&self.store_dir);
         }
         let credential_indexes = matching_credential_indexes(&self.credentials, rp_id, allow_list);
         let Some((&credential_index, remaining_indexes)) = credential_indexes.split_first() else {
@@ -668,7 +659,6 @@ impl Authenticator {
                 credential_indexes: remaining_indexes.to_vec(),
                 total_credentials: credential_indexes.len(),
                 created_at: Instant::now(),
-                session_uid: self.session.uid,
                 user_presence,
                 user_verified,
             })
@@ -754,10 +744,7 @@ impl Authenticator {
             return Err(ErrorStatus::NotAllowed);
         };
 
-        if pending.created_at.elapsed() > Duration::from_secs(30)
-            || pending.session_uid != self.session.uid
-            || !self.session.verify_matches_current()
-        {
+        if pending.created_at.elapsed() > Duration::from_secs(30) {
             return Err(ErrorStatus::NotAllowed);
         }
 
@@ -775,7 +762,6 @@ impl Authenticator {
                 credential_indexes: remaining_indexes.to_vec(),
                 total_credentials: pending.total_credentials,
                 created_at: Instant::now(),
-                session_uid: pending.session_uid,
                 user_presence: pending.user_presence,
                 user_verified: pending.user_verified,
             })
@@ -922,9 +908,6 @@ impl Authenticator {
     }
 
     fn credential_management(&mut self, body: &[u8]) -> Result<Vec<u8>, ErrorStatus> {
-        if !self.session.verify_matches_current() {
-            return Err(ErrorStatus::OperationDenied);
-        }
         let request = decode_map(body)?;
         let sub_command = optional_integer(&request, 1)?.ok_or(ErrorStatus::MissingParameter)?;
         if !(1..=7).contains(&sub_command) {
@@ -1009,8 +992,6 @@ impl Authenticator {
             rp_position: 1,
             credential_indexes: Vec::new(),
             credential_position: 0,
-            session_uid: self.session.uid,
-            session_id: self.session.session_id.clone(),
             token: self
                 .pin_uv_auth_token
                 .as_ref()
@@ -1061,8 +1042,6 @@ impl Authenticator {
             rp_position: 0,
             credential_indexes: indexes,
             credential_position: 1,
-            session_uid: self.session.uid,
-            session_id: self.session.session_id.clone(),
             token: self
                 .pin_uv_auth_token
                 .as_ref()
@@ -1115,12 +1094,8 @@ impl Authenticator {
         let valid = self.management.as_ref().is_some_and(|state| {
             state.continuation == expected
                 && state.last_used_at.elapsed() <= Duration::from_secs(30)
-                && state.session_uid == self.session.uid
-                && state.session_id == self.session.session_id
                 && self.pin_uv_auth_token.as_ref().is_some_and(|token| {
                     token.value == state.token
-                        && token.session_uid == self.session.uid
-                        && token.session_id == self.session.session_id
                         && token.issued_at.elapsed() <= Duration::from_secs(600)
                 })
         });
@@ -1266,8 +1241,6 @@ impl Authenticator {
             value: token.clone(),
             permissions,
             rp_id,
-            session_uid: self.session.uid,
-            session_id: self.session.session_id.clone(),
             issued_at: Instant::now(),
             first_used_at: None,
             user_present_until: None,
@@ -1303,8 +1276,6 @@ impl Authenticator {
             value: token.clone(),
             permissions,
             rp_id,
-            session_uid: self.session.uid,
-            session_id: self.session.session_id.clone(),
             issued_at,
             first_used_at: None,
             user_present_until: Some(issued_at + Duration::from_secs(30)),
@@ -1454,11 +1425,9 @@ impl Authenticator {
 
     fn pin_uv_auth_token_has_cached_user_presence(&self) -> bool {
         self.pin_uv_auth_token.as_ref().is_some_and(|token| {
-            token.session_uid == self.session.uid
-                && token.session_id == self.session.session_id
-                && token
-                    .user_present_until
-                    .is_some_and(|deadline| Instant::now() <= deadline)
+            token
+                .user_present_until
+                .is_some_and(|deadline| Instant::now() <= deadline)
         })
     }
 
@@ -1480,25 +1449,15 @@ impl Authenticator {
         if self.operation_is_cancelled() {
             return false;
         }
-        if !self.session.verify_matches_current() {
-            log::error!("session changed before {operation} approval");
-            return false;
-        }
+        log::debug!("requesting approval for {operation}");
         if let Some(status) = &self.operation_status {
             status.store(2, Ordering::SeqCst);
         }
-        let approved = self.approval.approve(prompt, &self.session);
+        let approved = self.approval.approve(prompt);
         if let Some(status) = &self.operation_status {
             status.store(1, Ordering::SeqCst);
         }
-        if !approved || self.operation_is_cancelled() {
-            return false;
-        }
-        if !self.session.verify_matches_current() {
-            log::error!("session changed during {operation} approval");
-            return false;
-        }
-        true
+        approved && !self.operation_is_cancelled()
     }
 
     fn operation_is_cancelled(&self) -> bool {
@@ -1515,9 +1474,6 @@ impl Authenticator {
         permission: Ctap2PermissionFlags,
         rp_id: Option<&str>,
     ) -> Result<bool, ErrorStatus> {
-        if !self.session.verify_matches_current() {
-            return Err(ErrorStatus::OperationDenied);
-        }
         if protocol.is_none() && auth_param.is_none() {
             return Ok(false);
         }
@@ -1527,9 +1483,7 @@ impl Authenticator {
             .pin_uv_auth_token
             .as_ref()
             .filter(|token| {
-                token.session_uid == self.session.uid
-                    && token.session_id == self.session.session_id
-                    && token.issued_at.elapsed() <= Duration::from_secs(600)
+                token.issued_at.elapsed() <= Duration::from_secs(600)
                     && (token.first_used_at.is_some()
                         || token.issued_at.elapsed() <= Duration::from_secs(30))
             })
@@ -2344,7 +2298,7 @@ pub fn update_pcr_policy_for_credential(
     recovery_passphrase: &str,
     pcr_indices: &[u32],
 ) -> color_eyre::Result<()> {
-    let credentials = store::load_ctap2_credentials_from_dir(store_dir, None)?;
+    let credentials = store::load_ctap2_credentials_from_dir(store_dir)?;
     let credential = credentials
         .iter()
         .find(|c| c.id == credential_id)
@@ -2428,7 +2382,7 @@ pub fn change_recovery_passphrase(
     old_passphrase: &str,
     new_passphrase: &str,
 ) -> color_eyre::Result<()> {
-    let credentials = store::load_ctap2_credentials_from_dir(store_dir, None)?;
+    let credentials = store::load_ctap2_credentials_from_dir(store_dir)?;
     let credential = credentials
         .iter()
         .find(|c| c.id == credential_id)

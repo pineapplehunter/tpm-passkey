@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, p.policy_selection FROM credential_metadata m JOIN credential_keyslots p ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' WHERE (?1 IS NULL OR m.user_id = ?1 OR m.user_id IS NULL) ORDER BY m.rp_id, m.credential_id",
+  "query": "SELECT m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, p.policy_selection FROM credential_metadata m JOIN credential_keyslots p ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' ORDER BY m.rp_id, m.credential_id",
   "describe": {
     "columns": [
       {
@@ -71,7 +71,7 @@
       }
     ],
     "parameters": {
-      "Right": 1
+      "Right": 0
     },
     "nullable": [
       false,
@@ -82,5 +82,5 @@
       true
     ]
   },
-  "hash": "934fa778dfa24398d9d5f9bd892d581d25aec9ffd056a2cdf56d792d0b1aa6e3"
+  "hash": "72b7e09b92e5c03f1edd7b6ac616436659869261dd998e49b42e5312557eaeff"
 }

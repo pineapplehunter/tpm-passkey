@@ -105,7 +105,8 @@ Security status:
 - Assertion currently increments the in-memory signature counter before signing and then saves; persistence failure semantics still need tightening.
 - TPM-backed credentials are not PCR-bound yet.
 - TPM-backed credentials do not yet have passphrase recovery slots.
-- There is no per-user namespace design yet.
+- The store is intentionally a single-user namespace; there is no UID filtering.
+  Legacy owner metadata is retained only for storage/integrity compatibility.
 - There is no integrity protection over credential metadata as a whole.
 
 ## Future Improvements
@@ -168,14 +169,13 @@ Future improvements should include:
 - Clear behavior for failed writes after successful signing.
 - Possibly monotonic TPM NV counters or another anti-rollback strategy if needed.
 
-### User Namespaces
+### Single-User Namespace
 
-The storage model must be tied to the daemon/user-session design.
+One daemon instance and store serve one user on a single-user machine. All
+credentials in the store are available to the authenticator and management API;
+there is no caller-UID filtering or login-session binding. Multi-user isolation,
+fast user switching, and multi-seat operation are unsupported.
 
-Open options:
-
-- Per-user daemon with per-user credential store.
-- System daemon plus per-user helper.
-- System daemon routing requests to the active graphical session.
-
-The production design should avoid accidentally sharing one credential namespace across all local users.
+Existing `user_id` metadata and stored TPM policy references are preserved for
+compatibility, not authorization. New credentials have no local owner UID.
+WebAuthn user handles and RP/user metadata are unchanged.

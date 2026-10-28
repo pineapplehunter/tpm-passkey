@@ -3,6 +3,8 @@
 Linux TPM Fido2 is an experimental Linux TPM-backed FIDO2/WebAuthn authenticator.
 
 It exposes a browser-usable virtual HID authenticator, which uses the TPM for signing.
+Its goal is convenient, TPM-bound passkey storage on a single-user machine,
+not multi-user credential isolation.
 
 ## What It Does
 
@@ -14,10 +16,19 @@ It exposes a browser-usable virtual HID authenticator, which uses the TPM for si
 
 ## System assumptions
 
+- A single-user machine: one daemon instance and credential store serve one user.
+  All stored credentials share one namespace. The daemon does not identify HID
+  request senders, check their UID, or bind operations to a login session.
+  Multiple users, fast user switching, and multi-seat isolation are unsupported.
 - Linux
 - Systemd enabled
 - TPM2 on system
 - Secureboot Enabled (Recommended)
+
+Keep device and store access restricted. Single-user operation does not make
+requests from other processes trustworthy: transaction approval and CTAP PIN/UV
+checks still apply. Logind is used only to route polkit prompts to the desktop,
+not to identify the caller or select credentials.
 
 ## Usage
 
@@ -63,7 +74,7 @@ The maintained CTAP 2.2 wire-format checklist and audit status are in
 ## Future Work
 
 - Expand CTAP2 compatibility for additional browser request shapes.
-- Harden polkit and session-switch handling.
+- Harden transaction approval through polkit.
 - Further security review
 
 ## Current Limits

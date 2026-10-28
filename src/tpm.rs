@@ -109,10 +109,12 @@ pub fn public_name(public_blob: &[u8]) -> Result<Vec<u8>> {
     Ok(name)
 }
 
-pub fn credential_policy_ref(credential_id: &[u8], owner_uid: Option<u32>) -> Vec<u8> {
+pub fn credential_policy_ref(credential_id: &[u8]) -> Vec<u8> {
     let mut value = b"linux-tpm-fido2/pcr-policy/v1".to_vec();
     value.extend_from_slice(credential_id);
-    value.extend_from_slice(&owner_uid.unwrap_or(0).to_be_bytes());
+    // Retain the v1 layout with the former owner field fixed to zero.
+    // Existing credentials continue to use their stored policyRef unchanged.
+    value.extend_from_slice(&0_u32.to_be_bytes());
     Sha256::digest(value).to_vec()
 }
 

@@ -9,19 +9,15 @@ const POLKIT_AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
 const POLKIT_AUTHORITY_IFACE: &str = "org.freedesktop.PolicyKit1.Authority";
 const POLKIT_ACTION_ID: &str = "io.github.pineapplehunter.linux-tpm-fido2.approve";
 
-/// Check with polkit whether a login session is authorized.
+/// Request approval through the desktop's polkit agent.
 ///
-/// The process subject is the session leader, not the daemon. This gives
-/// polkit a real process owned by the logged-in user while still allowing the
-/// request to originate from the privileged system daemon.
-///
-/// Returns `Ok(true)` when authorized, `Ok(false)` when denied,
-/// and `Err` when polkit is unavailable or communication fails.
-pub fn check_session(session_id: &str, pid: u32, user_uid: u32) -> Result<bool> {
+/// The active session leader is only a prompt-routing subject. Its identity is
+/// not used to attribute HID requests or select credentials on this single-user
+/// machine. The daemon itself is root and has no desktop authentication agent.
+pub fn check_active_session() -> Result<bool> {
+    let (pid, user_uid) = crate::systemd_logind::approval_subject()
+        .ok_or_else(|| color_eyre::eyre::eyre!("no active session for polkit approval"))?;
     let start_time = process_start_time_ticks(pid)?;
-    log::info!(
-        "polkit subject: unix-process pid={pid}, start-time={start_time}, uid={user_uid}, session-id={session_id}"
-    );
     let conn = Connection::system()?;
 
     let mut subject_details: HashMap<&str, Value> = HashMap::new();

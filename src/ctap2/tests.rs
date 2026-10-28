@@ -158,7 +158,7 @@ fn selection_and_reset_have_no_parameters_or_response_map() {
     assert!(authenticator.credentials.is_empty());
     assert!(authenticator.client_pin.is_none());
     assert!(
-        store::load_ctap2_credentials_from_dir(&authenticator.store_dir, None)
+        store::load_ctap2_credentials_from_dir(&authenticator.store_dir)
             .expect("load credentials after reset")
             .is_empty()
     );
@@ -515,8 +515,6 @@ fn client_pin_wire_shape_and_permission_validation_follow_ctap22() {
         value: token_value,
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: None,
-        session_uid: authenticator.session.uid,
-        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now() - Duration::from_secs(31),
         first_used_at: None,
         user_present_until: None,
@@ -696,8 +694,6 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: Some(rp_id.to_owned()),
-        session_uid: authenticator.session.uid,
-        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
         user_present_until: None,
@@ -722,8 +718,6 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         value: token.clone(),
         permissions: Ctap2PermissionFlags::MAKE_CREDENTIAL,
         rp_id: None,
-        session_uid: authenticator.session.uid,
-        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
         user_present_until: None,
@@ -759,8 +753,6 @@ fn make_credential_with_pin_uv_auth_token_regression() {
         value: token,
         permissions: Ctap2PermissionFlags::GET_ASSERTION,
         rp_id: Some(rp_id.to_owned()),
-        session_uid: authenticator.session.uid,
-        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
         user_present_until: None,
@@ -1360,19 +1352,50 @@ fn unsupported_policy_version_rejects_assertion() {
     assert_eq!(response[0], 0x27);
 }
 
+#[test]
+fn single_user_authenticator_loads_all_legacy_owners() {
+    let original = authenticator_with_credentials(
+        "example.com",
+        vec![
+            test_credential(vec![1], "example.com", 0),
+            test_credential(vec![2], "example.com", 0),
+            test_credential(vec![3], "example.com", 0),
+        ],
+    );
+    let mut credentials =
+        store::load_ctap2_credentials_from_dir(&original.store_dir).expect("load credentials");
+    for (credential, owner) in credentials.iter_mut().zip([Some(0), Some(u32::MAX), None]) {
+        credential.user_id = owner;
+    }
+    store::save_ctap2_credentials_to_dir(&original.store_dir, &credentials)
+        .expect("save legacy owner metadata");
+
+    let authenticator =
+        Authenticator::new_with_approval(original.store_dir.clone(), None, Box::new(AlwaysApprove));
+    assert_eq!(authenticator.credentials.len(), 3);
+    for (loaded, stored) in authenticator.credentials.iter().zip(&credentials) {
+        assert_eq!(loaded.id, stored.id);
+        assert_eq!(loaded.user_id, stored.user_id);
+    }
+    let summaries = store::load_credential_summaries_from_dir(&original.store_dir)
+        .expect("load all credential summaries");
+    assert_eq!(summaries.len(), 3);
+    std::fs::remove_dir_all(&original.store_dir).expect("remove test store");
+}
+
 struct AlwaysApprove;
 
 struct CountingApproval(Arc<AtomicUsize>);
 
 impl approval::UserApproval for CountingApproval {
-    fn approve(&self, _prompt: &str, _session: &session::SessionContext) -> bool {
+    fn approve(&self, _prompt: &str) -> bool {
         self.0.fetch_add(1, Ordering::SeqCst);
         true
     }
 }
 
 impl approval::UserApproval for AlwaysApprove {
-    fn approve(&self, _prompt: &str, _session: &session::SessionContext) -> bool {
+    fn approve(&self, _prompt: &str) -> bool {
         true
     }
 }
@@ -1415,7 +1438,6 @@ fn authenticator_with_credentials(
         store_dir,
         tpm_path: None,
         tpm: None,
-        session: session::SessionContext::detect(),
         approval: Box::new(AlwaysApprove),
         credentials: credentials
             .into_iter()
@@ -1560,8 +1582,6 @@ fn install_credential_management_token(
         value: token.clone(),
         permissions: Ctap2PermissionFlags::CREDENTIAL_MANAGEMENT,
         rp_id: rp_id.map(str::to_owned),
-        session_uid: authenticator.session.uid,
-        session_id: authenticator.session.session_id.clone(),
         issued_at: Instant::now(),
         first_used_at: None,
         user_present_until: None,

@@ -1539,7 +1539,6 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
- "libc",
  "log",
  "p256",
  "pbkdf2",

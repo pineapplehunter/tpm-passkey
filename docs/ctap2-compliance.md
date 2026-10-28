@@ -97,10 +97,10 @@ After a wrong PIN, retries are decremented and the key-agreement key is
 regenerated. Three consecutive mismatches in one power cycle produce
 `CTAP2_ERR_PIN_AUTH_BLOCKED`; zero retries produce `CTAP2_ERR_PIN_BLOCKED`.
 
-A token issued by built-in UV records user presence for at most 30 seconds. The
-cached presence is bound to the issuing login-session UID and session ID, and is
-consumed by one user-presence operation. A PIN-issued token has no cached user
-presence. All tokens remain cryptographically permission- and RP-scoped.
+A token issued by built-in UV records user presence for at most 30 seconds and
+is consumed by one user-presence operation. A PIN-issued token has no cached
+user presence. All tokens remain cryptographically permission- and RP-scoped.
+Under the single-user-machine assumption, tokens are not bound to login sessions.
 
 Audit status: **complete for ClientPIN request/response handling and token
 issuance**. Permission consumption and user-presence state during subsequent
@@ -239,8 +239,8 @@ public key `0x08`, and total credentials `0x09`. Optional implemented-feature
 fields begin at `0x0a`. Totals occur only in the corresponding begin response.
 
 RP and credential continuation requests do not repeat token authentication.
-Their state is bound to the initiating token and login-session UID/session ID,
-expires after 30 seconds without a matching continuation, and is interrupted by
+Their state is bound to the initiating token, expires after 30 seconds without
+a matching continuation, and is interrupted by
 any other operation. Missing, mismatched, expired, interrupted, or exhausted
 state returns `CTAP2_ERR_NOT_ALLOWED`; each successful continuation resets the
 30-second interval.

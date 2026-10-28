@@ -9,6 +9,7 @@ pub(crate) struct Credential {
     pub id: Vec<u8>,
     pub rp_id: String,
     pub discoverable: bool,
+    // Legacy local owner metadata, retained for store MAC compatibility only.
     pub user_id: Option<u32>,
     pub user_handle: Vec<u8>,
     pub user_name: Option<String>,

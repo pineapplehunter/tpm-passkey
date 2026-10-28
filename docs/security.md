@@ -8,7 +8,11 @@ The project is experimental. Unless explicitly identified as an implemented prop
 
 `linux-tpm-fido2` implements a virtual CTAP2 authenticator using the Linux UHID subsystem. A privileged daemon processes CTAPHID and CTAP2 requests, stores credential records in a local database, and delegates credential private-key operations to a TPM 2.0 device.
 
-The daemon may manage credentials belonging to multiple local users. Each virtual HID device instance is associated with a specific active graphical session and user ID. Desktop authentication is requested through polkit.
+The daemon assumes a single-user machine. One daemon instance and credential
+store serve one user, with no per-user namespaces, caller-UID checks, or
+login-session binding. Multi-user isolation, fast user switching, and multi-seat
+operation are unsupported. The goal is convenient TPM-bound passkey storage.
+Desktop authentication is requested through polkit.
 
 ## Security-Relevant Entities
 
@@ -17,7 +21,7 @@ The daemon may manage credentials belonging to multiple local users. Each virtua
 * **Daemon:** The privileged `linux-tpm-fido2` process that implements the virtual authenticator.
 * **TPM:** The TPM 2.0 device that generates, protects, and uses credential private keys.
 * **Credential Store:** The persistent database containing TPM object blobs, public-key material, credential metadata, policy information, and signature counters.
-* **Session Manager:** `systemd-logind`, which identifies the active local graphical session and its user ID.
+* **Session Manager:** `systemd-logind`, used only to find a desktop subject for routing polkit prompts, not to attribute requests or authorize credential access.
 * **Authorization Service:** polkit and the graphical polkit authentication agent.
 * **Device-Access Mechanism:** udev and `uaccess`, which grant access to the virtual HID device to the active user of the associated seat.
 * **Platform Trust Chain:** The firmware, bootloader, kernel, and measured-boot components that determine relevant PCR values.
@@ -26,25 +30,19 @@ A PCR is a TPM state register and is not considered an independent actor.
 
 ## Adversary Model
 
-### Unprivileged Cross-User Adversary
+### Multi-User Isolation Is Out of Scope
 
-A cross-user adversary controls one or more processes under a local UID different from the credential owner’s UID.
-
-This adversary may:
-
-* Read files that are accessible to its UID.
-* Attempt to open or communicate with the virtual HID device.
-* Attempt to invoke daemon interfaces.
-* Supply malformed or adversarial CTAPHID and CTAP2 messages.
-* Attempt to tamper with inadequately protected persistent state.
-
-The design aims to prevent this adversary from using another user’s credentials.
+The application does not provide isolation between local users. Device, socket,
+and store permissions remain useful access restrictions, but the daemon does
+not determine which local user sent a HID request. Do not deploy it as a
+shared-machine authenticator.
 
 ### Same-User Adversary
 
 A same-user adversary controls a process running under the credential owner’s UID.
 
-Because `uaccess` grants device access at UID granularity, the daemon cannot distinguish an authorized browser from another process running under the same UID solely through UHID.
+UHID reports do not identify their sending UID or process. The daemon cannot
+distinguish an authorized browser from another process with device access.
 
 A same-user adversary may therefore initiate CTAP operations. Transaction-specific user interaction is required to limit unauthorized use, but this does not provide protection after the user approves a misleading or insufficiently identified request.
 
@@ -57,7 +55,7 @@ This adversary may:
 * Read or modify the credential database.
 * Replace or modify the daemon.
 * Access the TPM resource-manager device.
-* Bypass session-selection and desktop-authorization logic.
+* Bypass desktop-authorization logic.
 * Initiate arbitrary TPM commands permitted by the TPM hierarchy and object policies.
 * Observe or modify passphrases entered through software controlled by the operating system.
 
@@ -165,27 +163,23 @@ Credential metadata is not necessarily confidential. Depending on the database f
 * Signature counters.
 * Policy configuration and recovery metadata.
 
-### User Isolation
+### Single-User Access Model
 
-Each UHID device generation shall be associated with one active local graphical session, seat, and UID.
+All stored credentials share one namespace. The daemon does not check caller
+UIDs, filter credentials by owner, bind CTAP state to login sessions, or revoke
+access on session switches. Existing owner metadata and TPM policy references
+are retained only for compatibility with stored records.
 
-Access to the corresponding `hidraw` device shall be restricted through udev and `uaccess` to the active UID of that seat.
-
-The daemon shall destroy and recreate the UHID device when the active session changes. Removing an ACL alone is insufficient because an already-open file descriptor may remain usable.
-
-Before selecting or using a credential, the daemon shall verify that:
-
-1. The request belongs to the current UHID device generation.
-2. The associated session remains active.
-3. The session UID matches the credential owner’s UID.
-4. The polkit authorization applies to the same session.
-5. The session identity remains unchanged after interactive authorization completes.
-
-These controls provide separation between different local UIDs. They do not distinguish processes running under the same UID.
+Keep the `hidraw` device, management socket, and store access restricted.
+The existing udev `uaccess` rule and root-only management socket remain, but do
+not constitute a supported multi-user isolation model. In particular, changing
+an ACL does not revoke an already-open file descriptor.
 
 ### User Authorization
 
-Interactive authorization shall be requested against the selected active graphical session.
+Interactive authorization is routed to the active desktop's polkit agent. This
+routing does not identify the sender of the HID request or establish credential
+ownership.
 
 A successful polkit operation establishes that the session user satisfied the configured polkit policy. Polkit authentication is not equivalent to an arbitrary graphical Allow/Deny acknowledgement.
 
@@ -195,13 +189,14 @@ The CTAP-defined user-presence state of a UV-issued `pinUvAuthToken` is the only
 
 * The token HMAC is valid and has the required permission.
 * The token's permissions RP ID matches the operation.
-* The active login-session UID and session ID match those recorded at issuance.
 * No more than 30 seconds have elapsed since UV approval.
 * Cached presence has not already been consumed.
 
 The operation clears cached presence and all token permissions except the CTAP-defined `lbw` exception. PIN-issued tokens do not carry cached user presence and therefore still require a separate presence approval. This avoids a second polkit prompt for the built-in-UV browser flow without turning approval into a general same-user or time-based authorization grant.
 
-Cancellation, timeout, session termination, session switching, or failure of the authentication agent shall cause the operation to fail closed.
+Cancellation, token expiry, and denied approval prevent authorization. Session
+termination and switching are not tracked. If polkit is unavailable, the existing
+terminal approval fallback remains; it requires an explicit affirmative answer.
 
 The authenticator cannot independently verify the browser’s web origin. It receives an RP ID and client-data hash from the client platform and relies on the WebAuthn client and relying party to perform the corresponding origin validation.
 
@@ -212,7 +207,7 @@ Unauthorized modification of security-sensitive credential records should be det
 The authenticated record should include, at minimum:
 
 * Credential ID.
-* Credential-owner UID.
+* Legacy credential-owner metadata, where retained for compatibility.
 * RP ID.
 * User handle.
 * TPM private and public blobs.
@@ -309,9 +304,6 @@ Before production security claims are made, at least the following issues must b
 * TPM keys protected exclusively by PCR policy must not retain an empty authorization-value bypass.
 * Recovery must authorize the original registered credential key rather than an independent signing key.
 * Passphrases must be protected using an offline-resistant password KDF.
-* Session identity must be obtained dynamically from `systemd-logind` rather than inherited environment variables.
-* UHID device generations must be bound to active sessions using `uaccess`.
-* Authorization must be performed against the same session before and after interaction.
 * Security-sensitive credential metadata must receive integrity protection.
 * Approval reuse and stale authorization state must be eliminated or formally justified.
 * Rollback behavior must be documented and, where required, mitigated. (Documented in § Rollback Resistance; mitigation deferred.)

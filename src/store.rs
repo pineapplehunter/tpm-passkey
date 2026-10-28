@@ -45,6 +45,7 @@ pub struct StoredCtap2Credential {
     pub id: Vec<u8>,
     pub rp_id: String,
     pub discoverable: bool,
+    // Legacy local owner metadata, retained for existing MACs; never a filter.
     pub user_id: Option<u32>,
     pub user_handle: Vec<u8>,
     pub user_name: Option<String>,
@@ -221,21 +222,19 @@ pub fn credentials_database_path() -> PathBuf {
 }
 
 pub fn load_ctap2_credentials() -> Result<Vec<StoredCtap2Credential>> {
-    load_ctap2_credentials_from_dir(dev_store_dir(), None)
+    load_ctap2_credentials_from_dir(dev_store_dir())
 }
 
 pub fn load_ctap2_credentials_from_dir(
     dir: impl AsRef<Path>,
-    user_id: Option<u32>,
 ) -> Result<Vec<StoredCtap2Credential>> {
-    block_on_store(load_ctap2_credentials_async(dir.as_ref(), user_id))
+    block_on_store(load_ctap2_credentials_async(dir.as_ref()))
 }
 
 pub fn load_credential_summaries_from_dir(
     dir: impl AsRef<Path>,
-    user_id: Option<u32>,
 ) -> Result<Vec<StoredCredentialSummary>> {
-    block_on_store(load_credential_summaries_async(dir.as_ref(), user_id))
+    block_on_store(load_credential_summaries_async(dir.as_ref()))
 }
 
 pub fn save_ctap2_credentials(credentials: &[StoredCtap2Credential]) -> Result<()> {
@@ -432,26 +431,20 @@ async fn save_daemon_passphrase_async(
     Ok(())
 }
 
-async fn load_credential_summaries_async(
-    dir: &Path,
-    user_id: Option<u32>,
-) -> Result<Vec<StoredCredentialSummary>> {
+async fn load_credential_summaries_async(dir: &Path) -> Result<Vec<StoredCredentialSummary>> {
     let database_path = credentials_database_path_in_dir(dir);
     if !database_path.exists() {
         return Ok(Vec::new());
     }
 
     let pool = open_database(dir).await?;
-    let user_id = user_id.map(i64::from);
     let rows = sqlx::query!(
         "SELECT m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, \
                 p.policy_selection \
          FROM credential_metadata m \
          JOIN credential_keyslots p \
            ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' \
-         WHERE (?1 IS NULL OR m.user_id = ?1 OR m.user_id IS NULL) \
          ORDER BY m.rp_id, m.credential_id",
-        user_id,
     )
     .fetch_all(&pool)
     .await
@@ -475,10 +468,7 @@ async fn load_credential_summaries_async(
         .collect())
 }
 
-async fn load_ctap2_credentials_async(
-    dir: &Path,
-    user_id: Option<u32>,
-) -> Result<Vec<StoredCtap2Credential>> {
+async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Credential>> {
     let database_path = credentials_database_path_in_dir(dir);
     if !database_path.exists() {
         return Ok(Vec::new());
@@ -499,10 +489,8 @@ async fn load_ctap2_credentials_async(
          LEFT JOIN credential_keyslots r \
            ON r.credential_id = m.credential_id AND r.slot_kind = 'recovery' \
          LEFT JOIN credential_tokens t ON t.keyslot_id = r.keyslot_id \
-         WHERE (?1 IS NULL OR m.user_id = ?1 OR m.user_id IS NULL) \
          ORDER BY m.rp_id, m.credential_id",
     )
-    .bind(user_id.map(i64::from))
     .fetch_all(&pool)
     .await
     .wrap_err_with(|| format!("loading credentials from {}", database_path.display()))?;
@@ -555,14 +543,12 @@ async fn load_ctap2_credentials_async(
                 id: row.try_get("credential_id")?,
                 rp_id: row.try_get("rp_id")?,
                 discoverable: row.try_get::<i64, _>("discoverable")? != 0,
-                user_id: match (stored_user_id, user_id) {
-                    (Some(value), _) => Some(
-                        u32::try_from(value)
-                            .wrap_err_with(|| format!("invalid user_id {}", value))?,
-                    ),
-                    (None, Some(uid)) => Some(uid),
-                    (None, None) => None,
-                },
+                // Preserve legacy owner metadata for existing integrity MACs;
+                // it no longer selects or authorizes credentials.
+                user_id: stored_user_id
+                    .map(u32::try_from)
+                    .transpose()
+                    .wrap_err("invalid legacy user_id")?,
                 user_handle: row.try_get("user_handle")?,
                 user_name: row.try_get("user_name")?,
                 user_display_name: row.try_get("user_display_name")?,
@@ -1134,7 +1120,7 @@ mod tests {
     fn missing_store_loads_empty_credentials() {
         let dir = test_store_dir("missing");
 
-        let credentials = load_ctap2_credentials_from_dir(&dir, None).expect("load credentials");
+        let credentials = load_ctap2_credentials_from_dir(&dir).expect("load credentials");
 
         assert!(credentials.is_empty());
     }
@@ -1183,7 +1169,7 @@ mod tests {
         }];
 
         save_ctap2_credentials_to_dir(&dir, &credentials).expect("save CTAP2 credentials");
-        let loaded = load_ctap2_credentials_from_dir(&dir, None).expect("load CTAP2 credentials");
+        let loaded = load_ctap2_credentials_from_dir(&dir).expect("load CTAP2 credentials");
 
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].integrity_mac.is_some());
@@ -1247,7 +1233,7 @@ mod tests {
         save_ctap2_credentials_to_dir(&dir, std::slice::from_ref(&second))
             .expect("save remaining credential");
 
-        let loaded = load_ctap2_credentials_from_dir(&dir, None).expect("load credentials");
+        let loaded = load_ctap2_credentials_from_dir(&dir).expect("load credentials");
 
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].integrity_mac.is_some());
@@ -1269,7 +1255,7 @@ mod tests {
         save_ctap2_credentials_to_dir(&dir, &[first.clone(), second.clone()])
             .expect("save credentials");
         let initial_summaries =
-            load_credential_summaries_from_dir(&dir, None).expect("load initial summaries");
+            load_credential_summaries_from_dir(&dir).expect("load initial summaries");
         let first_registered_at = initial_summaries
             .iter()
             .find(|summary| summary.id == first.id)
@@ -1279,7 +1265,7 @@ mod tests {
 
         update_ctap2_sign_count_in_dir(&dir, &first.id, 42).expect("update sign count");
 
-        let loaded = load_ctap2_credentials_from_dir(&dir, None).expect("load credentials");
+        let loaded = load_ctap2_credentials_from_dir(&dir).expect("load credentials");
         let loaded_first = loaded
             .iter()
             .find(|credential| credential.id == first.id)
@@ -1292,8 +1278,7 @@ mod tests {
         assert_eq!(loaded_first.sign_count, 42);
         assert_eq!(loaded_second.sign_count, 2);
 
-        let used_summaries =
-            load_credential_summaries_from_dir(&dir, None).expect("load used summaries");
+        let used_summaries = load_credential_summaries_from_dir(&dir).expect("load used summaries");
         let first_summary = used_summaries
             .iter()
             .find(|summary| summary.id == first.id)
@@ -1308,7 +1293,7 @@ mod tests {
 
         save_ctap2_credentials_to_dir(&dir, &loaded).expect("resave credentials");
         let resaved_summaries =
-            load_credential_summaries_from_dir(&dir, None).expect("load resaved summaries");
+            load_credential_summaries_from_dir(&dir).expect("load resaved summaries");
         let resaved_first = resaved_summaries
             .iter()
             .find(|summary| summary.id == first.id)
@@ -1361,7 +1346,7 @@ mod tests {
         )
         .expect("update recovery slot");
 
-        let loaded = load_ctap2_credentials_from_dir(&dir, None).expect("load credential");
+        let loaded = load_ctap2_credentials_from_dir(&dir).expect("load credential");
         let recovery = loaded[0].recovery.as_ref().expect("recovery slot");
         assert_eq!(recovery.key.private, vec![7]);
         assert_eq!(recovery.key.auth_value, Some(vec![9; 32]));

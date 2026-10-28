@@ -4,8 +4,13 @@
 
 `linux-tpm-fido2` is a blocking system daemon that exposes a virtual FIDO2
 authenticator through Linux UHID. The daemon owns the CTAPHID channels, CTAP2
-state machines, TPM context, credential store, active-session identity, and
-transaction approval flow.
+state machines, TPM context, one single-user credential store, and transaction
+approval flow. Multi-user isolation and session-switch handling are unsupported.
+
+Logind discovery is only for routing polkit prompts. The daemon does not check
+requester UIDs, scope credentials by UID, or bind CTAP state to login sessions.
+File and device permissions remain in place. Legacy owner metadata and stored
+TPM policy references are preserved so existing credentials remain loadable.
 
 ## Runtime Request Flow
 
@@ -17,7 +22,7 @@ transaction approval flow.
    channels while approval or TPM work blocks.
 4. `ctap2::Authenticator` on the worker decodes the CTAP command and coordinates
    its state machine.
-5. The command handler scopes credentials to the active UID, obtains approval
+5. The command handler uses the shared credential namespace, obtains approval
    through `approval::UserApproval`, and asks `tpm` to create or use keys.
 6. `store` persists credential, PIN, policy, and recovery state in SQLite.
 7. The worker result is fragmented by `ctaphid` and sent to the browser through
@@ -50,8 +55,7 @@ src/
 ├── management/
 │   ├── protocol.rs         serialized management API
 │   └── service.rs          management operations and TPM command dispatch
-├── session.rs              captured daemon session identity
-├── systemd_logind.rs       active-session discovery
+├── systemd_logind.rs       desktop subject discovery for polkit prompt routing
 └── polkit.rs               polkit authorization request
 ```
 
@@ -129,5 +133,3 @@ through the daemon-owned TPM command channel.
   coupling would provide little benefit.
 - Give the SQLite store a long-lived connection/runtime rather than opening a
   pool and checking migrations for individual operations.
-- Move daemon lifecycle and session-change handling out of `main.rs` when UHID
-  device recreation is implemented.

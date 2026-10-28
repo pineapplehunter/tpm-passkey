@@ -780,7 +780,7 @@ mod tests {
     struct SlowApproval;
 
     impl crate::approval::UserApproval for SlowApproval {
-        fn approve(&self, _prompt: &str, _session: &crate::session::SessionContext) -> bool {
+        fn approve(&self, _prompt: &str) -> bool {
             thread::sleep(Duration::from_millis(300));
             true
         }
