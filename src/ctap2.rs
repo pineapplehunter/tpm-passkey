@@ -1321,21 +1321,26 @@ impl Authenticator {
         if pin_hash.len() != 16 {
             return Err(ErrorStatus::InvalidParameter);
         }
-        let Some(pin) = self.client_pin.as_mut() else {
+        let Some(mut updated_pin) = self.client_pin.clone() else {
             return Err(ErrorStatus::PinNotSet);
         };
-        if pin.retries == 0 {
+        if updated_pin.retries == 0 {
             return Err(ErrorStatus::PinBlocked);
         }
+        // A correct guess must not bypass the three-attempt power-cycle lock.
+        if self.consecutive_pin_mismatches >= 3 {
+            return Err(ErrorStatus::PinAuthBlocked);
+        }
 
-        let candidate = pin_verifier(&pin.pin_salt, pin_hash);
-        if !constant_time_equal(&candidate, &pin.pin_verifier) {
-            pin.retries = pin.retries.saturating_sub(1);
-            let retries = pin.retries;
-            let state = pin.clone();
+        let candidate = pin_verifier(&updated_pin.pin_salt, pin_hash);
+        if !constant_time_equal(&candidate, &updated_pin.pin_verifier) {
+            updated_pin.retries = updated_pin.retries.saturating_sub(1);
+            let retries = updated_pin.retries;
             self.consecutive_pin_mismatches = self.consecutive_pin_mismatches.saturating_add(1);
             self.key_agreement = None;
-            self.persist_client_pin(&state)?;
+            // Failed writes cannot restore retries within this running instance.
+            self.client_pin = Some(updated_pin.clone());
+            self.persist_client_pin(&updated_pin)?;
             return Err(if retries == 0 {
                 ErrorStatus::PinBlocked
             } else if self.consecutive_pin_mismatches >= 3 {
@@ -1346,10 +1351,10 @@ impl Authenticator {
         }
 
         self.consecutive_pin_mismatches = 0;
-        if pin.retries != PIN_RETRIES {
-            pin.retries = PIN_RETRIES;
-            let state = pin.clone();
-            self.persist_client_pin(&state)?;
+        if updated_pin.retries != PIN_RETRIES {
+            updated_pin.retries = PIN_RETRIES;
+            self.persist_client_pin(&updated_pin)?;
+            self.client_pin = Some(updated_pin);
         }
         Ok(())
     }
@@ -2372,5 +2377,7 @@ fn management_auth_message(sub_command: i128, params: Option<&[(Value, Value)]>)
 
 #[cfg(test)]
 mod cbor_compliance_tests;
+#[cfg(test)]
+mod pin_compliance_tests;
 #[cfg(test)]
 mod tests;
