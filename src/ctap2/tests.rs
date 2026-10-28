@@ -83,6 +83,74 @@ fn pin_capabilities_follow_configuration_without_claiming_builtin_uv() {
 }
 
 #[test]
+fn approval_outcomes_use_command_specific_ctap_statuses() {
+    struct Outcome(approval::ApprovalOutcome);
+    impl approval::UserApproval for Outcome {
+        fn approve(&self, _: &str) -> bool {
+            panic!("controlled approval required")
+        }
+        fn approve_controlled(
+            &self,
+            _: &str,
+            _: &approval::ApprovalControl,
+        ) -> approval::ApprovalOutcome {
+            self.0
+        }
+    }
+    for outcome in [
+        approval::ApprovalOutcome::Denied,
+        approval::ApprovalOutcome::TimedOut,
+        approval::ApprovalOutcome::Cancelled,
+    ] {
+        let mut auth = authenticator_with_credential("example.test", vec![1]);
+        auth.approval = Box::new(Outcome(outcome));
+        let status = match outcome {
+            approval::ApprovalOutcome::TimedOut => ErrorStatus::UserActionTimeout,
+            approval::ApprovalOutcome::Cancelled => ErrorStatus::KeepaliveCancel,
+            _ => ErrorStatus::OperationDenied,
+        };
+        for command in [Ctap2Command::Selection, Ctap2Command::Reset] {
+            assert_eq!(auth.handle_cbor(&[command.into()]), vec![u8::from(status)]);
+        }
+        let status = if outcome == approval::ApprovalOutcome::Cancelled {
+            ErrorStatus::KeepaliveCancel
+        } else {
+            ErrorStatus::OperationDenied
+        };
+        for request in [
+            ctap_request(
+                Ctap2Command::MakeCredential,
+                cbor!({
+                    1 => bytes([0; 32]), 2 => {"id" => "example.test"},
+                    3 => {"id" => bytes([1])}, 4 => [{"type" => "public-key", "alg" => -7}],
+                })
+                .unwrap(),
+            ),
+            ctap_request(
+                Ctap2Command::MakeCredential,
+                cbor!({
+                    1 => bytes([0; 32]), 2 => {"id" => "example.test"},
+                    3 => {"id" => bytes([1])}, 4 => [{"type" => "public-key", "alg" => -7}],
+                    8 => bytes([]),
+                })
+                .unwrap(),
+            ),
+            ctap_request(
+                Ctap2Command::GetAssertion,
+                cbor!({
+                    1 => "example.test", 2 => bytes([0; 32]),
+                })
+                .unwrap(),
+            ),
+        ] {
+            assert_eq!(auth.handle_cbor(&request), vec![u8::from(status)]);
+        }
+        assert_eq!(auth.credentials.len(), 1);
+        std::fs::remove_dir_all(auth.store_dir).unwrap();
+    }
+}
+
+#[test]
 fn client_only_and_unknown_extension_inputs_are_ignored() {
     let dir = test_store_dir("client-only-extensions");
     let count = Arc::new(AtomicUsize::new(0));

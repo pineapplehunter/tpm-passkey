@@ -777,12 +777,26 @@ mod tests {
         assert!(handler.pending.is_none());
     }
 
-    struct SlowApproval;
+    struct PendingApproval;
 
-    impl crate::approval::UserApproval for SlowApproval {
-        fn approve(&self, _prompt: &str) -> bool {
-            thread::sleep(Duration::from_millis(300));
-            true
+    impl crate::approval::UserApproval for PendingApproval {
+        fn approve(&self, _: &str) -> bool {
+            panic!("CTAP must use the controlled approval API")
+        }
+
+        fn approve_controlled(
+            &self,
+            _: &str,
+            control: &crate::approval::ApprovalControl,
+        ) -> crate::approval::ApprovalOutcome {
+            // Never approves itself: only transaction cancellation/deadline can
+            // release the worker. A fixed sleep would not verify cancellation.
+            loop {
+                if let Some(outcome) = control.stopped() {
+                    return outcome;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 
@@ -790,8 +804,11 @@ mod tests {
     fn cbor_processing_emits_keepalive_and_cancel_has_no_direct_response() {
         let store_dir =
             std::env::temp_dir().join(format!("tpm-passkey-ctaphid-cancel-{}", std::process::id()));
-        let mut handler =
-            PacketHandler::new_with_user_approval(store_dir.clone(), None, Box::new(SlowApproval));
+        let mut handler = PacketHandler::new_with_user_approval(
+            store_dir.clone(),
+            None,
+            Box::new(PendingApproval),
+        );
         let cid = allocate_channel(&mut handler);
         let selection = command_packet(
             cid,
@@ -813,12 +830,34 @@ mod tests {
         let cancel = command_packet(cid, CtapHidCommand::Cancel, b"");
         assert_eq!(handler.handle_packet(&cancel), Some(PacketOutcome::Ignored));
 
-        thread::sleep(Duration::from_millis(220));
-        let Some(PacketOutcome::Response(cancelled)) = handler.poll() else {
-            panic!("expected cancelled CBOR response");
-        };
-        assert_eq!(cancelled.command, CtapHidCommand::Cbor);
+        fn wait_cbor(handler: &mut PacketHandler) -> Response {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                if let Some(PacketOutcome::Response(response)) = handler.poll()
+                    && response.command == CtapHidCommand::Cbor
+                {
+                    return response;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not become responsive"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let cancelled = wait_cbor(&mut handler);
         assert_eq!(cancelled.payload, vec![0x2d]);
+        // CANCEL must actually free the worker for a subsequent transaction.
+        let info = command_packet(
+            cid,
+            CtapHidCommand::Cbor,
+            &[ctap2::Ctap2Command::GetInfo.into()],
+        );
+        assert_eq!(
+            handler.handle_packet(&info),
+            Some(PacketOutcome::Processing)
+        );
+        assert_eq!(wait_cbor(&mut handler).payload[0], 0);
         let _ = std::fs::remove_dir_all(store_dir);
     }
 

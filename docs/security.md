@@ -223,9 +223,16 @@ valid state and restarting repairs this without deleting credentials. Explicit
 factory reset clears all credentials and PIN state atomically; ordinary operation
 never automatically drops or regenerates an unreadable PIN record.
 
-Cancellation, token expiry, and denied approval prevent authorization. Session
-termination and switching are not tracked. If polkit is unavailable, the existing
-terminal approval fallback remains; it requires an explicit affirmative answer.
+Cancellation, token expiry, and denied approval prevent authorization. Approval
+has one 30-second absolute deadline, including system-bus setup and logind lookup.
+Cancellation is checked every 20 ms; server-side polkit cleanup is bounded to a
+further 100 ms and uses the same connection and cancellation ID. Denial, timeout,
+or cancellation cannot fall through to a different approval provider. If polkit
+transport/service is unavailable, nonblocking terminal fallback uses only the
+remaining budget and requires a complete explicit affirmative answer. Unroutable
+subjects and malformed replies fail closed. Local kernel calls and blocked logging
+sinks are not preemptible; this is not a hard real-time guarantee. Session
+termination and switching are not tracked.
 
 The authenticator cannot independently verify the browser’s web origin. It receives an RP ID and client-data hash from the client platform and relies on the WebAuthn client and relying party to perform the corresponding origin validation.
 

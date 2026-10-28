@@ -98,6 +98,12 @@ Persistent state belongs to `store`; TPM handles and policy sessions belong to
 Interactive authorization is injected through `approval::UserApproval`.
 Production uses `SystemApproval`, while protocol tests provide an explicit fake
 provider. This avoids making production behavior depend on `cfg(test)`.
+`approve_controlled` receives the transaction cancellation flag and an absolute
+30-second deadline. Production drives logind and polkit on one Tokio-backed
+D-Bus connection within that budget, without an extra approval worker thread.
+Terminal fallback reopens stdin's terminal nonblocking and bounds both prompt
+writes and partial-line reads. Legacy injected providers remain source-compatible,
+but must override the controlled method to interrupt their own blocking work.
 
 The runtime credential model is distinct from the SQLite representation.
 Conversions live in `credential.rs`, preventing CTAP handlers from depending on
@@ -127,7 +133,9 @@ RUST_LOG=tpm_passkey=debug,sqlx=warn,zbus=warn
   Client PIN, CTAPHID framing, storage, and PCR selection.
 - The NixOS VM test exercises UHID discovery, polkit approval, a software TPM,
   credential creation/assertion, PIN management, PCR recovery, reboot
-  persistence, and CTAP compliance through `python-fido2`.
+  persistence, and CTAP compliance through `python-fido2`. Fault tests stop
+  logind/polkit processes while approval is pending, cancel over real UHID, and
+  verify worker recovery; a D-Bus monitor checks polkit cancellation identity.
 
 The NixOS VM uses `/dev/tpm0`, so all management TPM operations must pass
 through the daemon-owned TPM command channel.

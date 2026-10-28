@@ -1,12 +1,12 @@
 use zbus::{
-    blocking::Connection,
+    Connection,
     zvariant::{OwnedObjectPath, OwnedValue},
 };
 
 /// Find a process subject for routing polkit prompts to the desktop agent.
 /// This does not identify the sender of a HID request or authorize credentials.
-pub(crate) fn approval_subject() -> Option<(u32, u32)> {
-    let connection = Connection::system().ok()?;
+/// The caller must drive this future inside the approval control scope.
+pub(crate) async fn approval_subject(connection: &Connection) -> zbus::Result<Option<(u32, u32)>> {
     let sessions: Vec<(String, u32, String, String, OwnedObjectPath)> = connection
         .call_method(
             Some("org.freedesktop.login1"),
@@ -15,37 +15,35 @@ pub(crate) fn approval_subject() -> Option<(u32, u32)> {
             "ListSessions",
             &(),
         )
-        .ok()?
+        .await?
         .body()
-        .deserialize()
-        .ok()?;
+        .deserialize()?;
 
     let mut active_non_graphical = None;
     for (_, uid, _, seat, path) in sessions {
         let path = path.as_str();
-        if seat.is_empty()
-            || !bool::try_from(session_property(&connection, path, "Active")?).ok()?
+        if seat.is_empty() || !bool::try_from(session_property(connection, path, "Active").await?)?
         {
             continue;
         }
 
-        let session_type = String::try_from(session_property(&connection, path, "Type")?).ok()?;
-        let leader_pid = u32::try_from(session_property(&connection, path, "Leader")?).ok()?;
+        let session_type = String::try_from(session_property(connection, path, "Type").await?)?;
+        let leader_pid = u32::try_from(session_property(connection, path, "Leader").await?)?;
         let subject = (leader_pid, uid);
         if session_type == "x11" || session_type == "wayland" {
-            return Some(subject);
+            return Ok(Some(subject));
         }
         active_non_graphical.get_or_insert(subject);
     }
 
-    active_non_graphical
+    Ok(active_non_graphical)
 }
 
-fn session_property(
+async fn session_property(
     connection: &Connection,
     session_path: &str,
     property: &str,
-) -> Option<OwnedValue> {
+) -> zbus::Result<OwnedValue> {
     connection
         .call_method(
             Some("org.freedesktop.login1"),
@@ -54,8 +52,7 @@ fn session_property(
             "Get",
             &("org.freedesktop.login1.Session", property),
         )
-        .ok()?
+        .await?
         .body()
         .deserialize()
-        .ok()
 }

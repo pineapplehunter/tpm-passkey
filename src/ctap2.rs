@@ -316,10 +316,11 @@ impl Authenticator {
         if self.powered_up_at.elapsed() > Duration::from_secs(10) {
             return Err(ErrorStatus::NotAllowed);
         }
-        if !self.user_presence_approved("Reset FIDO authenticator and delete all passkeys", "reset")
-        {
-            return Err(ErrorStatus::OperationDenied);
-        }
+        self.user_presence_approved(
+            "Reset FIDO authenticator and delete all passkeys",
+            "reset",
+            ErrorStatus::UserActionTimeout,
+        )?;
         store::reset_authenticator_state_from_dir(&self.store_dir).map_err(|error| {
             log::warn!("failed to persist authenticator reset: {error:?}");
             ErrorStatus::OperationDenied
@@ -340,9 +341,11 @@ impl Authenticator {
     /// the user has given consent. CTAP2.2 §6.9. The actual user gesture is
     /// collected by the transport/UI; here we just confirm approval.
     fn selection(&mut self) -> Result<Vec<u8>, ErrorStatus> {
-        if !self.user_presence_approved("Select this FIDO authenticator", "selection") {
-            return Err(ErrorStatus::OperationDenied);
-        }
+        self.user_presence_approved(
+            "Select this FIDO authenticator",
+            "selection",
+            ErrorStatus::UserActionTimeout,
+        )?;
         Ok(vec![0x00])
     }
 
@@ -450,10 +453,12 @@ impl Authenticator {
             display_rp_label(rp_name, rp_id),
             user_display_name.or(user_name).unwrap_or("unknown user")
         );
-        if !cached_user_presence
-            && !self.user_presence_approved(&prompt, &format!("registration for {rp_id}"))
-        {
-            return Err(ErrorStatus::OperationDenied);
+        if !cached_user_presence {
+            self.user_presence_approved(
+                &prompt,
+                &format!("registration for {rp_id}"),
+                ErrorStatus::OperationDenied,
+            )?;
         }
         self.consume_pin_uv_auth_token_after_user_presence();
 
@@ -632,8 +637,8 @@ impl Authenticator {
 
         let cached_user_presence =
             user_verified && self.pin_uv_auth_token_has_cached_user_presence();
-        if user_presence && !cached_user_presence && !self.assertion_approved(rp_id) {
-            return Err(ErrorStatus::OperationDenied);
+        if user_presence && !cached_user_presence {
+            self.assertion_approved(rp_id)?;
         }
         if user_presence {
             self.consume_pin_uv_auth_token_after_user_presence();
@@ -1445,9 +1450,11 @@ impl Authenticator {
     }
 
     fn zero_length_pin_uv_auth(&self, prompt: &str) -> Result<Vec<u8>, ErrorStatus> {
-        if !self.user_presence_approved(prompt, "authenticator selection") {
-            return Err(ErrorStatus::OperationDenied);
-        }
+        self.user_presence_approved(
+            prompt,
+            "authenticator selection",
+            ErrorStatus::OperationDenied,
+        )?;
         Err(if self.client_pin.is_some() {
             ErrorStatus::PinInvalid
         } else {
@@ -1470,26 +1477,47 @@ impl Authenticator {
         }
     }
 
-    fn assertion_approved(&mut self, rp_id: &str) -> bool {
+    fn assertion_approved(&mut self, rp_id: &str) -> Result<(), ErrorStatus> {
         self.user_presence_approved(
             &format!("Authenticate with passkey for {rp_id}"),
             &format!("assertion for {rp_id}"),
+            ErrorStatus::OperationDenied,
         )
     }
 
-    fn user_presence_approved(&self, prompt: &str, operation: &str) -> bool {
+    fn user_presence_approved(
+        &self,
+        prompt: &str,
+        operation: &str,
+        timeout_error: ErrorStatus,
+    ) -> Result<(), ErrorStatus> {
         if self.operation_is_cancelled() {
-            return false;
+            return Err(ErrorStatus::KeepaliveCancel);
         }
         log::debug!("requesting approval for {operation}");
         if let Some(status) = &self.operation_status {
             status.store(2, Ordering::SeqCst);
         }
-        let approved = self.approval.approve(prompt);
+        let control = approval::ApprovalControl::new(
+            self.operation_cancelled.clone(),
+            Instant::now() + approval::DEFAULT_APPROVAL_TIMEOUT,
+        );
+        let outcome = self.approval.approve_controlled(prompt, &control);
         if let Some(status) = &self.operation_status {
             status.store(1, Ordering::SeqCst);
         }
-        approved && !self.operation_is_cancelled()
+        log::debug!("approval for {operation}: {outcome:?}");
+        if self.operation_is_cancelled() {
+            return Err(ErrorStatus::KeepaliveCancel);
+        }
+        match outcome {
+            approval::ApprovalOutcome::Approved => Ok(()),
+            approval::ApprovalOutcome::Cancelled => Err(ErrorStatus::KeepaliveCancel),
+            approval::ApprovalOutcome::Denied => Err(ErrorStatus::OperationDenied),
+            // §6.1.2/§6.2.2 UP timeout: OPERATION_DENIED. §6.6/§6.9 timeout:
+            // USER_ACTION_TIMEOUT. The caller selects its normative status.
+            approval::ApprovalOutcome::TimedOut => Err(timeout_error),
+        }
     }
 
     fn operation_is_cancelled(&self) -> bool {

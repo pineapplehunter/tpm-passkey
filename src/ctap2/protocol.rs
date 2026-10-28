@@ -74,6 +74,7 @@ pub(super) enum ErrorStatus {
     InvalidOption = 0x2c,
     KeepaliveCancel = 0x2d,
     NoCredentials = 0x2e,
+    UserActionTimeout = 0x2f,
     NotAllowed = 0x30,
     PinInvalid = 0x31,
     PinBlocked = 0x32,

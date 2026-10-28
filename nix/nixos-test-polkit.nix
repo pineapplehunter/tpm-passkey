@@ -90,6 +90,15 @@
           machine.succeed("systemctl start tpm-passkey")
           machine.wait_for_unit("tpm-passkey")
 
+          # CANCEL must free the real worker during logind lookup and polkit.
+          machine.wait_for_unit("polkit.service")
+          for unit, arguments in [("systemd-logind.service", ""), ("polkit.service", "--polkit")]:
+              machine.succeed(f"systemctl kill --kill-whom=main --signal=SIGSTOP {unit}")
+              try:
+                  machine.succeed("python3 ${./tests/approval_cancel.py} " + arguments, timeout=10)
+              finally:
+                  machine.succeed(f"systemctl kill --kill-whom=main --signal=SIGCONT {unit}")
+
           # -- fido2-manage subcommands (no PIN needed) --
           output = machine.succeed("fido2-manage -list")
           print("fido2-manage -list output:")

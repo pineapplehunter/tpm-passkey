@@ -30,8 +30,8 @@ match this checklist.
 This is an ongoing audit, **not a full conformance claim**. Section completion
 markers describe scoped wire/behavior checks, not certification or security
 assurance. Known remaining gaps include TPM-equivalent protection of PIN state,
-bounded/cancellable host approval, and complete credential-record integrity/
-load-failure handling. These require follow-up work.
+complete credential-record integrity/load-failure handling. These require
+follow-up work.
 
 ## Common Rules
 
@@ -280,8 +280,9 @@ Audit status: **complete for implemented credential-management fields**.
 
 `authenticatorReset` (`0x07`, section 6.6) and `authenticatorSelection` (`0x0b`,
 section 6.9) have no input parameters and return only the `CTAP2_OK` status byte
-on success. Both collect fresh user presence and fail with
-`CTAP2_ERR_OPERATION_DENIED` when it is denied. Because this USB authenticator
+on success. Both collect fresh user presence, return
+`CTAP2_ERR_OPERATION_DENIED` for refusal, and `CTAP2_ERR_USER_ACTION_TIMEOUT`
+(`0x2f`, not `ACTION_TIMEOUT`) for a user-action deadline. Because this USB authenticator
 has no physical display, reset is accepted only during the first 10 seconds of
 a new daemon/UHID authenticator generation; a later request returns
 `CTAP2_ERR_NOT_ALLOWED` without prompting.
@@ -324,6 +325,16 @@ Authenticator and TPM context. The UHID thread emits `CTAPHID_KEEPALIVE` at
 operation cancelled, queues state cleanup, and the original CBOR transaction
 returns `CTAP2_ERR_KEEPALIVE_CANCEL`; on a non-active CID it is ignored.
 
+Production approval has one 30-second user-action budget covering asynchronous
+system-bus connection, logind lookup, polkit and any terminal fallback. CANCEL is
+observed at most every 20 ms; polkit cancellation cleanup has a separate 100-ms
+bound and uses the same connection and cancellation ID. Refusal/deadline/cancel
+never trigger fallback. Reset/selection map deadlines to `USER_ACTION_TIMEOUT`;
+makeCredential/getAssertion UP and zero-length-auth selection map them to
+`OPERATION_DENIED`, per their distinct normative steps. Local kernel syscalls,
+ordinary logging, and an already executing TPM command are not asynchronously
+preempted.
+
 `CTAPHID_INIT`, `PING`, `CBOR`, `CANCEL`, `ERROR`, and `KEEPALIVE` follow their
 mandatory direction and length rules. `WINK` is implemented and advertised;
 `CAPABILITY_CBOR` and `CAPABILITY_NMSG` advertise CBOR support and the absence
@@ -333,8 +344,7 @@ Audit status: **complete**.
 
 ## Remaining Audit Order
 
-1. Make host approval bounded and promptly cancellable, including logind lookup.
-2. Protect PIN verifier/retry state with assurances matching TPM private keys.
-3. Complete credential-record integrity and fail-closed load handling.
-4. Revisit remaining request-type/status and feature-table claims against the
+1. Protect PIN verifier/retry state with assurances matching TPM private keys.
+2. Complete credential-record integrity and fail-closed load handling.
+3. Revisit remaining request-type/status and feature-table claims against the
    normative source; rerun browser-critical VM flows after each logical group.
