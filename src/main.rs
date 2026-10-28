@@ -103,8 +103,13 @@ enum ConfigSetCommand {
 
 #[derive(Debug, clap::Args)]
 struct DefaultPcrPolicyArgs {
-    /// PCR indices for the default policy (e.g. 1 7)
+    /// PCR indices for future credentials (e.g. 1 7); requires recovery
+    #[arg(required_unless_present = "disable", num_args = 1..)]
     pcr_indices: Vec<u32>,
+
+    /// Disable PCR binding for future registrations; existing keys are unchanged
+    #[arg(long, conflicts_with = "pcr_indices")]
+    disable: bool,
 }
 
 fn main() -> Result<()> {
@@ -309,8 +314,8 @@ fn run_list_credentials() -> Result<()> {
                 .and_then(|v| v.as_text())
                 .unwrap_or("never");
             let pcr_indices = management::value_get(cred, "pcr_indices")
-                .map(format_integer_array)
-                .unwrap_or_default();
+                .map(format_pcr_selection)
+                .unwrap_or_else(|| "none".to_owned());
             println!("{id}\t{rp_id}\t{user_name}\t{registered_at}\t{last_used_at}\t{pcr_indices}");
         }
     }
@@ -437,8 +442,8 @@ fn run_config_show() -> Result<()> {
         .as_ref()
         .ok_or_else(|| eyre!("daemon returned no configuration"))?;
     let default_pcr_policy = management::value_get(result, "default_pcr_policy")
-        .map(format_integer_array)
-        .unwrap_or_default();
+        .map(format_pcr_selection)
+        .unwrap_or_else(|| "none".to_owned());
     let recovery_passphrase_configured =
         management::value_get(result, "recovery_passphrase_configured")
             .and_then(|value| value.as_bool())
@@ -449,15 +454,37 @@ fn run_config_show() -> Result<()> {
 }
 
 fn run_set_default_pcr_policy(args: DefaultPcrPolicyArgs) -> Result<()> {
-    tpm::pcr_selection_for_indices(&args.pcr_indices).wrap_err("invalid PCR selection")?;
-    let pcr_indices = args.pcr_indices.clone();
-    let request = management::ManagementRequest::SetDefaultPcrPolicy { pcr_indices };
+    let request = if args.disable {
+        management::ManagementRequest::DisableDefaultPcrPolicy
+    } else {
+        tpm::pcr_selection_for_indices(&args.pcr_indices).wrap_err("invalid PCR selection")?;
+        management::ManagementRequest::SetDefaultPcrPolicy {
+            pcr_indices: args.pcr_indices.clone(),
+        }
+    };
     let response = management::send_request(&request)?;
     if !response.ok {
         bail!("daemon error: {}", response.error.unwrap_or_default());
     }
-    println!("default PCR policy set to {:?}", args.pcr_indices);
+    if args.disable {
+        println!(
+            "PCR binding disabled for future registrations; existing credentials are unchanged."
+        );
+    } else {
+        println!(
+            "default PCR policy set to {:?} for future registrations",
+            args.pcr_indices
+        );
+    }
     Ok(())
+}
+
+fn format_pcr_selection(value: &ciborium::value::Value) -> String {
+    if value.as_array().is_some_and(|values| !values.is_empty()) {
+        format_integer_array(value)
+    } else {
+        "none".to_owned()
+    }
 }
 
 fn format_integer_array(value: &ciborium::value::Value) -> String {
@@ -538,6 +565,53 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["linux-tpm-fido2", "set-default-pcr-policy", "7"]).is_err());
+    }
+
+    #[test]
+    fn pcr_disable_is_explicit_and_config_output_distinguishes_no_binding() {
+        let cli = Cli::try_parse_from([
+            "linux-tpm-fido2",
+            "config",
+            "set",
+            "default-pcr-policy",
+            "--disable",
+        ])
+        .unwrap();
+        let Command::Config(ConfigArgs {
+            command:
+                ConfigCommand::Set(ConfigSetArgs {
+                    setting: ConfigSetCommand::DefaultPcrPolicy(args),
+                }),
+        }) = cli.command
+        else {
+            panic!("PCR configuration command")
+        };
+        assert!(args.disable);
+        assert!(args.pcr_indices.is_empty());
+        assert!(
+            Cli::try_parse_from(["linux-tpm-fido2", "config", "set", "default-pcr-policy",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "linux-tpm-fido2",
+                "config",
+                "set",
+                "default-pcr-policy",
+                "--disable",
+                "7",
+            ])
+            .is_err()
+        );
+        assert_eq!(format_pcr_selection(&ciborium::value::Value::Null), "none");
+        assert_eq!(
+            format_pcr_selection(&ciborium::value::Value::Array(vec![])),
+            "none"
+        );
+        assert_eq!(
+            format_pcr_selection(&ciborium::value::Value::Array(vec![1.into(), 7.into()])),
+            "1,7"
+        );
     }
 
     #[test]

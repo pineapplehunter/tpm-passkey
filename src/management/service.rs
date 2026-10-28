@@ -192,12 +192,20 @@ fn dispatch_result(
         ),
         ManagementRequest::SetDefaultPcrPolicy { pcr_indices } => {
             tpm::pcr_selection_for_indices(pcr_indices)?;
+            if store::load_recovery_config(store_dir)?.is_none() {
+                return Err(eyre!(
+                    "configure a recovery passphrase before enabling PCR binding"
+                ));
+            }
             store::save_default_pcr_policy(store_dir, pcr_indices)?;
             Ok(cbor!({ "pcr_indices" => pcr_indices }).unwrap())
         }
+        ManagementRequest::DisableDefaultPcrPolicy => {
+            store::clear_default_pcr_policy(store_dir)?;
+            Ok(cbor!({ "status" => "PCR binding disabled for future registrations" }).unwrap())
+        }
         ManagementRequest::ShowConfig => {
-            let default_pcr_policy =
-                store::load_default_pcr_policy(store_dir)?.unwrap_or_else(|| vec![7]);
+            let default_pcr_policy = store::load_default_pcr_policy(store_dir)?;
             let recovery_passphrase_configured = store::load_recovery_config(store_dir)?.is_some();
             Ok(cbor!({
                 "default_pcr_policy" => default_pcr_policy,
@@ -205,6 +213,39 @@ fn dispatch_result(
             })
             .unwrap())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enabling_requires_recovery_but_existing_defaults_are_preserved_until_disabled() {
+        let mut id = [0; 8];
+        getrandom::fill(&mut id).unwrap();
+        let dir = std::env::temp_dir().join(format!("pcr-config-{}", hex::encode(id)));
+        let response = dispatch(
+            &dir,
+            None,
+            &ManagementRequest::SetDefaultPcrPolicy {
+                pcr_indices: vec![7],
+            },
+        );
+        assert!(!response.ok);
+        assert_eq!(store::load_default_pcr_policy(&dir).unwrap(), None);
+        // Older explicitly saved selections must still be shown, not silently
+        // disabled just because no recovery configuration exists yet.
+        store::save_default_pcr_policy(&dir, &[1, 7]).unwrap();
+        let shown = dispatch(&dir, None, &ManagementRequest::ShowConfig);
+        assert!(shown.ok);
+        assert_eq!(
+            store::load_default_pcr_policy(&dir).unwrap(),
+            Some(vec![1, 7])
+        );
+        assert!(dispatch(&dir, None, &ManagementRequest::DisableDefaultPcrPolicy).ok);
+        assert_eq!(store::load_default_pcr_policy(&dir).unwrap(), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM daemon_config WHERE key = 'default_pcr_policy'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "64e0f81ac698b5a57c0bf7cbec4d3bd804cf966ef6ef5787e22c46cc361859f4"
+}

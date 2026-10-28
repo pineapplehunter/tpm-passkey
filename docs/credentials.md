@@ -46,9 +46,34 @@ protected under a storage parent on the original TPM, not a raw private scalar.
 The daemon recreates a transient owner-hierarchy parent as needed and loads and
 flushes credential objects for signing.
 
+## Optional PCR binding
+
+New credentials are TPM-bound but **not PCR-bound by default**. An absent
+`daemon_config.default_pcr_policy` row means no binding. Explicitly saved PCR
+selections are preserved; an invalid or empty saved selection is an error,
+not an implicit request to disable binding.
+
+Unbound credentials have no stored PCR policy or recovery authority. They use
+the TPM's ordinary auth-value signing path, with no `PolicyPCR` invocation.
+Their `fixedTPM`, `fixedParent`, and `sensitiveDataOrigin` attributes still prevent
+normal private-key export/migration. This is not implemented by passing an empty
+PCR selection into the policy code. It permits use on the original TPM across
+boot-state changes, trading boot-state enforcement for convenience.
+
+Opt in by configuring a recovery phrase, then setting a nonempty PCR selection.
+Each new PCR-bound credential requires recovery enrollment to be unlocked and
+always gets its own recovery authority. A phrase alone never enables binding.
+`config set default-pcr-policy --disable` removes the default selection and
+allows unbound enrollment even while recovery enrollment is locked.
+
+Configuration changes affect future registrations only. Existing policies,
+TPM blobs, and recovery slots are not modified or retrofitted. A previously
+created bound key without recovery remains bound and without recovery. Stored
+PCR-policy updates still require that credential's recovery phrase.
+
 ## Recovery policy
 
-For each recovery-enabled credential:
+For each newly created PCR-bound credential:
 
 1. The TPM creates a separate recovery authority with a random 32-byte auth value.
 2. The authority approves a PCR policy using a credential-specific `policyRef`.
@@ -56,8 +81,9 @@ For each recovery-enabled credential:
    and restricts use to `TPM2_Sign`.
 4. The daemon password-encrypts the authority's auth value before persistence.
 
-Normal assertions verify the existing signed approval against the current PCR
-state. They do not decrypt the auth value or require the recovery phrase.
+Assertions for PCR-bound credentials verify the existing signed approval
+against the current PCR state. They do not decrypt the auth value or require
+the recovery phrase. Assertions for unbound credentials do not check PCRs.
 
 After a boot-state change, the management command decrypts the auth value using
 its supplied phrase. The original TPM uses the recovery authority to approve
@@ -92,20 +118,22 @@ Configure recovery before creating credentials that need it:
 
 ```sh
 linux-tpm-fido2 config set recovery-passphrase
+linux-tpm-fido2 config set default-pcr-policy 1 7
 ```
 
 This retains a zeroizing wrapping key only in the authenticator worker's memory
-for creating recovery-enabled credentials. After a daemon restart, enrollment
-is locked. Unlock it explicitly with:
+for creating PCR-bound credentials. After a daemon restart, only PCR-bound
+enrollment is locked. Unbound enrollment is unaffected. Unlock explicitly with:
 
 ```sh
 linux-tpm-fido2 config unlock-recovery
 ```
 
-While configured but locked, registration fails rather than silently creating a
-credential without recovery. Existing credentials can still authenticate. If no
-recovery configuration exists, registration creates PCR-bound credentials
-without recovery; setting a phrase later does not retrofit their fixed policy.
+While PCR binding is configured but recovery is missing or locked, registration
+fails rather than silently creating an unrecoverable bound credential. Without
+an explicit default selection, registration creates an unbound TPM key regardless
+of whether a phrase is configured or recovery enrollment is unlocked. Existing
+credentials always retain their individual policies.
 
 Policy-update requests always require their supplied phrase and do not use the
 enrollment unlock cache. Failed decryption happens before any TPM policy update.

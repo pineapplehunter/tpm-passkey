@@ -454,69 +454,32 @@ impl Authenticator {
             return Err(ErrorStatus::OperationDenied);
         }
 
-        let recovery_config = store::load_recovery_config(&self.store_dir).map_err(|error| {
-            log::warn!("failed to load recovery configuration: {error:?}");
-            ErrorStatus::OperationDenied
-        })?;
-        let recovery_unlock = if recovery_config.is_some() {
-            Some(
-                self.recovery_unlock
-                    .clone()
-                    .filter(|unlocked| {
-                        unlocked.matches_configuration(recovery_config.as_ref().unwrap())
-                    })
-                    .ok_or_else(|| {
-                        log::warn!("recovery enrollment is locked; run config unlock-recovery");
-                        ErrorStatus::OperationDenied
-                    })?,
-            )
-        } else {
-            None
-        };
-        let pcr_indices = store::load_default_pcr_policy(&self.store_dir)
-            .map_err(|error| {
-                log::warn!("failed to load default PCR policy: {error:?}");
-                ErrorStatus::OperationDenied
-            })?
-            .unwrap_or_else(|| vec![7]);
+        let binding = self.pcr_enrollment()?;
         let Some(tpm) = self.ensure_tpm() else {
             log::warn!("cannot create CTAP2 credential without TPM context");
             return Err(ErrorStatus::OperationDenied);
         };
-        tpm.set_pcr_indices(&pcr_indices).map_err(|error| {
-            log::warn!("invalid default PCR policy: {error:?}");
-            ErrorStatus::OperationDenied
-        })?;
         let mut credential_id = vec![0u8; 32];
         fill_random(&mut credential_id);
-        let recovery_key = if recovery_unlock.is_some() {
-            Some(tpm.create_recovery_key().map_err(|error| {
-                log::warn!("failed to create TPM recovery key: {error:?}");
+        // No configured selection means no PolicyPCR/PolicyAuthorize at all,
+        // not an empty selection passed through the PCR-policy machinery.
+        let (policy, recovery_key) = if let Some((indices, _)) = &binding {
+            let result = (|| -> color_eyre::Result<_> {
+                tpm.set_pcr_indices(indices)?;
+                let authority = tpm.create_recovery_key()?;
+                let pcr_policy = tpm.create_secure_boot_policy()?;
+                let policy_ref = tpm::credential_policy_ref(&credential_id);
+                let policy = tpm.create_authorized_policy(&pcr_policy, &authority, &policy_ref)?;
+                Ok((Some(policy), Some(authority)))
+            })();
+            result.map_err(|error| {
+                log::warn!("failed to create recoverable PCR policy: {error:?}");
                 ErrorStatus::OperationDenied
-            })?)
+            })?
         } else {
-            None
+            (None, None)
         };
-        let mut policy = match tpm.create_secure_boot_policy() {
-            Ok(policy) => policy,
-            Err(error) => {
-                log::warn!(
-                    "failed to create secure-boot PCR policy for CTAP2 credential: {error:?}"
-                );
-                return Err(ErrorStatus::OperationDenied);
-            }
-        };
-        if let Some(authority) = &recovery_key {
-            let policy_ref = tpm::credential_policy_ref(&credential_id);
-            policy = match tpm.create_authorized_policy(&policy, authority, &policy_ref) {
-                Ok(policy) => policy,
-                Err(error) => {
-                    log::warn!("failed to authorize TPM PCR policy: {error:?}");
-                    return Err(ErrorStatus::OperationDenied);
-                }
-            };
-        }
-        let key = match tpm.create_credential_key_with_policy(Some(&policy)) {
+        let key = match tpm.create_credential_key_with_policy(policy.as_ref()) {
             Ok(credential) => credential,
             Err(error) => {
                 log::warn!("failed to create TPM-backed CTAP2 credential key: {error:?}");
@@ -524,12 +487,15 @@ impl Authenticator {
             }
         };
         log::info!("created TPM-backed CTAP2 credential key");
-        let recovery = match (recovery_key, recovery_unlock) {
-            (Some(authority), Some(unlocked)) => {
+        let recovery = match (recovery_key, binding) {
+            (Some(authority), Some((_, unlocked))) => {
                 let aad = recovery::credential_aad(
                     &credential_id,
                     &authority.public,
-                    policy.policy_ref.as_deref().expect("authorized policyRef"),
+                    policy
+                        .as_ref()
+                        .and_then(|policy| policy.policy_ref.as_deref())
+                        .expect("authorized policyRef"),
                 );
                 let encrypted_auth = unlocked
                     .encrypt(
@@ -577,7 +543,7 @@ impl Authenticator {
             user_name: user_name.map(str::to_owned),
             user_display_name: user_display_name.map(str::to_owned),
             key,
-            policy: Some(store::StoredPcrPolicy {
+            policy: policy.map(|policy| store::StoredPcrPolicy {
                 selection: policy.selection,
                 digest: policy.digest,
                 policy_ref: policy.policy_ref,
@@ -1418,18 +1384,45 @@ impl Authenticator {
         Ok(())
     }
 
+    /// Snapshot only the defaults for this new credential. Existing credential
+    /// policies are never inferred from or rewritten by enrollment settings.
+    fn pcr_enrollment(&self) -> Result<Option<(Vec<u32>, UnlockedRecovery)>, ErrorStatus> {
+        let indices = store::load_default_pcr_policy(&self.store_dir).map_err(|error| {
+            log::warn!("failed to load default PCR policy: {error:?}");
+            ErrorStatus::OperationDenied
+        })?;
+        let Some(indices) = indices else {
+            return Ok(None);
+        };
+        let config = store::load_recovery_config(&self.store_dir)
+            .map_err(|error| {
+                log::warn!("failed to load recovery configuration: {error:?}");
+                ErrorStatus::OperationDenied
+            })?
+            .ok_or_else(|| {
+                log::warn!("PCR binding requires a configured recovery passphrase");
+                ErrorStatus::OperationDenied
+            })?;
+        let unlocked = self
+            .recovery_unlock
+            .as_ref()
+            .filter(|unlocked| unlocked.matches_configuration(&config))
+            .ok_or_else(|| {
+                log::warn!("PCR-bound enrollment is locked; run config unlock-recovery");
+                ErrorStatus::OperationDenied
+            })?;
+        Ok(Some((indices, unlocked.clone())))
+    }
+
     fn ensure_tpm(&mut self) -> Option<&mut tpm::Tpm> {
         if self.tpm.is_none() {
             let path = self.tpm_path.clone()?;
-            let pcr_indices = store::load_default_pcr_policy(&self.store_dir).unwrap_or(None);
-
             for attempt in 0..100 {
-                match tpm::Tpm::open(&path, pcr_indices.as_deref()) {
+                // Opening a context does not bind keys. Each operation selects
+                // the PCRs from its own explicit/stored policy when needed.
+                match tpm::Tpm::open(&path, None) {
                     Ok(tpm) => {
-                        log::info!(
-                            "TPM opened with PCR policy {:?}",
-                            pcr_indices.as_deref().unwrap_or(&[7])
-                        );
+                        log::info!("TPM context opened");
                         self.tpm = Some(tpm);
                         break;
                     }

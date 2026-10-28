@@ -199,7 +199,7 @@ impl Tpm {
         auth_value: Option<&[u8]>,
     ) -> Result<TpmCredential> {
         let parent = self.create_storage_parent()?;
-        let public = signing_key_public(policy, auth_value.is_some())?;
+        let public = signing_key_public(policy)?;
         let auth = auth_value
             .map(|value| Auth::try_from(value.to_vec()))
             .transpose()
@@ -745,7 +745,7 @@ impl Tpm {
     }
 
     fn probe_ecc_signing(&mut self) -> Result<()> {
-        let public = signing_key_public(None, true)?;
+        let public = signing_key_public(None)?;
 
         let key_handle = self
             .context
@@ -802,12 +802,15 @@ impl Tpm {
     }
 }
 
-fn signing_key_public(policy: Option<&PcrPolicyBinding>, user_with_auth: bool) -> Result<Public> {
+fn signing_key_public(policy: Option<&PcrPolicyBinding>) -> Result<Public> {
     let object_attributes = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
-        .with_user_with_auth(user_with_auth)
+        // Without a policy, allow the ordinary auth-value path (empty for
+        // unbound passkeys, random for recovery authorities). Policy-bound
+        // passkeys must NOT have an auth-value bypass.
+        .with_user_with_auth(policy.is_none())
         .with_decrypt(false)
         .with_sign_encrypt(true)
         .with_restricted(false)
@@ -930,7 +933,30 @@ fn der_integer(value: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pcr_indices_from_selection, pcr_selection_for_indices};
+    use super::{
+        PcrPolicyBinding, pcr_indices_from_selection, pcr_selection_for_indices, signing_key_public,
+    };
+
+    #[test]
+    fn unbound_keys_have_no_policy_but_both_modes_remain_nonexportable() {
+        let policy = PcrPolicyBinding {
+            selection: "sha256:7".into(),
+            digest: vec![0x42; 32],
+            policy_ref: None,
+            authority_name: None,
+            authority_signature: None,
+        };
+        for binding in [None, Some(&policy)] {
+            let public = signing_key_public(binding).unwrap();
+            let attributes = public.object_attributes();
+            assert!(attributes.fixed_tpm());
+            assert!(attributes.fixed_parent());
+            assert!(attributes.sensitive_data_origin());
+            assert!(attributes.sign_encrypt());
+            assert_eq!(attributes.user_with_auth(), binding.is_none());
+            assert_eq!(public.auth_policy().value().is_empty(), binding.is_none());
+        }
+    }
 
     #[test]
     fn pcr_selection_validation_rejects_invalid_input() {

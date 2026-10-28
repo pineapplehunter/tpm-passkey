@@ -112,15 +112,8 @@
           # -- config show/set --
           output = mgmt("config show")
           print("config show (defaults):", output)
-          assert "default_pcr_policy\t7" in output, f"Unexpected output: {output}"
+          assert "default_pcr_policy\tnone" in output, f"Unexpected output: {output}"
           assert "recovery_passphrase_configured\tfalse" in output, f"Unexpected output: {output}"
-
-          output = mgmt("config set default-pcr-policy 1 7")
-          print("config set default-pcr-policy:", output)
-          assert "default PCR policy set to [1, 7]" in output, f"Unexpected output: {output}"
-
-          output = mgmt("config show")
-          assert "default_pcr_policy\t1,7" in output, f"Unexpected output: {output}"
 
           # -- Set daemon passphrase (first-time: empty old passphrase) --
           mgmt_expect(
@@ -131,6 +124,13 @@
               'send "test-recovery-passphrase\\r"; '
               'expect eof',
           )
+
+          # PCR binding is opt-in and requires configured recovery.
+          output = mgmt("config set default-pcr-policy 1 7")
+          print("config set default-pcr-policy:", output)
+          assert "default PCR policy set to [1, 7]" in output, f"Unexpected output: {output}"
+          output = mgmt("config show")
+          assert "default_pcr_policy\t1,7" in output, f"Unexpected output: {output}"
 
           # -- register and assert via polkit authorization --
           machine.succeed("mkdir -p /tmp/linux-tpm-fido2-smoke")

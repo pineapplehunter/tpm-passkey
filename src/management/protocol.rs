@@ -24,6 +24,8 @@ pub enum ManagementRequest {
     },
     #[serde(rename = "set-default-pcr-policy")]
     SetDefaultPcrPolicy { pcr_indices: Vec<u32> },
+    #[serde(rename = "disable-default-pcr-policy")]
+    DisableDefaultPcrPolicy,
     #[serde(rename = "show-config")]
     ShowConfig,
 }

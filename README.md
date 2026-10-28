@@ -10,7 +10,7 @@ not multi-user credential isolation.
 
 - Presents a virtual FIDO2 HID authenticator to browsers.
 - Creates TPM-backed P-256 credentials for registration and assertion.
-- Supports secure-boot PCR-bound credentials.
+- Keeps credentials TPM-bound, with optional, explicit PCR boot-state binding.
 - Supports recovery material unlocked by a passphrase and kept TPM-bound.
 - Checks user acknowledgement through polkit.
 
@@ -43,24 +43,51 @@ Management examples:
 ```sh
 linux-tpm-fido2 list-credentials
 linux-tpm-fido2 config show
-linux-tpm-fido2 config set default-pcr-policy 1 7
-linux-tpm-fido2 config set recovery-passphrase
-# After restarting the daemon, before registering recovery-enabled credentials:
-linux-tpm-fido2 config unlock-recovery
 ```
 
 `list-credentials` prints the base64 credential ID accepted by
 `fido2-manage -credential`, followed by tab-separated RP ID, user name,
-registration time, last-use time, and bound PCR indices. `config show` reports
-the effective default PCR policy and whether recovery passphrase material is
-configured. Configure recovery before creating credentials that need it.
-Setting the recovery passphrase unlocks recovery-enabled registration for the
-current daemon process; after a restart, run `config unlock-recovery` to unlock
-registration again. Existing credentials can still authenticate while enrollment
-is locked. Credentials created before recovery is configured have no recovery
-slot and cannot gain one just by setting a passphrase.
+registration time, last-use time, and bound PCR indices (`none` when unbound).
+`config show` prints `default_pcr_policy\tnone` when no selection is configured,
+or the explicit indices, such as `1,7`.
 
-Each credential has its own TPM recovery authority with a random authorization
+### Optional PCR binding
+
+**New credentials have no PCR binding by default.** They remain non-exportable
+TPM keys, but can sign on the original TPM after boot measurements change.
+This trades boot-state restrictions for convenience; someone with sufficient
+access to the original TPM can use an unbound key regardless of boot state.
+
+Opt in before registering credentials that should be PCR-bound:
+
+```sh
+linux-tpm-fido2 config set recovery-passphrase
+linux-tpm-fido2 config set default-pcr-policy 1 7
+# After a daemon restart, unlock before registering new PCR-bound credentials:
+linux-tpm-fido2 config unlock-recovery
+```
+
+A passphrase alone does **not** enable PCR binding. Enabling requires configured
+recovery, and new PCR-bound enrollment also requires it to be unlocked. Every
+new PCR-bound credential gets its own recovery authority. Unbound enrollment
+never requires a recovery unlock, even when a phrase is configured.
+
+Disable binding for future registrations explicitly:
+
+```sh
+linux-tpm-fido2 config set default-pcr-policy --disable
+```
+
+These settings affect **future registrations only**. Existing credentials are
+not retrofitted or relaxed. Existing explicitly saved PCR selections are
+preserved across upgrades/restarts; only an absent default configuration means
+no binding. Previously created PCR-bound keys without recovery are not upgraded
+by setting a phrase. Existing PCR-policy updates still require the phrase.
+
+Recovery approves new PCR states on the **same TPM**. It cannot recover from
+TPM loss, replacement, clearing, or loss of the necessary credential blobs.
+
+Each PCR-bound credential has its own TPM recovery authority with a random authorization
 secret. Argon2id (64 MiB, three passes) and AES-256-GCM encrypt that secret; the
 database stores neither plaintext authorization values nor derived encryption
 keys. Policy updates require the supplied passphrase, even when registration is

@@ -1468,6 +1468,63 @@ fn credential_metadata_update_rolls_back_when_storage_fails() {
 }
 
 #[test]
+fn pcr_binding_is_explicit_requires_recovery_and_never_retrofits_credentials() {
+    let mut authenticator = authenticator_with_credential("example.com", vec![1]);
+    let dir = authenticator.store_dir.clone();
+    let mut existing = store::load_ctap2_credentials_from_dir(&dir).unwrap();
+    // A pre-existing bound credential may lack recovery. Keep it unchanged;
+    // only new bound enrollment must satisfy the new recovery requirement.
+    existing[0].policy = Some(store::StoredPcrPolicy {
+        selection: "sha256:7".into(),
+        digest: vec![1; 32],
+        policy_ref: None,
+        authority_name: None,
+        authority_signature: None,
+        policy_version: 1,
+    });
+    store::save_ctap2_credentials_to_dir(&dir, &existing).unwrap();
+    assert!(authenticator.pcr_enrollment().unwrap().is_none());
+    store::save_default_pcr_policy(&dir, &[7]).unwrap();
+    assert!(matches!(
+        authenticator.pcr_enrollment(),
+        Err(ErrorStatus::OperationDenied)
+    ));
+    assert_eq!(store::load_default_pcr_policy(&dir).unwrap(), Some(vec![7]));
+    store::clear_default_pcr_policy(&dir).unwrap();
+    authenticator
+        .set_recovery_passphrase(None, "optional PCR test phrase")
+        .unwrap();
+    assert!(
+        authenticator.pcr_enrollment().unwrap().is_none(),
+        "a phrase alone must not bind new keys"
+    );
+    store::save_default_pcr_policy(&dir, &[1, 7]).unwrap();
+    assert_eq!(
+        authenticator.pcr_enrollment().unwrap().unwrap().0,
+        vec![1, 7]
+    );
+    let restarted = Authenticator::new_with_approval(dir.clone(), None, Box::new(AlwaysApprove));
+    assert_eq!(
+        store::load_default_pcr_policy(&dir).unwrap(),
+        Some(vec![1, 7])
+    );
+    assert!(matches!(
+        restarted.pcr_enrollment(),
+        Err(ErrorStatus::OperationDenied)
+    ));
+    store::clear_default_pcr_policy(&dir).unwrap();
+    assert!(
+        restarted.pcr_enrollment().unwrap().is_none(),
+        "unbound enrollment must not need recovery unlock"
+    );
+    let unchanged = store::load_ctap2_credentials_from_dir(&dir).unwrap();
+    assert_eq!(unchanged[0].policy, existing[0].policy);
+    assert_eq!(unchanged[0].key, existing[0].key);
+    assert!(unchanged[0].recovery.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn recovery_unlock_rotation_and_policy_updates_require_the_phrase() {
     let mut authenticator = authenticator_with_credentials(
         "example.com",

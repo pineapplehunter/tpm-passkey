@@ -19,6 +19,7 @@
         inputs.flake-parts.flakeModules.easyOverlay
         inputs.treefmt-nix.flakeModule
         ./nix/nixos-test-polkit.nix
+        ./nix/nixos-test-pcr.nix
         ./nix/module.nix
       ];
 

@@ -279,6 +279,8 @@ async fn load_default_pcr_policy_async(dir: &Path) -> Result<Option<Vec<u32>>> {
             let blob: Vec<u8> = r.get("value");
             let indices: Vec<u32> = ciborium::from_reader(&blob[..])
                 .wrap_err("deserializing default PCR policy from database")?;
+            tpm::pcr_selection_for_indices(&indices)
+                .wrap_err("invalid saved default PCR selection")?;
             Ok(Some(indices))
         }
         None => Ok(None),
@@ -286,6 +288,7 @@ async fn load_default_pcr_policy_async(dir: &Path) -> Result<Option<Vec<u32>>> {
 }
 
 pub fn save_default_pcr_policy(dir: impl AsRef<Path>, indices: &[u32]) -> Result<()> {
+    tpm::pcr_selection_for_indices(indices)?;
     block_on_store(save_default_pcr_policy_async(dir.as_ref(), indices))
 }
 
@@ -301,6 +304,17 @@ async fn save_default_pcr_policy_async(dir: &Path, indices: &[u32]) -> Result<()
     .await
     .wrap_err("saving default PCR policy to database")?;
     Ok(())
+}
+
+/// Disabling binding removes only the default for future registrations.
+pub fn clear_default_pcr_policy(dir: impl AsRef<Path>) -> Result<()> {
+    block_on_store(async {
+        let pool = open_database(dir.as_ref()).await?;
+        sqlx::query!("DELETE FROM daemon_config WHERE key = 'default_pcr_policy'")
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
 }
 
 pub fn load_recovery_config(dir: impl AsRef<Path>) -> Result<Option<EncryptedSecret>> {
@@ -948,6 +962,20 @@ mod tests {
         let pk = sk.public_key();
         let point = pk.to_sec1_point(false);
         (point.x().unwrap().to_vec(), point.y().unwrap().to_vec())
+    }
+
+    #[test]
+    fn pcr_defaults_are_absent_or_explicit_and_invalid_saves_do_not_disable_them() {
+        let dir = test_store_dir("optional-pcr-default");
+        assert_eq!(load_default_pcr_policy(&dir).unwrap(), None);
+        save_default_pcr_policy(&dir, &[1, 7]).unwrap();
+        assert_eq!(load_default_pcr_policy(&dir).unwrap(), Some(vec![1, 7]));
+        assert!(save_default_pcr_policy(&dir, &[]).is_err());
+        assert!(save_default_pcr_policy(&dir, &[24]).is_err());
+        assert_eq!(load_default_pcr_policy(&dir).unwrap(), Some(vec![1, 7]));
+        clear_default_pcr_policy(&dir).unwrap();
+        assert_eq!(load_default_pcr_policy(&dir).unwrap(), None);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
