@@ -71,6 +71,7 @@ pub struct Authenticator {
     approval: Box<dyn approval::UserApproval>,
     recovery_unlock: Option<UnlockedRecovery>,
     credentials: Vec<Credential>,
+    credential_load_failed: bool,
     pending_assertion: Option<PendingAssertion>,
     client_pin: Option<ClientPinState>,
     client_pin_load_failed: bool,
@@ -140,7 +141,16 @@ impl Authenticator {
         approval: Box<dyn approval::UserApproval>,
     ) -> Self {
         let tpm = None;
-        let credentials = Self::load_credentials_from_disk(&store_dir);
+        let (credentials, credential_load_failed) =
+            match Self::load_credentials_from_disk(&store_dir) {
+                Ok(credentials) => (credentials, false),
+                Err(error) => {
+                    log::warn!(
+                        "failed to load credentials; blocking credential operations: {error:?}"
+                    );
+                    (Vec::new(), true)
+                }
+            };
         log::info!("loaded {} TPM-backed CTAP2 credentials", credentials.len());
         let mut client_pin_load_failed = false;
         let client_pin = match store::load_client_pin_state_from_dir(&store_dir) {
@@ -166,6 +176,7 @@ impl Authenticator {
             approval,
             recovery_unlock: None,
             credentials,
+            credential_load_failed,
             pending_assertion: None,
             client_pin,
             client_pin_load_failed,
@@ -179,12 +190,22 @@ impl Authenticator {
         }
     }
 
-    fn load_credentials_from_disk(store_dir: &PathBuf) -> Vec<Credential> {
-        match store::load_ctap2_credentials_from_dir(store_dir) {
-            Ok(credentials) => credentials.into_iter().map(Credential::from).collect(),
+    fn load_credentials_from_disk(store_dir: &PathBuf) -> color_eyre::Result<Vec<Credential>> {
+        store::load_ctap2_credentials_from_dir(store_dir)
+            .map(|credentials| credentials.into_iter().map(Credential::from).collect())
+    }
+
+    fn reload_credentials(&mut self) -> Result<(), ErrorStatus> {
+        match Self::load_credentials_from_disk(&self.store_dir) {
+            Ok(credentials) => {
+                self.credentials = credentials;
+                Ok(())
+            }
             Err(error) => {
-                log::warn!("failed to reload CTAP2 credential store: {error:?}");
-                Vec::new()
+                log::warn!("credential reload failed; blocking credential operations: {error:?}");
+                self.credential_load_failed = true;
+                self.cancel_pending();
+                Err(ErrorStatus::IntegrityFailure)
             }
         }
     }
@@ -234,9 +255,9 @@ impl Authenticator {
             body.len()
         );
 
-        // An unreadable PIN record is not an unconfigured authenticator.
+        // Unreadable persistent state is not an empty/unconfigured authenticator.
         // Keep discovery/reset available, but never permit a protection downgrade.
-        if self.client_pin_load_failed
+        if (self.client_pin_load_failed || self.credential_load_failed)
             && matches!(
                 command,
                 Ctap2Command::ClientPin
@@ -326,6 +347,7 @@ impl Authenticator {
             ErrorStatus::OperationDenied
         })?;
         self.credentials.clear();
+        self.credential_load_failed = false;
         self.recovery_unlock = None;
         self.client_pin = None;
         self.client_pin_load_failed = false;
@@ -387,6 +409,9 @@ impl Authenticator {
             return Err(ErrorStatus::InvalidParameter);
         }
 
+        if self.tpm_path.is_some() {
+            self.reload_credentials()?;
+        }
         let rp_id = map_text(rp, "id").ok_or(ErrorStatus::MissingParameter)?;
         let rp_name = map_text(rp, "name");
         let user_handle = map_bytes(user, "id").ok_or(ErrorStatus::MissingParameter)?;
@@ -628,7 +653,7 @@ impl Authenticator {
         // Reload credentials from disk when running as daemon (tpm_path is set)
         // to pick up management-side modifications (e.g., update-pcr-reference).
         if self.tpm_path.is_some() {
-            self.credentials = Self::load_credentials_from_disk(&self.store_dir);
+            self.reload_credentials()?;
         }
         let credential_indexes = matching_credential_indexes(&self.credentials, rp_id, allow_list);
         let Some((&credential_index, remaining_indexes)) = credential_indexes.split_first() else {
@@ -951,6 +976,9 @@ impl Authenticator {
         self.management = None;
         let auth_param = auth_param.ok_or(ErrorStatus::PuatRequired)?;
         let protocol = protocol.ok_or(ErrorStatus::MissingParameter)?;
+        if self.tpm_path.is_some() {
+            self.reload_credentials()?;
+        }
         let permission_rp_id = match sub_command {
             1 | 2 => None,
             4 => {

@@ -443,7 +443,7 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                 r.tpm_key AS recovery_tpm_key, r.public_key AS recovery_public_key, \
                  t.encrypted_auth, t.last_used AS token_last_used, t.used_count AS token_used_count \
          FROM credential_metadata m \
-         JOIN credential_keyslots p \
+         LEFT JOIN credential_keyslots p \
            ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' \
          LEFT JOIN credential_keyslots r \
            ON r.credential_id = m.credential_id AND r.slot_kind = 'recovery' \
@@ -524,26 +524,14 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                 integrity_mac,
             };
 
-            if let Some(ref expected_mac) = stored.integrity_mac {
-                let key = match load_or_generate_hmac_key(dir) {
-                    Ok(key) => key,
-                    Err(error) => {
-                        log::warn!("cannot verify credential integrity: {error:?}");
-                        return Ok(stored);
-                    }
-                };
-                let computed = compute_credential_mac(&key, &stored)?;
-                if computed != expected_mac as &[u8] {
-                    log::error!(
-                        "credential integrity check failed for rp_id={} id={}",
-                        stored.rp_id,
-                        hex::encode(&stored.id)
-                    );
-                    return Err(eyre!(
-                        "credential integrity check failed for rp_id={}",
-                        stored.rp_id
-                    ));
-                }
+            let expected_mac = stored
+                .integrity_mac
+                .as_ref()
+                .ok_or_else(|| eyre!("credential is missing its integrity MAC"))?;
+            let key = read_hmac_key(dir)?;
+            let computed = compute_credential_mac(&key, &stored)?;
+            if !constant_time_equal(&computed, expected_mac) {
+                return Err(eyre!("credential integrity check failed"));
             }
 
             Ok(stored)
@@ -556,6 +544,7 @@ async fn save_ctap2_credentials_async(
     credentials: &[StoredCtap2Credential],
 ) -> Result<()> {
     let pool = open_database(dir).await?;
+    let integrity_key = load_or_generate_hmac_key(dir)?;
     let mut tx = pool.begin().await.wrap_err("beginning store transaction")?;
     let existing_timestamps: HashMap<Vec<u8>, (String, Option<String>)> =
         sqlx::query!("SELECT credential_id, created_at, last_used_at FROM credential_metadata")
@@ -572,16 +561,7 @@ async fn save_ctap2_credentials_async(
         .wrap_err("clearing credential rows")?;
 
     for credential in credentials {
-        let key = match load_or_generate_hmac_key(dir) {
-            Ok(key) => {
-                let mac = compute_credential_mac(&key, credential)?;
-                Some(mac)
-            }
-            Err(error) => {
-                log::warn!("cannot compute credential integrity MAC: {error:?}");
-                None
-            }
-        };
+        let key = Some(compute_credential_mac(&integrity_key, credential)?);
 
         let (registered_at, last_used_at) = existing_timestamps
             .get(&credential.id)
@@ -1049,6 +1029,43 @@ mod tests {
         assert!(
             !dir.join(HMAC_KEY_FILE).exists(),
             "reads must not generate replacement keys"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_loading_rejects_missing_macs_keys_and_primary_slots() {
+        for missing_primary in [false, true] {
+            let dir = test_store_dir("credential-load-integrity");
+            save_ctap2_credentials_to_dir(&dir, &[test_credential(vec![1], "example.test", 0)])
+                .unwrap();
+            block_on_store(async {
+                let pool = open_database(&dir).await?;
+                if missing_primary {
+                    sqlx::query!("DELETE FROM credential_keyslots WHERE slot_kind = 'primary'")
+                        .execute(&pool)
+                        .await?;
+                } else {
+                    sqlx::query!("UPDATE credential_metadata SET integrity_mac = NULL")
+                        .execute(&pool)
+                        .await?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(load_ctap2_credentials_from_dir(&dir).is_err());
+            reset_authenticator_state_from_dir(&dir).unwrap();
+            assert!(load_ctap2_credentials_from_dir(&dir).unwrap().is_empty());
+            fs::remove_dir_all(dir).unwrap();
+        }
+        let dir = test_store_dir("credential-missing-key");
+        save_ctap2_credentials_to_dir(&dir, &[test_credential(vec![1], "example.test", 0)])
+            .unwrap();
+        fs::remove_file(dir.join(HMAC_KEY_FILE)).unwrap();
+        assert!(load_ctap2_credentials_from_dir(&dir).is_err());
+        assert!(
+            !dir.join(HMAC_KEY_FILE).exists(),
+            "reads must not replace integrity keys"
         );
         fs::remove_dir_all(dir).unwrap();
     }

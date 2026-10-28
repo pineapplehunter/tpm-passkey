@@ -1,4 +1,4 @@
-"""A corrupt PIN record must not make the authenticator appear unprotected."""
+"""Corrupt stored state must not become an unprotected or empty authenticator."""
 import hashlib
 import sqlite3
 import subprocess
@@ -52,7 +52,7 @@ def expect_integrity_failure(operation):
     except CtapError as error:
         assert error.code == CtapError.ERR.INTEGRITY_FAILURE, error
     else:
-        raise AssertionError("corrupt PIN state was accepted")
+        raise AssertionError("corrupt stored state was accepted")
 
 
 with sqlite3.connect(STORE) as database:
@@ -98,3 +98,46 @@ try:
 finally:
     device.close()
 print("PIN-state corruption fails closed and repair preserves credentials")
+
+with sqlite3.connect(STORE) as database:
+    credential_id, credential_mac = database.execute(
+        "SELECT credential_id, integrity_mac FROM credential_metadata ORDER BY credential_id LIMIT 1"
+    ).fetchone()
+
+
+def set_credential_mac(value):
+    with sqlite3.connect(STORE) as database:
+        database.execute(
+            "UPDATE credential_metadata SET integrity_mac = ? WHERE credential_id = ?",
+            (value, credential_id),
+        )
+
+
+try:
+    for corrupt, at_startup in ((bytes(32), False), (None, True)):
+        set_credential_mac(corrupt)
+        if at_startup:
+            restart()
+        device, ctap = connect()
+        try:
+            # The first iteration changes the store while the worker still has
+            # trusted cached credentials; registration must reload before saving.
+            expect_integrity_failure(lambda: ctap.make_credential(
+                hashlib.sha256(b"blocked credential save").digest(),
+                {"id": "blocked.example.test"}, {"id": b"blocked"},
+                [{"type": "public-key", "alg": -7}], options={"rk": False},
+            ))
+            expect_integrity_failure(lambda: ctap.get_assertion(
+                "login.example.test", hashlib.sha256(b"blocked credential load").digest(),
+                options={"up": False},
+            ))
+        finally:
+            device.close()
+        set_credential_mac(credential_mac)
+        assert snapshot() == original
+        restart()
+finally:
+    set_credential_mac(credential_mac)
+    restart()
+assert snapshot() == original
+print("Credential-state corruption fails closed without overwriting cached/disk keys")

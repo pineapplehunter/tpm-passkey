@@ -30,8 +30,8 @@ match this checklist.
 This is an ongoing audit, **not a full conformance claim**. Section completion
 markers describe scoped wire/behavior checks, not certification or security
 assurance. Known remaining gaps include TPM-equivalent protection of PIN state,
-complete credential-record integrity/load-failure handling. These require
-follow-up work.
+complete TPM-bound credential-record integrity and rollback protection. These
+require follow-up work.
 
 ## Common Rules
 
@@ -345,6 +345,7 @@ Audit status: **complete**.
 ## Remaining Audit Order
 
 1. Protect PIN verifier/retry state with assurances matching TPM private keys.
-2. Complete credential-record integrity and fail-closed load handling.
-3. Revisit remaining request-type/status and feature-table claims against the
+2. Authenticate complete credential records and address rollback protection.
+3. Correct newest-first assertion ordering after persistent-store reloads.
+4. Revisit remaining request-type/status and feature-table claims against the
    normative source; rerun browser-critical VM flows after each logical group.

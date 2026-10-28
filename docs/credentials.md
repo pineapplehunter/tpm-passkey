@@ -46,7 +46,7 @@ protected under a storage parent on the original TPM, not a raw private scalar.
 The daemon recreates a transient owner-hierarchy parent as needed and loads and
 flushes credential objects for signing.
 
-## Client PIN state failures and reset
+## Persistent-state failures and reset
 
 A stored PIN record must have 32-byte salt/verifier fields, a valid retry count,
 and an authenticated integrity MAC. Unreadable or unverifiable PIN state blocks
@@ -54,6 +54,15 @@ credential/PIN operations with `INTEGRITY_FAILURE`, not an implicit "PIN unset".
 GetInfo conservatively reports PIN protection so discovery and explicit reset
 remain available. Restore a complete valid backup and restart to repair without
 deleting credentials. Legacy PIN rows with no MAC are no longer accepted.
+
+Credential loads likewise require a valid metadata MAC, the existing integrity
+key, and a primary slot. Load/reload failures block operations rather than
+creating an empty writable namespace. Production registration, assertion, and
+credential-management begin/update/delete operations reload state before use.
+Integrity-key read errors never fall back to unchecked credentials, and a failed
+MAC-key access aborts snapshot writes before deleting rows. Legacy credential
+rows with no MAC are not automatically repaired or accepted. This does not make
+the metadata MAC cover every field or protect against full-store rollback.
 
 Explicit CTAP reset requires fresh approval within its normal startup window.
 Credential rows (including ones not loaded into memory) and PIN state are deleted

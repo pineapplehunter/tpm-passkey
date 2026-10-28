@@ -151,6 +151,77 @@ fn approval_outcomes_use_command_specific_ctap_statuses() {
 }
 
 #[test]
+fn unreadable_credentials_never_become_an_empty_writable_store() {
+    let auth = authenticator_with_credential("example.test", vec![1]);
+    let dir = auth.store_dir.clone();
+    let original = store::load_ctap2_credentials_from_dir(&dir).unwrap();
+    let key_path = dir.join("integrity.hmac-key");
+    let key = std::fs::read(&key_path).unwrap();
+    std::fs::write(&key_path, [0; 31]).unwrap();
+    assert!(store::load_ctap2_credentials_from_dir(&dir).is_err());
+    // Existing cached state must not be saved without its MAC if key I/O fails.
+    assert_eq!(auth.save_credentials(), Err(ErrorStatus::OperationDenied));
+    let mut restarted = Authenticator::new(dir.clone(), None);
+    assert!(restarted.credential_load_failed);
+    for command in [
+        Ctap2Command::MakeCredential,
+        Ctap2Command::GetAssertion,
+        Ctap2Command::CredentialManagement,
+        Ctap2Command::ClientPin,
+    ] {
+        assert_eq!(
+            restarted.handle_cbor(&[command.into()]),
+            vec![u8::from(ErrorStatus::IntegrityFailure)]
+        );
+    }
+    restarted.cancel_pending();
+    assert!(restarted.credential_load_failed);
+    std::fs::write(&key_path, key).unwrap();
+    assert_eq!(
+        store::load_ctap2_credentials_from_dir(&dir).unwrap(),
+        original
+    );
+    let repaired = Authenticator::new(dir.clone(), None);
+    assert!(!repaired.credential_load_failed);
+    assert_eq!(repaired.credentials.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn registration_and_assertion_reload_failures_preserve_last_trusted_state() {
+    for command in [Ctap2Command::MakeCredential, Ctap2Command::GetAssertion] {
+        let mut auth = authenticator_with_credential("example.test", vec![1]);
+        let dir = auth.store_dir.clone();
+        auth.tpm_path = Some(PathBuf::from("/not-a-tpm"));
+        let count = Arc::new(AtomicUsize::new(0));
+        auth.approval = Box::new(CountingApproval(count.clone()));
+        let key_path = dir.join("integrity.hmac-key");
+        let key = std::fs::read(&key_path).unwrap();
+        std::fs::write(&key_path, [0; 31]).unwrap();
+        let body = if command == Ctap2Command::MakeCredential {
+            cbor!({1 => bytes([0; 32]), 2 => {"id" => "example.test"},
+                3 => {"id" => bytes([2])}, 4 => [{"type" => "public-key", "alg" => -7}]})
+            .unwrap()
+        } else {
+            cbor!({1 => "example.test", 2 => bytes([0; 32])}).unwrap()
+        };
+        assert_eq!(
+            auth.handle_cbor(&ctap_request(command, body)),
+            vec![u8::from(ErrorStatus::IntegrityFailure)]
+        );
+        assert!(auth.credential_load_failed);
+        assert_eq!(auth.credentials.len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        std::fs::write(&key_path, key).unwrap();
+        assert_eq!(
+            store::load_ctap2_credentials_from_dir(&dir).unwrap().len(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn client_only_and_unknown_extension_inputs_are_ignored() {
     let dir = test_store_dir("client-only-extensions");
     let count = Arc::new(AtomicUsize::new(0));
@@ -1866,6 +1937,7 @@ fn authenticator_with_credentials(
                 sign_count: credential.sign_count,
             })
             .collect(),
+        credential_load_failed: false,
         pending_assertion: None,
         client_pin: None,
         client_pin_load_failed: false,

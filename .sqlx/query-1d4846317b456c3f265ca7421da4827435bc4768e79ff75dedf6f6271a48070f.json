@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE credential_metadata SET integrity_mac = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "1d4846317b456c3f265ca7421da4827435bc4768e79ff75dedf6f6271a48070f"
+}

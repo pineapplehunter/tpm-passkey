@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM credential_keyslots WHERE slot_kind = 'primary'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "29184999ecf1b3f86e5339a5db770c55aaa9f7faa89ff69101a88b19f4bea12a"
+}
