@@ -25,7 +25,6 @@ caller separately.
 * **Management CLI:** The unprivileged `tpm-passkey` process, which collects recovery phrases and requests daemon-side changes.
 * **TPM:** The TPM 2.0 device that generates, protects, and uses credential private keys.
 * **Credential Store:** The persistent database containing TPM object blobs, public-key material, credential metadata, policy information, and signature counters.
-* **Session Manager:** `systemd-logind`, used to guard graphical-session eligibility and cancel pending consent on observed session loss/lock/change; it does not identify HID senders or credential owners.
 * **Authorization Service:** polkit and its authentication agent, used for management privileges and group-gated approval-agent registration, not CTAP UP.
 * **Device-Access Mechanism:** udev and `uaccess`, which grant access to the virtual HID device to the active user of the associated seat.
 * **Platform Trust Chain:** The firmware, bootloader, kernel, and measured-boot components that determine relevant PCR values.
@@ -191,8 +190,8 @@ Credential metadata is not necessarily confidential. Depending on the database f
 
 All stored credentials share one namespace. The daemon does not determine HID
 caller UIDs, filter credentials by owner, or bind PIN tokens/credentials to login
-sessions. Credential metadata has no local owner UID. Pending approval is cancelled
-on observed session ineligibility; this is not per-user credential revocation.
+sessions. Credential metadata has no local owner UID. The daemon does not monitor
+session state or cancel pending approval on lock.
 
 Keep `hidraw` and store access restricted. The existing udev `uaccess` rule does
 not constitute multi-user isolation: changing an ACL does not revoke an already
@@ -204,9 +203,9 @@ namespace, not separate stores.
 ### User Authorization
 
 An unprivileged desktop agent registers its object path on the system bus. The
-daemon uses the actual unique sender and bus-derived UID, never a caller-supplied
-UID/name. Polkit gates registration, while logind independently checks graphical
-eligibility. A user-service PID need not reside in the graphical session scope.
+daemon uses the actual unique sender, never a caller-supplied UID/name. Polkit
+gates registration. The daemon relies on the desktop to prevent interaction while
+locked and does not bind the agent to a login session.
 The helper checks that incoming requests originate from the current root-owned
 daemon bus name. Root never accesses the user's display or session bus.
 
@@ -215,7 +214,7 @@ polkit/PAM host re-authentication assurance. The agent is not secure attention:
 same-user malware can impersonate/compromise it or automate consent. The displayed
 RP/account data is untrusted plain text, not independently verified web-origin
 identity. Wayland may leave a dialog unfocused; automatic activation is not
-promised. Neither session eligibility nor helper identity identifies the browser.
+promised. Helper identity does not identify the browser.
 
 Authorization shall be associated with one specific CTAP transaction. Authorization results shall not be reused for unrelated requests unless the reuse semantics are explicitly defined and justified.
 
@@ -238,15 +237,13 @@ factory reset clears all credentials and PIN state atomically; ordinary operatio
 never automatically drops or regenerates an unreadable PIN record.
 
 Cancellation, token expiry, and denied approval prevent authorization. Approval
-has one 30-second absolute deadline, including system-bus setup and logind lookup.
+has one 30-second absolute deadline, including system-bus communication.
 Cancellation is checked every 20 ms; explicit remote dialog cancellation has a
 further bounded cleanup allowance of at most 100 ms. Denial, timeout, cancellation,
 missing helper/display, malformed replies or disconnection fail closed with no
 fallback. A fresh request ID and connection binding prevent consent transfer or
-replay. Session eligibility is rechecked before accepting Allow and during a
-pending request. Observed loss cannot be undone by unlocking/re-registration for
-that transaction. `LockedHint` depends on desktop cooperation; rapid unobserved
-transitions are not a secure-attention guarantee. Local kernel calls and blocked
+replay. Desktop locking does not cancel a pending request; it may remain pending
+until its deadline and be approved after unlock. Local kernel calls and blocked
 logging sinks are not preemptible; this is not a hard real-time guarantee.
 Registration checks cancellation after TPM creation and before persistence;
 reset checks before deletion. Cancellation racing an already-started SQLite
@@ -349,7 +346,6 @@ Credential use depends on the continued availability and consistency of:
 * The TPM object blobs.
 * The credential database.
 * The required authorization factors (e.g., PCR state or passphrase).
-* The session manager.
 * The registered graphical approval agent and its display connection.
 * Polkit for new registrations and management; its authentication agent when management policy requires authentication.
 * The UHID and hidraw subsystems.

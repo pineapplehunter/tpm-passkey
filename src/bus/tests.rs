@@ -5,6 +5,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::atomic::AtomicUsize,
 };
+use zbus::zvariant::OwnedValue;
 
 struct PrivateBus {
     child: Child,
@@ -248,12 +249,6 @@ async fn install(bus: &PrivateBus) -> (BusApproval, tokio::task::JoinHandle<()>)
         registry: Arc::new(Mutex::new(Registry::default())),
         barrier,
     };
-    let proxy = zbus::fdo::DBusProxy::new(&connection).await.unwrap();
-    let owner = proxy
-        .get_name_owner("org.freedesktop.login1".try_into().unwrap())
-        .await
-        .unwrap();
-    approval.registry.lock().unwrap().logind_owner = Some(owner.as_str().to_owned());
     let (tpm, _rx) = std::sync::mpsc::channel();
     connection
         .object_server()
@@ -448,19 +443,12 @@ fn management_authorizes_before_fd_decode_and_rejects_operation_substitution() {
 
 #[test]
 #[ignore = "requires dbus-daemon in PATH; run with --ignored"]
-fn session_guard_rejects_lock_ambiguity_and_wrong_uid_then_disconnects() {
+fn registration_is_independent_of_logind_and_disconnects() {
     crate::approval::runtime().unwrap().block_on(async {
         let bus = PrivateBus::new();
         let _authority = authority(&bus, Authority::default()).await;
-        let (_logind, session) = login(&bus).await;
         let (approval, monitor) = install(&bus).await;
         let caller = bus.connect().await;
-        session.locked.store(true, Ordering::SeqCst);
-        assert!(register(&caller).await.is_err());
-        session.locked.store(false, Ordering::SeqCst);
-        session.multiple.store(true, Ordering::SeqCst);
-        assert!(register(&caller).await.is_err());
-        session.multiple.store(false, Ordering::SeqCst);
         assert!(register(&caller).await.is_ok());
         assert!(approval.registry.lock().unwrap().agent.is_some());
         caller.close().await.unwrap();
@@ -471,31 +459,13 @@ fn session_guard_rejects_lock_ambiguity_and_wrong_uid_then_disconnects() {
         })
         .await
         .unwrap();
-        // Registration does not require the process to be in a logind scope;
-        // only the authenticated bus UID must match the eligible session UID.
-        let wrong_uid = Login {
-            uid: session.uid.wrapping_add(1),
-            ..session
-        };
-        _logind
-            .object_server()
-            .remove::<Login, _>("/org/freedesktop/login1")
-            .await
-            .unwrap();
-        _logind
-            .object_server()
-            .at("/org/freedesktop/login1", wrong_uid)
-            .await
-            .unwrap();
-        let caller = bus.connect().await;
-        assert!(register(&caller).await.is_err());
         monitor.abort();
     });
 }
 
 #[test]
 #[ignore = "requires dbus-daemon in PATH; run with --ignored"]
-fn observed_lock_then_recovery_cannot_revive_pending_consent() {
+fn unrelated_lock_signals_do_not_cancel_pending_consent() {
     crate::approval::runtime().unwrap().block_on(async {
         let bus = PrivateBus::new();
         let _authority = authority(&bus, Authority::default()).await;
@@ -538,31 +508,19 @@ fn observed_lock_then_recovery_cannot_revive_pending_consent() {
                 .await
                 .unwrap();
         }
+        agent.release.store(true, Ordering::SeqCst);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), task)
                 .await
                 .unwrap()
                 .unwrap(),
-            ApprovalOutcome::Denied
+            ApprovalOutcome::Approved
         );
-        assert!(approval.registry.lock().unwrap().agent.is_none());
-        assert_eq!(
-            agent.cancelled.lock().unwrap()[0],
-            agent.requests.lock().unwrap()[0].0
-        );
+        assert!(approval.registry.lock().unwrap().agent.is_some());
+        assert!(agent.cancelled.lock().unwrap().is_empty());
         assert_eq!(
             agent.requests.lock().unwrap()[0].1.rp_id,
             "full.example.test"
-        );
-        let pending = approval.clone();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || pending.approve_context_controlled(
-                &crate::approval::context("selection", ""),
-                &short_control(100)
-            ))
-            .await
-            .unwrap(),
-            ApprovalOutcome::Denied
         );
         monitor.abort();
     });
@@ -637,7 +595,7 @@ fn agent_wait_cancel_and_deadline_share_one_budget_and_cancel_exact_request() {
 
 #[test]
 #[ignore = "requires dbus-daemon in PATH; run with --ignored"]
-fn final_snapshot_rejects_session_changes_even_without_signals() {
+fn session_changes_do_not_revoke_agent() {
     crate::approval::runtime().unwrap().block_on(async {
         let bus = PrivateBus::new();
         let _authority = authority(&bus, Authority::default()).await;
@@ -661,8 +619,8 @@ fn final_snapshot_rejects_session_changes_even_without_signals() {
         entered(&agent).await;
         session.multiple.store(true, Ordering::SeqCst);
         agent.release.store(true, Ordering::SeqCst);
-        assert_eq!(task.await.unwrap(), ApprovalOutcome::Denied);
-        assert!(approval.registry.lock().unwrap().agent.is_none());
+        assert_eq!(task.await.unwrap(), ApprovalOutcome::Approved);
+        assert!(approval.registry.lock().unwrap().agent.is_some());
         session.multiple.store(false, Ordering::SeqCst);
         let pending = approval.clone();
         assert_eq!(
@@ -672,9 +630,8 @@ fn final_snapshot_rejects_session_changes_even_without_signals() {
             ))
             .await
             .unwrap(),
-            ApprovalOutcome::Denied
+            ApprovalOutcome::Approved
         );
-        // An explicit fresh registration is needed; previous consent never revives.
         register(&caller).await.unwrap();
         let pending = approval.clone();
         assert_eq!(

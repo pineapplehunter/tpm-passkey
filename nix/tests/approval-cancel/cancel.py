@@ -1,4 +1,4 @@
-"""Cancel while real logind or a registered agent is pending; verify wire cleanup."""
+"""Cancel while a registered agent is pending; verify wire cleanup."""
 import json
 from pathlib import Path
 import sys

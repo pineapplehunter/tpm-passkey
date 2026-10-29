@@ -31,17 +31,12 @@ This is access to one shared store, not per-user credential isolation.
 - `UnregisterAgent(o path) -> ()`
 
 The path is `/io/github/pineapplehunter/TpmPasskey1/ApprovalAgent`. A registration
-is bound to its unique sender, bus-derived UID, object path, and exact eligible
-logind session. Run one frontend at a time. A live agent is not silently replaced;
-a pending approval cannot be replaced, queued, or resurrected by re-registration.
-
-The minimal session policy supports exactly one local graphical user session,
-which must be active and unlocked. An additional inactive graphical session is
-also ambiguous: a systemd user-service PID need not identify which display it
-belongs to. Lock/logout/session observations revoke registration and pending
-consent. Agents retry registration outside pending dialogs after recovery, even
-if the daemon's name owner has not changed. `LockedHint` requires desktop
-cooperation. This does not identify the browser or enforce credential ownership.
+is bound to its unique sender and object path. Run one frontend at a time. A live
+agent is not silently replaced; a pending approval cannot be replaced, queued,
+or resurrected by re-registration. Agents register when the daemon appears
+and retry failures. The daemon does not monitor session or lock state: the
+desktop is responsible for preventing interaction while locked. This does not
+identify the browser or enforce credential ownership.
 
 ## Toolkit-independent approval interface
 

@@ -1,7 +1,7 @@
 { pkgs, package }:
 (import ../common.nix { inherit pkgs package; }) {
   name = "approval-lifecycle";
-  reason = "Exercise fresh Allow/Deny, absent helper, and session lock during a real pending approval; no cached or stale consent may survive.";
+  reason = "Exercise fresh Allow/Deny and absent helper; no cached consent may survive.";
   testScript = ''
     scenario("${./scenario.py}", timeout=60)
     machine.succeed("systemctl stop tpm-passkey-test-agent; rm -f /run/user/1000/tpm-passkey-test-ready")

@@ -132,10 +132,8 @@ async fn register(connection: &Connection, shared: &Shared) {
             registered = None;
             continue;
         };
-        // Lock/logout/session observations revoke daemon-side registration
-        // without changing its name owner. Retry idempotently after recovery,
-        // but never register over a pending consent transaction.
-        if shared.has_pending() {
+        // Retry failures, but do not repeat successful registrations.
+        if registered == Some(epoch) || shared.has_pending() {
             continue;
         }
         let result = tokio::time::timeout(Duration::from_secs(3), async {

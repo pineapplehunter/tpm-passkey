@@ -326,7 +326,7 @@ operation cancelled, queues state cleanup, and the original CBOR transaction
 returns `CTAP2_ERR_KEEPALIVE_CANCEL`; on a non-active CID it is ignored.
 
 Production approval has one 30-second user-action budget covering asynchronous
-system-bus/logind checks and the directed GTK-agent request. CANCEL is observed
+system-bus checks and the directed GTK-agent request. CANCEL is observed
 at most every 20 ms; explicit remote dialog cancellation has a separate 100-ms
 cleanup bound and uses the same unique connection and request ID. Missing helper,
 refusal/deadline/cancel/disconnection never trigger fallback. Host approval is a

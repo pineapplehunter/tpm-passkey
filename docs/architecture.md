@@ -11,7 +11,7 @@ The separate `tpm-passkey` CLI and `tpm-passkey-approval-gtk` GUI depend only on
 small shared protocol crate, never the daemon library. GTK is not linked into
 the daemon or CLI, and separate Nix packages keep it out of their runtime closures.
 
-Logind guards approval eligibility and pending-session changes. The daemon does
+The daemon relies on the desktop lock and does not monitor login sessions. It does
 not identify HID requester UIDs, scope credentials by UID, or bind PIN tokens to
 login sessions. D-Bus management and registration authenticate their own senders.
 File and device permissions remain in place. Credential compatibility across
@@ -68,7 +68,6 @@ src/
 ├── management.rs           management dispatch boundary (no Unix listener)
 ├── management/
 │   └── service.rs          management operations and TPM command dispatch
-├── systemd_logind.rs       graphical-session eligibility, not browser identity
 └── polkit.rs               management/registration authorization, not CTAP UP
 ```
 
@@ -111,8 +110,8 @@ unprivileged agent on the system bus. Its unique connection/object path, fresh
 request ID and remaining lifetime bind exactly one decision to one transaction.
 The daemon explicitly cancels the remote dialog; dropping a local future alone
 is not sufficient. The helper tombstones authenticated cancellation IDs even
-when Cancel overtakes Request authentication. Observed session loss revokes
-registration, so the agent retries idempotent registration after recovery. Session eligibility is checked while pending and before Allow.
+when Cancel overtakes Request authentication. The agent registers when the daemon
+appears and retries failures; desktop lock or session changes do not revoke it.
 There is no automatic terminal or polkit fallback for presence.
 
 `crates/protocol` contains toolkit/TPM-independent wire types and sealed-FD
@@ -159,8 +158,8 @@ RUST_LOG=tpm_passkey=debug,sqlx=warn,zbus=warn
   machine configuration, driver helpers and credential fixtures stay directly
   in `nix/tests/`; see its [test index](../nix/tests/README.md).
   Protocol cases use an explicitly test-only auto-answering system-bus agent
-  and a controlled logind fixture, not production bypasses. Fault cases stop
-  logind or hold a dialog pending and verify directed cancellation identity.
+  and a controlled desktop fixture, not production bypasses. Fault cases hold a
+  dialog pending and verify directed cancellation identity.
   A separate test runs the real unprivileged GTK binary on headless X11; this
   is not evidence of manual Firefox/Wayland usability or automatic focus.
 

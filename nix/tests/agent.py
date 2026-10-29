@@ -1,8 +1,7 @@
 """Test-only system-bus agent; NOT shipped with production binaries.
 
-The login fixture is a TTY. Its controller advertises Wayland to exercise the
-real logind eligibility path without a desktop in every protocol VM. This is
-not evidence of GTK UX. The dedicated GTK test runs the real GUI separately.
+The login fixture is a TTY with a simulated Wayland session. This is not
+evidence of GTK UX. The dedicated GTK test runs the real GUI separately.
 """
 import asyncio
 import json

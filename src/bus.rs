@@ -2,7 +2,6 @@
 use crate::{
     approval::{ApprovalControl, ApprovalOutcome, DEFAULT_APPROVAL_TIMEOUT, UserApproval},
     ctap2,
-    systemd_logind::{self, Session},
 };
 use color_eyre::{Result, eyre::eyre};
 use std::{
@@ -17,19 +16,17 @@ use tpm_passkey_protocol::{self as wire, ApprovalContext};
 use zbus::{
     Connection, MessageStream,
     export::futures_core::Stream,
-    zvariant::{OwnedFd, OwnedObjectPath, OwnedValue},
+    zvariant::{OwnedFd, OwnedObjectPath},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Agent {
     sender: String,
     path: OwnedObjectPath,
-    session: Session,
 }
 #[derive(Default)]
 struct Registry {
     generation: u64,
-    logind_owner: Option<String>,
     agent: Option<Agent>,
     registering: HashMap<String, usize>,
     pending: Option<(String, Arc<AtomicBool>)>,
@@ -221,13 +218,7 @@ impl UserApproval for BusApproval {
 }
 impl BusApproval {
     async fn eligible(&self, agent: &Agent) -> bool {
-        let eligible = crate::polkit::caller_alive(&self.connection, &agent.sender).await
-            && systemd_logind::eligible_session(&self.connection)
-                .await
-                .ok()
-                .flatten()
-                .as_ref()
-                == Some(&agent.session);
+        let eligible = crate::polkit::caller_alive(&self.connection, &agent.sender).await;
         let eligible = eligible && self.observations_current().await;
         let mut registry = self.registry.lock().unwrap();
         if !eligible && registry.agent.as_ref() == Some(agent) {
@@ -237,8 +228,7 @@ impl BusApproval {
     }
     async fn observations_current(&self) -> bool {
         // The connection reader enqueues signals before delivering subsequent
-        // query replies. Drain those observations before accepting a snapshot;
-        // a lock/unlock pair must not disappear behind a successful GetAll.
+        // query replies. Drain those observations before accepting a snapshot.
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.barrier.send(tx).await.is_ok() && rx.await.is_ok()
     }
@@ -321,38 +311,18 @@ impl Daemon {
         }
         control
             .run(async {
-                let session = systemd_logind::eligible_session(&self.approval.connection)
-                    .await
-                    .ok()
-                    .flatten()
-                    .ok_or_else(denied)?;
-                let proxy = zbus::fdo::DBusProxy::new(&self.approval.connection)
-                    .await
-                    .map_err(|_| denied())?;
-                let uid = proxy
-                    .get_connection_unix_user(sender.as_str().try_into().map_err(|_| denied())?)
-                    .await
-                    .map_err(|_| denied())?;
-                if uid != session.uid
-                    || !crate::polkit::caller_alive(&self.approval.connection, &sender).await
-                    || systemd_logind::eligible_session(&self.approval.connection)
-                        .await
-                        .ok()
-                        .flatten()
-                        .as_ref()
-                        != Some(&session)
+                if !crate::polkit::caller_alive(&self.approval.connection, &sender).await
                     || !self.approval.observations_current().await
                 {
                     return Err(denied());
                 }
-                if self.approval.registry.lock().unwrap().register(
-                    generation,
-                    Agent {
-                        sender,
-                        path,
-                        session,
-                    },
-                ) {
+                if self
+                    .approval
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .register(generation, Agent { sender, path })
+                {
                     Ok(())
                 } else {
                     Err(denied())
@@ -462,13 +432,6 @@ pub fn start(store_dir: std::path::PathBuf, tpm: ctap2::TpmCmdSender) -> Result<
                             .build();
                         let signals =
                             MessageStream::for_match_rule(rule, &connection, Some(1024)).await?;
-                        let proxy = zbus::fdo::DBusProxy::new(&connection).await?;
-                        let owner = proxy
-                            .get_name_owner("org.freedesktop.login1".try_into()?)
-                            .await
-                            .ok()
-                            .map(|owner| owner.as_str().to_owned());
-                        shared.lock().unwrap().logind_owner = owner;
                         let (barrier, barriers) = tokio::sync::mpsc::channel(16);
                         let approval = BusApproval {
                             connection: connection.clone(),
@@ -541,54 +504,8 @@ async fn monitor(
                 approval.registry.lock().unwrap().invalidate();
                 continue;
             };
-            let mut registry = approval.registry.lock().unwrap();
-            if name == "org.freedesktop.login1" {
-                registry.logind_owner = (!new.is_empty()).then_some(new);
-                registry.invalidate();
-            } else if !old.is_empty() {
-                registry.owner_lost(&name);
-            }
-        }
-        // Object paths and interface strings alone do not authenticate signals.
-        let from_logind = header.sender().is_some_and(|sender| {
-            approval.registry.lock().unwrap().logind_owner.as_deref() == Some(sender.as_str())
-        });
-        if !from_logind {
-            continue;
-        }
-        let logind_path = header
-            .path()
-            .is_some_and(|p| p.as_str().starts_with("/org/freedesktop/login1"));
-        // Conservative invalidation: creation/removal of any session can change
-        // sole-session eligibility. Ignore only unrelated property changes.
-        if logind_path
-            && (iface == "org.freedesktop.login1.Manager"
-                || iface == "org.freedesktop.login1.Session")
-        {
-            approval.registry.lock().unwrap().invalidate();
-        } else if logind_path
-            && iface == "org.freedesktop.DBus.Properties"
-            && member == "PropertiesChanged"
-        {
-            let changed = message
-                .body()
-                .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>();
-            let sensitive = [
-                "Active",
-                "Remote",
-                "LockedHint",
-                "State",
-                "Type",
-                "Class",
-                "Seat",
-                "ActiveSession",
-            ];
-            if changed.as_ref().map_or(true, |(_, changed, invalidated)| {
-                sensitive
-                    .iter()
-                    .any(|key| changed.contains_key(*key) || invalidated.iter().any(|v| v == key))
-            }) {
-                approval.registry.lock().unwrap().invalidate();
+            if !old.is_empty() && new.is_empty() {
+                approval.registry.lock().unwrap().owner_lost(&name);
             }
         }
     }
@@ -608,12 +525,6 @@ mod tests {
         Agent {
             sender: sender.into(),
             path: wire::AGENT_PATH.try_into().unwrap(),
-            session: Session {
-                id: "s1".into(),
-                uid: 1000,
-                seat: "seat0".into(),
-                path: "/org/freedesktop/login1/session/s1".try_into().unwrap(),
-            },
         }
     }
     #[test]

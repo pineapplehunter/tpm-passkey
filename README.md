@@ -28,10 +28,8 @@ not multi-user credential isolation.
 
 Keep device and store access restricted. Single-user operation does not make
 requests from other processes trustworthy: transaction approval and CTAP PIN/UV
-checks still apply. Logind gates approval-agent eligibility, not HID caller identity
-or credential ownership. Exactly one local graphical session must be eligible;
-missing/locked/ambiguous sessions fail closed. Lock detection depends on the
-desktop publishing accurate logind state.
+checks still apply. The daemon does not monitor desktop lock or login sessions;
+the desktop is responsible for preventing interaction while locked.
 
 ## Usage
 
