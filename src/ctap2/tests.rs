@@ -151,6 +151,80 @@ fn approval_outcomes_use_command_specific_ctap_statuses() {
 }
 
 #[test]
+fn expired_management_command_cannot_mutate_recovery_configuration() {
+    let mut auth = authenticator_with_credential("example.test", vec![1]);
+    let error = auth
+        .handle_tpm_command(TpmCommand::BeforeDeadline {
+            deadline: Instant::now() - Duration::from_millis(1),
+            command: Box::new(TpmCommand::SetRecoveryPassphrase {
+                old_passphrase: None,
+                new_passphrase: Zeroizing::new("must not be applied".into()),
+            }),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("expired"));
+    assert!(
+        store::load_recovery_config(&auth.store_dir)
+            .unwrap()
+            .is_none()
+    );
+    std::fs::remove_dir_all(auth.store_dir).unwrap();
+}
+
+#[test]
+fn structured_presence_context_is_bound_to_ctap_entities_not_prompts() {
+    struct Capture(Arc<std::sync::Mutex<Vec<tpm_passkey_protocol::ApprovalContext>>>);
+    impl approval::UserApproval for Capture {
+        fn approve(&self, _: &str) -> bool {
+            panic!("human prompts must not be parsed")
+        }
+        fn approve_context_controlled(
+            &self,
+            context: &tpm_passkey_protocol::ApprovalContext,
+            _: &approval::ApprovalControl,
+        ) -> approval::ApprovalOutcome {
+            self.0.lock().unwrap().push(context.clone());
+            approval::ApprovalOutcome::Denied
+        }
+    }
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut auth = authenticator_with_credential("example.test", vec![1]);
+    auth.credentials.push(auth.credentials[0].clone());
+    auth.approval = Box::new(Capture(captured.clone()));
+    let registration = ctap_request(
+        Ctap2Command::MakeCredential,
+        cbor!({
+            1 => bytes([0; 32]), 2 => {"id" => "example.test", "name" => "Example"},
+            3 => {"id" => bytes([0x12, 0x34]), "name" => "alice", "displayName" => "Alice"},
+            4 => [{"type" => "public-key", "alg" => -7}],
+        })
+        .unwrap(),
+    );
+    auth.handle_cbor(&registration);
+    auth.handle_cbor(&ctap_request(
+        Ctap2Command::GetAssertion,
+        cbor!({1 => "example.test", 2 => bytes([0; 32])}).unwrap(),
+    ));
+    auth.handle_cbor(&[Ctap2Command::Selection.into()]);
+    auth.handle_cbor(&[Ctap2Command::Reset.into()]);
+    let contexts = captured.lock().unwrap();
+    assert_eq!(contexts.len(), 4);
+    assert_eq!(contexts[0].operation, "register");
+    assert_eq!(contexts[0].rp_id, "example.test");
+    assert_eq!(contexts[0].rp_name, "Example");
+    assert_eq!(contexts[0].account_name, "alice");
+    assert_eq!(contexts[0].account_id, "1234");
+    assert_eq!(contexts[1].operation, "login");
+    assert_eq!(contexts[1].credential_count, 2);
+    assert!(contexts[1].account_name.is_empty());
+    assert!(contexts[1].account_id.is_empty());
+    assert_eq!(contexts[2].operation, "selection");
+    assert_eq!(contexts[3].operation, "reset");
+    assert!(contexts.iter().all(|context| context.validate()));
+    std::fs::remove_dir_all(auth.store_dir).unwrap();
+}
+
+#[test]
 fn unreadable_credentials_never_become_an_empty_writable_store() {
     let auth = authenticator_with_credential("example.test", vec![1]);
     let dir = auth.store_dir.clone();
@@ -1514,19 +1588,6 @@ fn client_data_hash_must_be_32_bytes() {
         cbor!({ 1 => "example.com", 2 => bytes([0xaa; 33]) }).expect("long assertion hash request"),
     );
     assert_eq!(authenticator.handle_cbor(&get_assertion)[0], 0x12);
-}
-
-#[test]
-fn display_rp_label_prefers_human_readable_name() {
-    assert_eq!(
-        display_rp_label(Some("Weird Site"), "example.com"),
-        "Weird Site (example.com)"
-    );
-    assert_eq!(
-        display_rp_label(Some("example.com"), "example.com"),
-        "example.com"
-    );
-    assert_eq!(display_rp_label(None, "example.com"), "example.com");
 }
 
 #[test]

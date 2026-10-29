@@ -5,10 +5,15 @@
 `tpm-passkey` is a blocking system daemon that exposes a virtual FIDO2
 authenticator through Linux UHID. The daemon owns the CTAPHID channels, CTAP2
 state machines, TPM context, one single-user credential store, and transaction
-approval flow. Multi-user isolation and session-switch handling are unsupported.
+approval coordination. Multi-user credential isolation is unsupported.
 
-Logind discovery is only for routing polkit prompts. The daemon does not check
-requester UIDs, scope credentials by UID, or bind CTAP state to login sessions.
+The separate `tpm-passkey` CLI and `tpm-passkey-approval-gtk` GUI depend only on a
+small shared protocol crate, never the daemon library. GTK is not linked into
+the daemon or CLI, and separate Nix packages keep it out of their runtime closures.
+
+Logind guards approval eligibility and pending-session changes. The daemon does
+not identify HID requester UIDs, scope credentials by UID, or bind PIN tokens to
+login sessions. D-Bus management and registration authenticate their own senders.
 File and device permissions remain in place. Credential compatibility across
 commits is not guaranteed; new SQL migrations may deliberately discard keys.
 
@@ -28,8 +33,10 @@ commits is not guaranteed; new SQL migrations may deliberately discard keys.
 7. The worker result is fragmented by `ctaphid` and sent to the browser through
    UHID.
 
-Management requests use a Unix socket. Socket threads perform validation and
-storage work, while TPM operations are queued to the same authenticator worker.
+Management requests use the root-owned system-bus API and daemon-side polkit
+authorization of the actual sender. Request bodies travel through bounded sealed
+memfds, not secret-bearing D-Bus arguments. Storage work runs outside the bus
+handler's event loop; TPM operations are queued to the same authenticator worker.
 This preserves one owner for the TPM context because the NixOS test TPM exposes
 only one usable `/dev/tpm0` opener. Recovery setup, unlock, rotation, and policy
 updates also run on this worker, so enrollment cannot race passphrase rotation.
@@ -42,7 +49,7 @@ request's phrase, never the enrollment cache.
 
 ```text
 src/
-├── main.rs                 daemon lifecycle, UHID loop, and CLI
+├── main.rs                 standalone daemon lifecycle and UHID loop
 ├── hid.rs                  HID descriptor and virtual-device identity
 ├── ctaphid.rs              CTAPHID channels, framing, and transport errors
 ├── ctap2.rs                authenticator facade and command orchestration
@@ -56,13 +63,13 @@ src/
 ├── store.rs                SQLite schema access and integrity metadata
 ├── tpm.rs                  TPM object, PCR policy, and signing operations
 ├── recovery.rs             Argon2id/AES-GCM encryption of recovery authorization
-├── approval.rs             injectable approval boundary and polkit fallback
-├── management.rs           management socket server and client transport
+├── approval.rs             injectable, controlled transaction-presence boundary
+├── bus.rs                  persistent bus endpoint, agent registry and consent
+├── management.rs           management dispatch boundary (no Unix listener)
 ├── management/
-│   ├── protocol.rs         serialized management API
 │   └── service.rs          management operations and TPM command dispatch
-├── systemd_logind.rs       desktop subject discovery for polkit prompt routing
-└── polkit.rs               polkit authorization request
+├── systemd_logind.rs       graphical-session eligibility, not browser identity
+└── polkit.rs               management/registration authorization, not CTAP UP
 ```
 
 ## State Ownership
@@ -96,14 +103,27 @@ Persistent state belongs to `store`; TPM handles and policy sessions belong to
 ## Effect Boundaries
 
 Interactive authorization is injected through `approval::UserApproval`.
-Production uses `SystemApproval`, while protocol tests provide an explicit fake
-provider. This avoids making production behavior depend on `cfg(test)`.
+Production explicitly installs `BusApproval`; `SystemApproval` is a fail-closed
+library default. Protocol tests provide an explicit fake provider. This avoids making production behavior depend on `cfg(test)`.
 `approve_controlled` receives the transaction cancellation flag and an absolute
-30-second deadline. Production drives logind and polkit on one Tokio-backed
-D-Bus connection within that budget, without an extra approval worker thread.
-Terminal fallback reopens stdin's terminal nonblocking and bounds both prompt
-writes and partial-line reads. Legacy injected providers remain source-compatible,
-but must override the controlled method to interrupt their own blocking work.
+30-second deadline. Production directs a structured request to a registered
+unprivileged agent on the system bus. Its unique connection/object path, fresh
+request ID and remaining lifetime bind exactly one decision to one transaction.
+The daemon explicitly cancels the remote dialog; dropping a local future alone
+is not sufficient. The helper tombstones authenticated cancellation IDs even
+when Cancel overtakes Request authentication. Observed session loss revokes
+registration, so the agent retries idempotent registration after recovery. Session eligibility is checked while pending and before Allow.
+There is no automatic terminal or polkit fallback for presence.
+
+`crates/protocol` contains toolkit/TPM-independent wire types and sealed-FD
+management transport. `crates/cli` contains one-shot management commands.
+`crates/approval-gtk` owns the GTK main loop, D-Bus lifecycle and native libadwaita
+AlertDialog, using plain-text labels and a Deny default. libadwaita is not a
+daemon/CLI dependency.
+GTK runs only in the desktop user's own environment. Desktop startup may use
+XDG autostart, a correctly integrated graphical-session.target, or a compositor's
+own startup mechanism; root does not scrape environment variables or access a
+user session bus. No lingering is enabled.
 
 The runtime credential model is distinct from the SQLite representation.
 Conversions live in `credential.rs`, preventing CTAP handlers from depending on
@@ -136,8 +156,11 @@ RUST_LOG=tpm_passkey=debug,sqlx=warn,zbus=warn
   Each directory has its Nix test, reason and case-specific assets. Shared
   machine configuration, driver helpers and credential fixtures stay directly
   in `nix/tests/`; see its [test index](../nix/tests/README.md).
-  Fault tests stop logind/polkit during approval and cancel over real UHID;
-  a D-Bus monitor checks polkit cancellation identity.
+  Protocol cases use an explicitly test-only auto-answering system-bus agent
+  and a controlled logind fixture, not production bypasses. Fault cases stop
+  logind or hold a dialog pending and verify directed cancellation identity.
+  A separate test runs the real unprivileged GTK binary on headless X11; this
+  is not evidence of manual Firefox/Wayland usability or automatic focus.
 
 The NixOS VM uses `/dev/tpm0`, so all management TPM operations must pass
 through the daemon-owned TPM command channel.

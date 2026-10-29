@@ -1,35 +1,16 @@
 """Real TPM/UHID regression for opt-in PCR binding and unchanged old keys."""
 import hashlib
-import socket
 import sqlite3
-import struct
 import subprocess
 import time
 
-import cbor2
+from tpm_test_bus import management, wait_for_agent
 from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2
 from fido2.hid import CtapHidDevice
 
 PHRASE = "optional PCR recovery test phrase"
 STORE = "/var/lib/tpm-passkey/credentials.sqlite"
-SOCKET = "/run/tpm-passkey/management.sock"
-
-
-def management(command, params=None, ok=True):
-    request = {"cmd": command}
-    if params is not None:
-        request["params"] = params
-    encoded = cbor2.dumps(request)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(20)
-        client.connect(SOCKET)
-        client.sendall(struct.pack(">I", len(encoded)) + encoded)
-        with client.makefile("rb") as stream:
-            length = struct.unpack(">I", stream.read(4))[0]
-            response = cbor2.loads(stream.read(length))
-    assert response["ok"] == ok, response
-    return response.get("result")
 
 
 def open_ctap():
@@ -111,6 +92,7 @@ def extend_pcr(digit):
 
 def restart():
     subprocess.run(["systemctl", "restart", "tpm-passkey"], check=True)
+    wait_for_agent()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         try:

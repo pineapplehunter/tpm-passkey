@@ -12,17 +12,21 @@ The daemon assumes a single-user machine. One daemon instance and credential
 store serve one user, with no per-user namespaces, caller-UID checks, or
 login-session binding. Multi-user isolation, fast user switching, and multi-seat
 operation are unsupported. The goal is convenient TPM-bound passkey storage.
-Desktop authentication is requested through polkit.
+CTAP user presence is a GTK Allow/Deny acknowledgement, not host
+re-authentication. Polkit authorizes the actual management/registration D-Bus
+caller separately.
 
 ## Security-Relevant Entities
 
 * **Relying Party (RP):** The remote service that registers a credential and verifies authentication assertions.
 * **Client:** The browser or other CTAP client that communicates with the virtual authenticator.
-* **Daemon:** The privileged `tpm-passkey` process that implements the virtual authenticator.
+* **Daemon:** The privileged `tpm-passkey-daemon` process that implements the virtual authenticator; it does not link GTK.
+* **Approval Agent:** The unprivileged `tpm-passkey-approval-gtk` desktop process, trusted to report transaction-specific consent. Same-user compromise can subvert it.
+* **Management CLI:** The unprivileged `tpm-passkey` process, which collects recovery phrases and requests daemon-side changes.
 * **TPM:** The TPM 2.0 device that generates, protects, and uses credential private keys.
 * **Credential Store:** The persistent database containing TPM object blobs, public-key material, credential metadata, policy information, and signature counters.
-* **Session Manager:** `systemd-logind`, used only to find a desktop subject for routing polkit prompts, not to attribute requests or authorize credential access.
-* **Authorization Service:** polkit and the graphical polkit authentication agent.
+* **Session Manager:** `systemd-logind`, used to guard graphical-session eligibility and cancel pending consent on observed session loss/lock/change; it does not identify HID senders or credential owners.
+* **Authorization Service:** polkit and its authentication agent, used for management privileges and group-gated approval-agent registration, not CTAP UP.
 * **Device-Access Mechanism:** udev and `uaccess`, which grant access to the virtual HID device to the active user of the associated seat.
 * **Platform Trust Chain:** The firmware, bootloader, kernel, and measured-boot components that determine relevant PCR values.
 
@@ -32,8 +36,8 @@ A PCR is a TPM state register and is not considered an independent actor.
 
 ### Multi-User Isolation Is Out of Scope
 
-The application does not provide isolation between local users. Device, socket,
-and store permissions remain useful access restrictions, but the daemon does
+The application does not provide isolation between local credential users. Device,
+system-bus/polkit policy and store permissions remain useful restrictions, but the daemon does
 not determine which local user sent a HID request. Do not deploy it as a
 shared-machine authenticator.
 
@@ -185,23 +189,33 @@ Credential metadata is not necessarily confidential. Depending on the database f
 
 ### Single-User Access Model
 
-All stored credentials share one namespace. The daemon does not check caller
-UIDs, filter credentials by owner, bind CTAP state to login sessions, or revoke
-access on session switches. Credential metadata has no local owner UID or
-owner-dependent compatibility format.
+All stored credentials share one namespace. The daemon does not determine HID
+caller UIDs, filter credentials by owner, or bind PIN tokens/credentials to login
+sessions. Credential metadata has no local owner UID. Pending approval is cancelled
+on observed session ineligibility; this is not per-user credential revocation.
 
-Keep the `hidraw` device, management socket, and store access restricted.
-The existing udev `uaccess` rule and root-only management socket remain, but do
-not constitute a supported multi-user isolation model. In particular, changing
-an ACL does not revoke an already-open file descriptor.
+Keep `hidraw` and store access restricted. The existing udev `uaccess` rule does
+not constitute multi-user isolation: changing an ACL does not revoke an already
+open descriptor. D-Bus management and registration authenticate their own actual
+senders. The configured access group gates ordinary users; root is trusted and
+controls the store regardless. Group members operate on the same credential
+namespace, not separate stores.
 
 ### User Authorization
 
-Interactive authorization is routed to the active desktop's polkit agent. This
-routing does not identify the sender of the HID request or establish credential
-ownership.
+An unprivileged desktop agent registers its object path on the system bus. The
+daemon uses the actual unique sender and bus-derived UID, never a caller-supplied
+UID/name. Polkit gates registration, while logind independently checks graphical
+eligibility. A user-service PID need not reside in the graphical session scope.
+The helper checks that incoming requests originate from the current root-owned
+daemon bus name. Root never accesses the user's display or session bus.
 
-A successful polkit operation establishes that the session user satisfied the configured polkit policy. Polkit authentication is not equivalent to an arbitrary graphical Allow/Deny acknowledgement.
+GTK Allow/Deny supplies acknowledgement only. It no longer provides the former
+polkit/PAM host re-authentication assurance. The agent is not secure attention:
+same-user malware can impersonate/compromise it or automate consent. The displayed
+RP/account data is untrusted plain text, not independently verified web-origin
+identity. Wayland may leave a dialog unfocused; automatic activation is not
+promised. Neither session eligibility nor helper identity identifies the browser.
 
 Authorization shall be associated with one specific CTAP transaction. Authorization results shall not be reused for unrelated requests unless the reuse semantics are explicitly defined and justified.
 
@@ -225,14 +239,41 @@ never automatically drops or regenerates an unreadable PIN record.
 
 Cancellation, token expiry, and denied approval prevent authorization. Approval
 has one 30-second absolute deadline, including system-bus setup and logind lookup.
-Cancellation is checked every 20 ms; server-side polkit cleanup is bounded to a
-further 100 ms and uses the same connection and cancellation ID. Denial, timeout,
-or cancellation cannot fall through to a different approval provider. If polkit
-transport/service is unavailable, nonblocking terminal fallback uses only the
-remaining budget and requires a complete explicit affirmative answer. Unroutable
-subjects and malformed replies fail closed. Local kernel calls and blocked logging
-sinks are not preemptible; this is not a hard real-time guarantee. Session
-termination and switching are not tracked.
+Cancellation is checked every 20 ms; explicit remote dialog cancellation has a
+further bounded cleanup allowance of at most 100 ms. Denial, timeout, cancellation,
+missing helper/display, malformed replies or disconnection fail closed with no
+fallback. A fresh request ID and connection binding prevent consent transfer or
+replay. Session eligibility is rechecked before accepting Allow and during a
+pending request. Observed loss cannot be undone by unlocking/re-registration for
+that transaction. `LockedHint` depends on desktop cooperation; rapid unobserved
+transitions are not a secure-attention guarantee. Local kernel calls and blocked
+logging sinks are not preemptible; this is not a hard real-time guarantee.
+Registration checks cancellation after TPM creation and before persistence;
+reset checks before deletion. Cancellation racing an already-started SQLite
+commit or TPM command cannot guarantee rollback/preemption.
+
+### Management and Secret Transport
+
+Management uses a separate system-bus API, with polkit checks against the actual
+caller's unique bus name before processing mutations. Read, recovery and settings
+operations have distinct actions. Group eligibility does not itself authorize
+mutations: the deployment chooses own-password or administrator authentication,
+without retained authorization. Existing recovery-phrase cryptographic checks
+remain required; polkit cannot replace decryption knowledge.
+
+Requests use bounded, write/grow/shrink-sealed anonymous memfds passed as Unix
+FDs. The public operation must match the decoded request. Descriptors of the
+wrong type, missing seals, excessive sizes and malformed/trailing input are
+rejected. Seals are checked before taking the size snapshot. Secret bytes are
+not serialized into D-Bus message bodies or included in errors/logs. Encoding uses
+a fixed bounded zeroizing buffer; direct secret-field decoding uses guarded
+scratch and field storage, including partial failures. This is best-effort
+application-level erasure, not a guarantee that every library/allocator copy or
+crash dump has been erased. FDs are closed promptly, but
+sealed memfd pages cannot be overwritten and memory backing may be swapped or
+retained by another holder. The bus broker handles these descriptors. This does
+not hide secrets from a privileged monitor/broker, root, kernel compromise or
+same-user process compromise; no end-to-end encryption claim is made.
 
 The authenticator cannot independently verify the browser’s web origin. It receives an RP ID and client-data hash from the client platform and relies on the WebAuthn client and relying party to perform the corresponding origin validation.
 
@@ -309,7 +350,8 @@ Credential use depends on the continued availability and consistency of:
 * The credential database.
 * The required authorization factors (e.g., PCR state or passphrase).
 * The session manager.
-* The polkit service and graphical authentication agent.
+* The registered graphical approval agent and its display connection.
+* Polkit for new registrations and management; its authentication agent when management policy requires authentication.
 * The UHID and hidraw subsystems.
 
 When PCR-bound authorization is used, changes to measured platform state may prevent normal credential use. Recovery is possible only if a recovery mechanism for the original credential key has been implemented and remains available.

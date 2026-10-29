@@ -12,12 +12,38 @@ use std::{
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+pub(crate) fn context(operation: &str, rp_id: &str) -> tpm_passkey_protocol::ApprovalContext {
+    tpm_passkey_protocol::ApprovalContext {
+        operation: operation.into(),
+        rp_id: rp_id.into(),
+        rp_name: String::new(),
+        account_name: String::new(),
+        account_id: String::new(),
+        credential_count: 0,
+    }
+}
+
 /// Boundary for transaction-specific user presence (UP), never built-in UV.
 pub trait UserApproval: Send {
     fn approve(&self, prompt: &str) -> bool;
 
-    /// Compatibility adapter for existing providers. Only providers overriding
-    /// this method (including SystemApproval) can interrupt a pending approval.
+    /// Structured production boundary; legacy fakes can keep implementing the
+    /// old controlled API. Production providers must override this method.
+    fn approve_context_controlled(
+        &self,
+        context: &tpm_passkey_protocol::ApprovalContext,
+        control: &ApprovalControl,
+    ) -> ApprovalOutcome {
+        if !context.validate() {
+            return ApprovalOutcome::Denied;
+        }
+        self.approve_controlled(
+            &format!("{}: {}", context.operation, context.rp_id),
+            control,
+        )
+    }
+
+    /// Compatibility adapter for explicit development and test providers.
     fn approve_controlled(&self, prompt: &str, control: &ApprovalControl) -> ApprovalOutcome {
         if let Some(outcome) = control.stopped() {
             return outcome;
@@ -82,11 +108,21 @@ pub enum ApprovalOutcome {
     TimedOut,
 }
 
-/// Production approval provider backed by polkit with a terminal fallback.
+/// Fail-closed default for library callers without the persistent bus service.
+/// The daemon explicitly installs BusApproval. There is no fallback provider.
 #[derive(Debug, Default)]
 pub struct SystemApproval;
-
 impl UserApproval for SystemApproval {
+    fn approve(&self, _: &str) -> bool {
+        false
+    }
+}
+
+/// Explicit development-only provider. Never selected automatically.
+#[derive(Debug, Default)]
+pub struct TerminalApproval;
+
+impl UserApproval for TerminalApproval {
     fn approve(&self, prompt: &str) -> bool {
         self.approve_controlled(
             prompt,
@@ -102,16 +138,10 @@ impl UserApproval for SystemApproval {
             return ApprovalOutcome::Denied;
         };
         runtime.block_on(async {
-            match crate::polkit::check_active_session_controlled(control).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    log::warn!("polkit unavailable, falling back: {error:?}");
-                    control
-                        .run(terminal_approval(prompt))
-                        .await
-                        .unwrap_or_else(|outcome| outcome)
-                }
-            }
+            control
+                .run(terminal_approval(prompt))
+                .await
+                .unwrap_or_else(|outcome| outcome)
         })
     }
 }

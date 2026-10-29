@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import time
 
+from tpm_test_bus import wait_for_agent
 from fido2.ctap import CtapError
 from fido2.ctap2 import ClientPin, Ctap2
 from fido2.hid import CtapHidDevice
@@ -16,6 +17,7 @@ def restart():
     # production start-rate limit. Reset that counter, not the daemon policy.
     subprocess.run(["systemctl", "reset-failed", "tpm-passkey"], check=True, timeout=5)
     subprocess.run(["systemctl", "restart", "tpm-passkey"], check=True, timeout=20)
+    wait_for_agent()
     device, _ = connect()  # Wait for the worker before the next corruption.
     device.close()
 

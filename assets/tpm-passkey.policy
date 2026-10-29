@@ -1,21 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE policyconfig PUBLIC
- "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
-
 <policyconfig>
   <vendor>io.github.pineapplehunter.tpm-passkey</vendor>
   <vendor_url>https://github.com/pineapplehunter/tpm-passkey</vendor_url>
-  <icon_name>security-high-symbolic</icon_name>
-
-  <action id="io.github.pineapplehunter.tpm-passkey.approve">
-    <description>Use a TPM-backed passkey</description>
-    <message>Authentication is required to use a TPM-backed passkey.</message>
-
-    <defaults>
-      <allow_any>no</allow_any>
-      <allow_inactive>no</allow_inactive>
-      <allow_active>auth_self</allow_active>
-    </defaults>
+  <action id="io.github.pineapplehunter.tpm-passkey.register-agent">
+    <description>Register a passkey approval agent</description>
+    <message>Register a desktop agent for TPM-backed passkey confirmation.</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>no</allow_active></defaults>
+  </action>
+  <action id="io.github.pineapplehunter.tpm-passkey.read">
+    <description>Read passkey configuration and credential metadata</description>
+    <message>Read TPM-backed passkey configuration and credential metadata.</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>no</allow_active></defaults>
+  </action>
+  <action id="io.github.pineapplehunter.tpm-passkey.manage-recovery">
+    <description>Manage passkey recovery</description>
+    <message>Authentication is required to change or unlock TPM-backed passkey recovery.</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>no</allow_active></defaults>
+  </action>
+  <action id="io.github.pineapplehunter.tpm-passkey.manage-settings">
+    <description>Change passkey settings</description>
+    <message>Authentication is required to change TPM-backed passkey settings.</message>
+    <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>no</allow_active></defaults>
   </action>
 </policyconfig>

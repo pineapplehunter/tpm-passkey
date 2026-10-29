@@ -8,7 +8,7 @@
         'expect "Enter the same PIN again"; send "1234\\r"; expect eof')
     machine.succeed("mkdir -p /tmp/credential")
     machine.succeed("python3 ${../register.py} /tmp/credential login.example.test alice user-1 registration false")
-    machine.succeed("python3 ${./scenario.py}", timeout=90)
+    scenario("${./scenario.py}", timeout=90)
     machine.succeed("python3 ${../assert.py} /tmp/credential login.example.test repaired")
     assert len(mgmt("list-credentials").strip().splitlines()) == 1
   '';

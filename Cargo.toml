@@ -1,8 +1,15 @@
 [package]
-name = "tpm-passkey"
+name = "tpm-passkey-daemon"
 version = "0.1.0"
 edition = "2024"
 license = "GPL3"
+
+[workspace]
+members = ["crates/protocol", "crates/cli", "crates/approval-gtk"]
+resolver = "2"
+
+[lib]
+name = "tpm_passkey"
 
 [dependencies]
 aes = "0.9"
@@ -25,7 +32,6 @@ log = "0.4.27"
 p256 = { version = "0.14", features = ["ecdh", "ecdsa", "getrandom", "pem"] }
 pbkdf2 = "0.13"
 rcgen = { version = "0.14.8", features = ["ring"] }
-rpassword = "7.3"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11"
 sqlx = { version = "0.9.0", features = [
@@ -34,7 +40,14 @@ sqlx = { version = "0.9.0", features = [
   "macros",
   "migrate",
 ] }
-tokio = { version = "1.52.3", features = ["macros", "net", "rt", "time"] }
+tokio = { version = "1.52.3", features = [
+  "macros",
+  "net",
+  "rt",
+  "sync",
+  "time",
+] }
+tpm-passkey-protocol = { version = "0.1.0", path = "crates/protocol" }
 tss-esapi = "7.7.0"
 uhid-virt = "0.0.8"
 zbus = { version = "5", features = ["tokio"], default-features = false }

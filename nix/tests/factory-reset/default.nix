@@ -10,6 +10,7 @@
     machine.succeed("python3 ${../register.py} /tmp/credential reset.example.test alice user-1 registration true 1234")
     machine.succeed("python3 ${../assert.py} /tmp/credential reset.example.test before-reset")
     machine.succeed("systemctl restart tpm-passkey")
+    wait_for_agent()
     expect_command("fido2-manage -reset -device 1",
         'expect "Are you sure you want to proceed?"; send "Y\\r"; expect eof')
     assert mgmt("list-credentials").strip() == ""

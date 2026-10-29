@@ -338,10 +338,12 @@ impl Authenticator {
             return Err(ErrorStatus::NotAllowed);
         }
         self.user_presence_approved(
-            "Reset FIDO authenticator and delete all passkeys",
-            "reset",
+            &approval::context("reset", ""),
             ErrorStatus::UserActionTimeout,
         )?;
+        if self.operation_is_cancelled() {
+            return Err(ErrorStatus::KeepaliveCancel);
+        }
         store::reset_authenticator_state_from_dir(&self.store_dir).map_err(|error| {
             log::warn!("failed to persist authenticator reset: {error:?}");
             ErrorStatus::OperationDenied
@@ -364,8 +366,7 @@ impl Authenticator {
     /// collected by the transport/UI; here we just confirm approval.
     fn selection(&mut self) -> Result<Vec<u8>, ErrorStatus> {
         self.user_presence_approved(
-            "Select this FIDO authenticator",
-            "selection",
+            &approval::context("selection", ""),
             ErrorStatus::UserActionTimeout,
         )?;
         Ok(vec![0x00])
@@ -420,7 +421,7 @@ impl Authenticator {
         let pin_uv_auth_param = optional_bytes(&request, 8)?;
         let pin_uv_auth_protocol = optional_integer(&request, 9)?;
         if pin_uv_auth_param == Some(&[]) {
-            return self.zero_length_pin_uv_auth("Select authenticator for registration");
+            return self.zero_length_pin_uv_auth();
         }
         let pin_uv_auth_present = pin_uv_auth_param.is_some();
         let user_verified = self.validate_pin_uv_auth(
@@ -473,17 +474,12 @@ impl Authenticator {
 
         let cached_user_presence =
             user_verified && self.pin_uv_auth_token_has_cached_user_presence();
-        let prompt = format!(
-            "Register a new passkey for {} as {}",
-            display_rp_label(rp_name, rp_id),
-            user_display_name.or(user_name).unwrap_or("unknown user")
-        );
         if !cached_user_presence {
-            self.user_presence_approved(
-                &prompt,
-                &format!("registration for {rp_id}"),
-                ErrorStatus::OperationDenied,
-            )?;
+            let mut context = approval::context("register", rp_id);
+            context.rp_name = rp_name.unwrap_or("").to_owned();
+            context.account_name = user_name.or(user_display_name).unwrap_or("").to_owned();
+            context.account_id = hex::encode(user_handle);
+            self.user_presence_approved(&context, ErrorStatus::OperationDenied)?;
         }
         self.consume_pin_uv_auth_token_after_user_presence();
 
@@ -573,6 +569,11 @@ impl Authenticator {
             Some((&credential_id, &public_key)),
             None,
         );
+        // TPM commands cannot be preempted, but cancellation observed after
+        // key creation must not replace/persist an existing passkey.
+        if self.operation_is_cancelled() {
+            return Err(ErrorStatus::KeepaliveCancel);
+        }
         let previous_credentials = self.credentials.clone();
         if let Some(index) = replacement_index {
             self.credentials.remove(index);
@@ -596,6 +597,10 @@ impl Authenticator {
             recovery,
             sign_count: 0,
         });
+        if self.operation_is_cancelled() {
+            self.credentials = previous_credentials;
+            return Err(ErrorStatus::KeepaliveCancel);
+        }
         if let Err(error) = self.save_credentials() {
             self.credentials = previous_credentials;
             return Err(error);
@@ -628,7 +633,7 @@ impl Authenticator {
         let pin_uv_auth_param = optional_bytes(&request, 6)?;
         let pin_uv_auth_protocol = optional_integer(&request, 7)?;
         if pin_uv_auth_param == Some(&[]) {
-            return self.zero_length_pin_uv_auth("Select authenticator for assertion");
+            return self.zero_length_pin_uv_auth();
         }
         let pin_uv_auth_present = pin_uv_auth_param.is_some();
         let user_verified = self.validate_pin_uv_auth(
@@ -663,7 +668,7 @@ impl Authenticator {
         let cached_user_presence =
             user_verified && self.pin_uv_auth_token_has_cached_user_presence();
         if user_presence && !cached_user_presence {
-            self.assertion_approved(rp_id)?;
+            self.assertion_approved(rp_id, credential_indexes.len())?;
         }
         if user_presence {
             self.consume_pin_uv_auth_token_after_user_presence();
@@ -1477,10 +1482,9 @@ impl Authenticator {
         self.tpm.as_mut()
     }
 
-    fn zero_length_pin_uv_auth(&self, prompt: &str) -> Result<Vec<u8>, ErrorStatus> {
+    fn zero_length_pin_uv_auth(&self) -> Result<Vec<u8>, ErrorStatus> {
         self.user_presence_approved(
-            prompt,
-            "authenticator selection",
+            &approval::context("selection", ""),
             ErrorStatus::OperationDenied,
         )?;
         Err(if self.client_pin.is_some() {
@@ -1505,24 +1509,26 @@ impl Authenticator {
         }
     }
 
-    fn assertion_approved(&mut self, rp_id: &str) -> Result<(), ErrorStatus> {
-        self.user_presence_approved(
-            &format!("Authenticate with passkey for {rp_id}"),
-            &format!("assertion for {rp_id}"),
-            ErrorStatus::OperationDenied,
-        )
+    fn assertion_approved(
+        &mut self,
+        rp_id: &str,
+        candidate_count: usize,
+    ) -> Result<(), ErrorStatus> {
+        let mut context = approval::context("login", rp_id);
+        context.credential_count = u32::try_from(candidate_count).unwrap_or(u32::MAX);
+        // Consent is for the RP and candidate set, not an invented account choice.
+        self.user_presence_approved(&context, ErrorStatus::OperationDenied)
     }
 
     fn user_presence_approved(
         &self,
-        prompt: &str,
-        operation: &str,
+        context: &tpm_passkey_protocol::ApprovalContext,
         timeout_error: ErrorStatus,
     ) -> Result<(), ErrorStatus> {
         if self.operation_is_cancelled() {
             return Err(ErrorStatus::KeepaliveCancel);
         }
-        log::debug!("requesting approval for {operation}");
+        log::debug!("requesting approval for {}", context.operation);
         if let Some(status) = &self.operation_status {
             status.store(2, Ordering::SeqCst);
         }
@@ -1530,11 +1536,11 @@ impl Authenticator {
             self.operation_cancelled.clone(),
             Instant::now() + approval::DEFAULT_APPROVAL_TIMEOUT,
         );
-        let outcome = self.approval.approve_controlled(prompt, &control);
+        let outcome = self.approval.approve_context_controlled(context, &control);
         if let Some(status) = &self.operation_status {
             status.store(1, Ordering::SeqCst);
         }
-        log::debug!("approval for {operation}: {outcome:?}");
+        log::debug!("approval for {}: {outcome:?}", context.operation);
         if self.operation_is_cancelled() {
             return Err(ErrorStatus::KeepaliveCancel);
         }
@@ -1669,6 +1675,14 @@ impl Authenticator {
     /// This runs on the main daemon thread which owns the TPM context.
     pub fn handle_tpm_command(&mut self, command: TpmCommand) -> color_eyre::Result<()> {
         match command {
+            TpmCommand::BeforeDeadline { deadline, command } => {
+                if Instant::now() >= deadline {
+                    return Err(color_eyre::eyre::eyre!(
+                        "management operation expired before execution"
+                    ));
+                }
+                self.handle_tpm_command(*command)
+            }
             TpmCommand::PcrPolicyUpdate(cmd) => {
                 let credentials = store::load_ctap2_credentials_from_dir(&self.store_dir)?;
                 let credential = credentials
@@ -1773,6 +1787,11 @@ impl Default for Authenticator {
 
 /// A TPM-bound operation requested by the management thread.
 pub enum TpmCommand {
+    /// Do not execute a queued management mutation after its caller's budget.
+    BeforeDeadline {
+        deadline: Instant,
+        command: Box<TpmCommand>,
+    },
     PcrPolicyUpdate(PcrPolicyUpdateCommand),
     SetRecoveryPassphrase {
         old_passphrase: Option<Zeroizing<String>>,
@@ -2268,13 +2287,6 @@ fn credential_descriptor_list_contains(list: &[Value], credential_id: &[u8]) -> 
         };
         map_text(map, "type") == Some("public-key") && map_bytes(map, "id") == Some(credential_id)
     })
-}
-
-fn display_rp_label(rp_name: Option<&str>, rp_id: &str) -> String {
-    match rp_name {
-        Some(name) if name != rp_id => format!("{name} ({rp_id})"),
-        _ => rp_id.to_owned(),
-    }
 }
 
 fn validate_enumerate_credentials_params(

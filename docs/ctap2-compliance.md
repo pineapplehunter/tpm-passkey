@@ -326,10 +326,13 @@ operation cancelled, queues state cleanup, and the original CBOR transaction
 returns `CTAP2_ERR_KEEPALIVE_CANCEL`; on a non-active CID it is ignored.
 
 Production approval has one 30-second user-action budget covering asynchronous
-system-bus connection, logind lookup, polkit and any terminal fallback. CANCEL is
-observed at most every 20 ms; polkit cancellation cleanup has a separate 100-ms
-bound and uses the same connection and cancellation ID. Refusal/deadline/cancel
-never trigger fallback. Reset/selection map deadlines to `USER_ACTION_TIMEOUT`;
+system-bus/logind checks and the directed GTK-agent request. CANCEL is observed
+at most every 20 ms; explicit remote dialog cancellation has a separate 100-ms
+cleanup bound and uses the same unique connection and request ID. Missing helper,
+refusal/deadline/cancel/disconnection never trigger fallback. Host approval is a
+plain acknowledgement, not polkit/PAM re-authentication; polkit only gates agent
+registration and management. PIN/token requirements and CTAP error mappings
+remain independent and unchanged. Reset/selection map deadlines to `USER_ACTION_TIMEOUT`;
 makeCredential/getAssertion UP and zero-length-auth selection map them to
 `OPERATION_DENIED`, per their distinct normative steps. Local kernel syscalls,
 ordinary logging, and an already executing TPM command are not asynchronously

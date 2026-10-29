@@ -1,0 +1,17 @@
+[package]
+name = "tpm-passkey"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+base64 = "0.23"
+ciborium = "0.2.2"
+clap = { version = "4.5.53", features = ["derive"] }
+color-eyre = "0.6.5"
+env_logger = "0.11.8"
+hex = "0.4"
+rpassword = "7.4"
+tpm-passkey-protocol = { path = "../protocol" }
+unicode-general-category = "1.1.0"
+zeroize = "1.8"

@@ -140,7 +140,7 @@ impl PacketHandler {
         )
     }
 
-    fn new_with_user_approval(
+    pub fn new_with_user_approval(
         store_dir: PathBuf,
         tpm_path: Option<PathBuf>,
         approval: Box<dyn crate::approval::UserApproval>,

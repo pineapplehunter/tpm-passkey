@@ -12,7 +12,8 @@ not multi-user credential isolation.
 - Creates TPM-backed P-256 credentials for registration and assertion.
 - Keeps credentials TPM-bound, with optional, explicit PCR boot-state binding.
 - Supports recovery material unlocked by a passphrase and kept TPM-bound.
-- Checks user acknowledgement through polkit.
+- Collects transaction-specific user presence through an unprivileged GTK Allow/Deny agent.
+- Runs management commands as the user, with daemon-side polkit authorization.
 
 ## System assumptions
 
@@ -27,20 +28,73 @@ not multi-user credential isolation.
 
 Keep device and store access restricted. Single-user operation does not make
 requests from other processes trustworthy: transaction approval and CTAP PIN/UV
-checks still apply. Logind is used only to route polkit prompts to the desktop,
-not to identify the caller or select credentials.
+checks still apply. Logind gates approval-agent eligibility, not HID caller identity
+or credential ownership. Exactly one local graphical session must be eligible;
+missing/locked/ambiguous sessions fail closed. Lock detection depends on the
+desktop publishing accurate logind state.
 
 ## Usage
 
-Daemon:
+Daemon (as root; prefer the NixOS service setup below):
 
 ```sh
-tpm-passkey daemon --store-dir .tpm-passkey-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
+sudo tpm-passkey-daemon --store-dir .tpm-passkey-store --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
 ```
 
-The binary, Cargo package, Nix overlay package, and systemd unit are now named
-`tpm-passkey`; the NixOS option is `services.tpm-passkey`. The service stores state
-in `/var/lib/tpm-passkey` and exposes `/run/tpm-passkey/management.sock`.
+There are three separate Cargo packages/binaries:
+
+- `tpm-passkey-daemon`: privileged CTAP/TPM/store service, without GTK.
+- `tpm-passkey`: unprivileged management CLI, without GTK or TPM implementation.
+- `tpm-passkey-approval-gtk`: unprivileged GTK4/libadwaita confirmation agent.
+
+Direct daemon deployment also requires the supplied system-bus/polkit assets and
+an administrator-selected authorization policy. Management CLI commands below run
+as the ordinary user, without `sudo`.
+
+Both public interfaces use the system bus, at
+`io.github.pineapplehunter.TpmPasskey1`. The former management Unix socket and
+`tpm-passkey daemon` command are retired. The systemd unit remains
+`tpm-passkey.service`; state remains `/var/lib/tpm-passkey`. No migration changes
+credentials, recovery formats or PIN requirements for this binary/API split.
+
+### Desktop setup (NixOS)
+
+The overlay supplies all three packages. For example, replacing `alice` with your
+desktop account:
+
+```nix
+services.tpm-passkey = {
+  enable = true;
+  approvalGtk.enable = true;
+  # Default: XDG autostart. Alternatives: "systemd" or "manual".
+  approvalGtk.startup = "xdg-autostart";
+};
+users.users.alice.extraGroups = [ "tpm-passkey" ];
+```
+
+Log out/in after changing group membership. No user lingering is enabled.
+`approvalGtk.startup = "systemd"` requires correctly integrated
+`graphical-session.target` and display environment. On minimal compositors that
+ignore XDG autostart, start `tpm-passkey-approval-gtk` from the compositor's
+session configuration instead. The root daemon never starts GTK, scrapes display
+environment variables, or connects to a user's session bus.
+
+The configurable `accessGroup` (default `tpm-passkey`) gates ordinary callers.
+Members may read metadata and register an agent without a password prompt.
+Management mutations require administrator authentication by default;
+`managementAuthentication = "self"` instead delegates them to members after
+own-password authentication. Authorization is not retained. Root remains trusted.
+Group access is to one shared store, not separate per-user stores.
+
+GTK approval is user presence, not a polkit/PAM re-authentication ceremony or
+built-in UV. Missing GUI/agent, close, Deny, cancellation or expiry fail closed
+without a fallback prompt. Same-user malware can impersonate the helper; this is
+not secure attention. Wayland does not guarantee automatic foreground focus.
+
+Flake packages are `daemon`, `cli` (also `default`), `approval-gtk`, and an optional
+`bundle`. Install the components separately to keep GTK outside the daemon's
+runtime closure. `cargo run -p tpm-passkey-daemon -- --dry-run` checks daemon
+configuration without opening devices.
 
 Existing state directories are **not moved automatically**. Stop the previously
 installed daemon before moving its complete state directory (database and
@@ -132,7 +186,7 @@ needs TPM-equivalent protection before a full conformance claim is possible.
 ## Future Work
 
 - Expand CTAP2 compatibility for additional browser request shapes.
-- Harden transaction approval through polkit.
+- Manually validate Firefox and approval UX on target Wayland desktops.
 - Further security review
 
 ## Current Limits

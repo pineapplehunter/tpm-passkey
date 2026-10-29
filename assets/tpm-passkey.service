@@ -1,13 +1,15 @@
 [Unit]
 Description=TPM-backed FIDO2 authenticator
-After=systemd-logind.service polkit.service
-Requires=systemd-logind.service
+After=dbus.service systemd-logind.service polkit.service
+Requires=dbus.service systemd-logind.service
+Wants=polkit.service
 ConditionPathExists=/dev/uhid
 ConditionPathExists=/dev/tpmrm0
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/tpm-passkey daemon --store-dir /var/lib/tpm-passkey --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
+Type=dbus
+BusName=io.github.pineapplehunter.TpmPasskey1
+ExecStart=/usr/bin/tpm-passkey-daemon --store-dir /var/lib/tpm-passkey --tpm-path /dev/tpmrm0 --uhid-path /dev/uhid
 
 StateDirectory=tpm-passkey
 StateDirectoryMode=0700

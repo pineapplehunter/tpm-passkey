@@ -36,10 +36,46 @@
           ...
         }:
         {
-          packages.default = pkgs.callPackage ./nix/package.nix { };
+          packages = {
+            daemon = pkgs.callPackage ./nix/package.nix { component = "daemon"; };
+            cli = pkgs.callPackage ./nix/package.nix { component = "cli"; };
+            approval-gtk = pkgs.callPackage ./nix/package.nix { component = "gtk"; };
+            default = config.packages.cli;
+            bundle = pkgs.symlinkJoin {
+              name = "tpm-passkey-bundle";
+              paths = [
+                config.packages.daemon
+                config.packages.cli
+                config.packages.approval-gtk
+              ];
+            };
+          };
+
+          checks.binary-separation = pkgs.runCommand "tpm-passkey-binary-separation" { } ''
+            if ${pkgs.gnugrep}/bin/grep -E -- '-gtk4-[0-9]|-libadwaita-[0-9]' \
+              ${pkgs.closureInfo { rootPaths = [ config.packages.daemon ]; }}/store-paths \
+              ${pkgs.closureInfo { rootPaths = [ config.packages.cli ]; }}/store-paths; then
+              echo "GTK leaked into daemon/CLI runtime closure" >&2
+              exit 1
+            fi
+            if ${pkgs.gnugrep}/bin/grep -- '-tpm2-tss-' \
+              ${
+                pkgs.closureInfo {
+                  # GTK's native dependencies may themselves include platform
+                  # TPM support; neither frontend uses the daemon's Rust crate.
+                  rootPaths = [ config.packages.cli ];
+                }
+              }/store-paths; then
+              echo "TPM implementation leaked into CLI runtime closure" >&2
+              exit 1
+            fi
+            touch "$out"
+          '';
 
           overlayAttrs = {
-            tpm-passkey = config.packages.default;
+            tpm-passkey = config.packages.cli;
+            tpm-passkey-daemon = config.packages.daemon;
+            tpm-passkey-approval-gtk = config.packages.approval-gtk;
           };
 
           treefmt = {
@@ -81,6 +117,9 @@
                 sqlx-cli
                 tpm2-tss
                 tpm2-tools
+                gtk4
+                libadwaita
+                dbus
                 sqlite
                 sqlx-prepare-shell
                 (rust-bin.stable.latest.default.override {

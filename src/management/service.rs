@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::mpsc};
+use std::{collections::HashMap, path::Path, sync::mpsc, time::Instant};
 
 use ciborium::{cbor, value::Value};
 use color_eyre::{
@@ -10,13 +10,26 @@ use zeroize::Zeroizing;
 use super::{CredentialTarget, ManagementRequest, ManagementResponse};
 use crate::{ctap2, store, tpm};
 
-fn execute(tx: Option<&ctap2::TpmCmdSender>, command: ctap2::TpmCommand) -> Result<()> {
+fn execute(
+    tx: Option<&ctap2::TpmCmdSender>,
+    command: ctap2::TpmCommand,
+    deadline: Instant,
+) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(eyre!("management operation timed out"));
+    }
     let tx = tx.ok_or_else(|| eyre!("authenticator worker is not available"))?;
     let (response_tx, response_rx) = mpsc::channel();
-    tx.send((command, response_tx))
-        .map_err(|_| eyre!("authenticator worker channel closed"))?;
+    tx.send((
+        ctap2::TpmCommand::BeforeDeadline {
+            deadline,
+            command: Box::new(command),
+        },
+        response_tx,
+    ))
+    .map_err(|_| eyre!("authenticator worker channel closed"))?;
     response_rx
-        .recv()
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .wrap_err("waiting for authenticator worker")?
         .map_err(|error| eyre!("{error}"))
 }
@@ -24,6 +37,7 @@ fn execute(tx: Option<&ctap2::TpmCmdSender>, command: ctap2::TpmCommand) -> Resu
 fn check_pcr_stale(
     tx: Option<&ctap2::TpmCmdSender>,
     policy: &store::StoredPcrPolicy,
+    deadline: Instant,
 ) -> Option<bool> {
     let pcr_indices = tpm::pcr_indices_from_selection(&policy.selection).ok()?;
     let (resp_tx, resp_rx) = mpsc::channel();
@@ -33,12 +47,23 @@ fn check_pcr_stale(
             pcr_indices,
             resp_tx,
         }),
+        deadline,
     )
     .ok()?;
-    Some(resp_rx.recv().ok()?.ok()? != policy.digest)
+    Some(
+        resp_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()?
+            .ok()?
+            != policy.digest,
+    )
 }
 
-fn list_credentials(store_dir: &Path, tx: Option<&ctap2::TpmCmdSender>) -> Result<Value> {
+fn list_credentials(
+    store_dir: &Path,
+    tx: Option<&ctap2::TpmCmdSender>,
+    deadline: Instant,
+) -> Result<Value> {
     let credentials = store::load_ctap2_credentials_from_dir(store_dir)?;
     let summaries: HashMap<_, _> = store::load_credential_summaries_from_dir(store_dir)?
         .into_iter()
@@ -52,7 +77,7 @@ fn list_credentials(store_dir: &Path, tx: Option<&ctap2::TpmCmdSender>) -> Resul
         let pcr_stale = credential
             .policy
             .as_ref()
-            .and_then(|policy| check_pcr_stale(tx, policy));
+            .and_then(|policy| check_pcr_stale(tx, policy, deadline));
         let pcr_indices = summary
             .policy_selection
             .as_deref()
@@ -81,6 +106,7 @@ fn update_pcr_policies(
     passphrase: &str,
     new_indices: Option<&[u32]>,
     target: Option<&CredentialTarget>,
+    deadline: Instant,
 ) -> Result<Value> {
     if let Some(indices) = new_indices {
         tpm::pcr_selection_for_indices(indices)?;
@@ -102,6 +128,9 @@ fn update_pcr_policies(
     };
     let mut results = Vec::new();
     for id in ids {
+        if Instant::now() >= deadline {
+            return Err(eyre!("management operation timed out"));
+        }
         let id_hex = hex::encode(&id);
         let credential = credentials.iter().find(|credential| credential.id == id);
         let reason = match credential {
@@ -133,11 +162,12 @@ fn update_pcr_policies(
                 pcr_indices,
                 passphrase: Zeroizing::new(passphrase.to_owned()),
             }),
+            deadline,
         );
         results.push(match result {
             Ok(()) => cbor!({ "credential" => id_hex, "status" => "ok" }).unwrap(),
-            Err(error) => {
-                cbor!({ "credential" => id_hex, "status" => "error", "error" => error.to_string() })
+            Err(_) => {
+                cbor!({ "credential" => id_hex, "status" => "error", "error" => "operation failed" })
                     .unwrap()
             }
         });
@@ -149,9 +179,13 @@ fn dispatch_result(
     store_dir: &Path,
     tx: Option<&ctap2::TpmCmdSender>,
     request: &ManagementRequest,
+    deadline: Instant,
 ) -> Result<Value> {
+    if Instant::now() >= deadline {
+        return Err(eyre!("management operation timed out"));
+    }
     match request {
-        ManagementRequest::ListCredentials => list_credentials(store_dir, tx),
+        ManagementRequest::ListCredentials => list_credentials(store_dir, tx, deadline),
         ManagementRequest::UpdatePassphrase {
             old_passphrase,
             new_passphrase,
@@ -159,11 +193,10 @@ fn dispatch_result(
             execute(
                 tx,
                 ctap2::TpmCommand::SetRecoveryPassphrase {
-                    old_passphrase: old_passphrase
-                        .as_ref()
-                        .map(|phrase| Zeroizing::new(phrase.clone())),
-                    new_passphrase: Zeroizing::new(new_passphrase.clone()),
+                    old_passphrase: old_passphrase.clone(),
+                    new_passphrase: new_passphrase.clone(),
                 },
+                deadline,
             )?;
             Ok(cbor!({ "status" => "recovery passphrase updated" }).unwrap())
         }
@@ -171,13 +204,14 @@ fn dispatch_result(
             execute(
                 tx,
                 ctap2::TpmCommand::UnlockRecovery {
-                    passphrase: Zeroizing::new(passphrase.clone()),
+                    passphrase: passphrase.clone(),
                 },
+                deadline,
             )?;
             Ok(cbor!({ "status" => "recovery enrollment unlocked" }).unwrap())
         }
         ManagementRequest::UpdatePcrReference { passphrase } => {
-            update_pcr_policies(store_dir, tx, passphrase, None, None)
+            update_pcr_policies(store_dir, tx, passphrase, None, None, deadline)
         }
         ManagementRequest::UpdatePcrPolicy {
             passphrase,
@@ -189,6 +223,7 @@ fn dispatch_result(
             passphrase,
             Some(pcr_indices),
             Some(credential_target),
+            deadline,
         ),
         ManagementRequest::SetDefaultPcrPolicy { pcr_indices } => {
             tpm::pcr_selection_for_indices(pcr_indices)?;
@@ -221,6 +256,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_reply_wait_is_bounded_and_queued_command_has_original_deadline() {
+        let (tx, rx) = mpsc::channel();
+        let deadline = Instant::now() + std::time::Duration::from_millis(30);
+        let start = Instant::now();
+        assert!(
+            execute(
+                Some(&tx),
+                ctap2::TpmCommand::UnlockRecovery {
+                    passphrase: Zeroizing::new("secret".into())
+                },
+                deadline
+            )
+            .is_err()
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+        let (command, _) = rx.try_recv().unwrap();
+        assert!(
+            matches!(command, ctap2::TpmCommand::BeforeDeadline { deadline: queued, .. } if queued == deadline)
+        );
+    }
+
+    #[test]
     fn enabling_requires_recovery_but_existing_defaults_are_preserved_until_disabled() {
         let mut id = [0; 8];
         getrandom::fill(&mut id).unwrap();
@@ -249,20 +306,35 @@ mod tests {
     }
 }
 
-pub(super) fn dispatch(
+#[cfg(test)]
+fn dispatch(
     store_dir: &Path,
     tx: Option<&ctap2::TpmCmdSender>,
     request: &ManagementRequest,
 ) -> ManagementResponse {
-    match dispatch_result(store_dir, tx, request) {
+    dispatch_until(
+        store_dir,
+        tx,
+        request,
+        Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+pub(crate) fn dispatch_until(
+    store_dir: &Path,
+    tx: Option<&ctap2::TpmCmdSender>,
+    request: &ManagementRequest,
+    deadline: Instant,
+) -> ManagementResponse {
+    match dispatch_result(store_dir, tx, request, deadline) {
         Ok(result) => ManagementResponse {
             ok: true,
             error: None,
             result: Some(result),
         },
-        Err(error) => ManagementResponse {
+        Err(_) => ManagementResponse {
             ok: false,
-            error: Some(error.to_string()),
+            error: Some("management operation failed".into()),
             result: None,
         },
     }
