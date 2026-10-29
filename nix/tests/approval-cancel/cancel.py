@@ -8,6 +8,8 @@ from fido2.ctap2 import Ctap2
 from fido2.hid import CTAPHID, CtapHidDevice
 
 verify_agent = "--agent" in sys.argv
+# Registration can temporarily remove the readiness marker while a request is busy.
+daemon_owner = Path("/run/user/1000/tpm-passkey-test-ready").read_text() if verify_agent else None
 path = Path("/run/user/1000/tpm-passkey-test-events")
 before = len(path.read_text().splitlines()) if path.exists() else 0
 
@@ -60,7 +62,7 @@ with next(CtapHidDevice.list_devices()) as device:
             assert len(checks) == len(cancels) == 1, events()
             assert checks[0]["id"] == cancels[0]["id"]
             assert checks[0]["sender"] == cancels[0]["sender"]
-            assert checks[0]["sender"] == Path("/run/user/1000/tpm-passkey-test-ready").read_text()
+            assert checks[0]["sender"] == daemon_owner
     finally:
         watchdog.cancel()
 print("Pending approval cancelled; CTAP worker responsive; directed dialog cancellation verified")
