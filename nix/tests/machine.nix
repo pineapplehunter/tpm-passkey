@@ -18,6 +18,8 @@
     enable = true;
     package = package.daemon;
     cliPackage = package.cli;
+    # Each scenario starts its own explicit test or real GTK agent.
+    approval.enable = false;
     tpmPath = "/dev/tpm0";
     uhidPath = "/dev/uhid";
   };

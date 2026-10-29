@@ -121,8 +121,10 @@ management transport. `crates/cli` contains one-shot management commands.
 AlertDialog, using plain-text labels and a Deny default. libadwaita is not a
 daemon/CLI dependency.
 GTK runs only in the desktop user's own environment. Desktop startup may use
-XDG autostart, a correctly integrated graphical-session.target, or a compositor's
-own startup mechanism; root does not scrape environment variables or access a
+a correctly integrated graphical-session.target (the default), XDG autostart,
+or a compositor's own startup mechanism. The generic `approval` options enable
+the agent with the daemon by default; `approval.enable = false` opts out.
+Root does not scrape environment variables or access a
 user session bus. No lingering is enabled.
 
 The runtime credential model is distinct from the SQLite representation.

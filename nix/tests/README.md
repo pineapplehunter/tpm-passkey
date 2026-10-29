@@ -26,6 +26,9 @@ Shared files stay here:
 
 - `machine.nix`: software TPM, daemon package, user, polkit and tools.
 - `common.nix`: test constructor; requires a reason and prints it in the log.
+- `approval-options.nix`: pure module-evaluation check for default enablement,
+  systemd startup, opt-out, XDG autostart and manual startup. Protocol VMs
+  explicitly disable automatic startup and select their own test agent.
 - `driver.py`: bounded login/startup, management/expect and recovery helpers.
 - `register.py`, `assert.py`: credential fixture creation and signature checks.
 - `agent.py`: **test-only** auto-answering agent; controls a TTY session and

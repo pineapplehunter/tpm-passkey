@@ -12,7 +12,7 @@ let
     mkOption
     ;
   cfg = config.services.tpm-passkey;
-  agent = lib.getExe cfg.approvalGtk.package;
+  agent = lib.getExe cfg.approval.package;
   autostart = pkgs.writeShellScript "tpm-passkey-approval-autostart" ''
     if ${pkgs.coreutils}/bin/id -nG | ${pkgs.gnugrep}/bin/grep -qw -- ${lib.escapeShellArg cfg.accessGroup}; then
       exec ${agent}
@@ -47,17 +47,20 @@ in
       default = "admin";
       description = "Polkit authentication required for group-member management mutations, without retained authorization. Reads and agent registration are noninteractive.";
     };
-    approvalGtk = {
-      enable = mkEnableOption "the unprivileged GTK approval agent (never built-in UV)";
+    approval = {
+      enable = mkEnableOption "the unprivileged approval agent (never built-in UV)" // {
+        default = cfg.enable;
+      };
+      # Other frontends, such as Qt, can implement the same approval protocol.
       package = lib.mkPackageOption pkgs "tpm-passkey-approval-gtk" { };
       startup = mkOption {
         type = types.enum [
-          "xdg-autostart"
           "systemd"
+          "xdg-autostart"
           "manual"
         ];
-        default = "xdg-autostart";
-        description = "Start with desktop autostart, a correctly integrated graphical-session.target, or manually. No lingering or root display access is enabled.";
+        default = "systemd";
+        description = "Start with a correctly integrated graphical-session.target by default, desktop autostart, or manually. No lingering or root display access is enabled.";
       };
     };
   };
@@ -75,7 +78,7 @@ in
       cfg.package
       cfg.cliPackage
     ]
-    ++ lib.optional cfg.approvalGtk.enable cfg.approvalGtk.package;
+    ++ lib.optional cfg.approval.enable cfg.approval.package;
     services.udev.packages = [ cfg.package ];
     services.dbus.packages = [ cfg.package ];
     security.polkit.enable = true;
@@ -132,7 +135,7 @@ in
       };
     };
     systemd.user.services.tpm-passkey-approval-gtk =
-      mkIf (cfg.approvalGtk.enable && cfg.approvalGtk.startup == "systemd")
+      mkIf (cfg.approval.enable && cfg.approval.startup == "systemd")
         {
           description = "GTK passkey user-presence approval agent";
           wantedBy = [ "graphical-session.target" ];
@@ -146,7 +149,7 @@ in
           };
         };
     environment.etc."xdg/autostart/tpm-passkey-approval-gtk.desktop" =
-      mkIf (cfg.approvalGtk.enable && cfg.approvalGtk.startup == "xdg-autostart")
+      mkIf (cfg.approval.enable && cfg.approval.startup == "xdg-autostart")
         {
           text = ''
             [Desktop Entry]

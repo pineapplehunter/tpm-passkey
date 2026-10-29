@@ -65,19 +65,25 @@ desktop account:
 ```nix
 services.tpm-passkey = {
   enable = true;
-  approvalGtk.enable = true;
-  # Default: XDG autostart. Alternatives: "systemd" or "manual".
-  approvalGtk.startup = "xdg-autostart";
+  # Approval is enabled automatically with the daemon.
+  # Default: "systemd". Alternatives: "xdg-autostart" or "manual".
+  approval.startup = "systemd";
 };
 users.users.alice.extraGroups = [ "tpm-passkey" ];
 ```
 
 Log out/in after changing group membership. No user lingering is enabled.
-`approvalGtk.startup = "systemd"` requires correctly integrated
-`graphical-session.target` and display environment. On minimal compositors that
-ignore XDG autostart, start `tpm-passkey-approval-gtk` from the compositor's
-session configuration instead. The root daemon never starts GTK, scrapes display
-environment variables, or connects to a user's session bus.
+The default `approval.startup = "systemd"` requires correctly integrated
+`graphical-session.target` and display environment. Choose `"xdg-autostart"` for
+desktops using XDG autostart, or `"manual"` and launch `tpm-passkey-approval-gtk`
+from the compositor's session configuration. `approval.enable = false` disables
+agent installation/startup for an independently managed frontend. The root daemon
+never starts GTK, scrapes display environment variables, or connects to a user's
+session bus.
+
+The option group is toolkit-independent: `approval.package` defaults to the GTK
+agent but can select another compatible frontend. Configurations using the old
+`approvalGtk` option group must rename it to `approval`.
 
 The configurable `accessGroup` (default `tpm-passkey`) gates ordinary callers.
 Members may read metadata and register an agent without a password prompt.
