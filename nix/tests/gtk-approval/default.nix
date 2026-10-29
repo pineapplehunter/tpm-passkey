@@ -34,6 +34,7 @@
     };
   };
   testScript = ''
+    setup_migration()
     machine.succeed("systemctl stop tpm-passkey-test-agent")
     machine.succeed("systemctl start tpm-passkey-test-session tpm-passkey-test-xvfb")
     machine.wait_until_succeeds("test -S /tmp/.X11-unix/X99", timeout=15)
@@ -48,7 +49,7 @@
     machine.succeed(f"DISPLAY=:99 xdotool windowfocus {window} key Escape")
     machine.wait_until_succeeds("! kill -0 $(cat /tmp/gtk-client-pid)", timeout=10)
     assert "OPERATION_DENIED" in machine.succeed("cat /tmp/gtk-result")
-    assert mgmt("list-credentials").strip() == ""
+    assert mgmt("list --json").strip() == "[]"
     machine.succeed("test $(systemctl show tpm-passkey-test-gtk -p User --value) = alice")
   '';
 }

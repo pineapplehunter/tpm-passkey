@@ -5,7 +5,7 @@ pub mod ctap2;
 pub mod ctaphid;
 pub mod hid;
 pub mod management;
+pub mod migration_crypto;
 pub mod polkit;
-pub mod recovery;
 pub mod store;
 pub mod tpm;

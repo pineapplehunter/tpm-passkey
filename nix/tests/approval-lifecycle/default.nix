@@ -3,6 +3,7 @@
   name = "approval-lifecycle";
   reason = "Exercise fresh Allow/Deny and absent helper; no cached consent may survive.";
   testScript = ''
+    setup_migration()
     scenario("${./scenario.py}", timeout=60)
     machine.succeed("systemctl stop tpm-passkey-test-agent; rm -f /run/user/1000/tpm-passkey-test-ready")
     machine.succeed("python3 ${./absent.py}", timeout=10)

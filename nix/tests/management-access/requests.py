@@ -1,7 +1,26 @@
 """User-side negative transport tests: never authorize one operation as another."""
 import asyncio
+import sys
 import cbor2
 from tpm_test_bus import manage_raw, management
+
+if '--denied' in sys.argv:
+    # Exercise polkit without a CLI passphrase prompt consuming the test
+    # driver's backdoor stdin. Each request must be denied before dispatch.
+    for operation, params in [
+        ('show-config', None),
+        ('disable-default-pcr-policy', None),
+        ('verify-migration-passphrase', {'passphrase': 'test migration phrase'}),
+    ]:
+        payload = operation if params is None else {operation: params}
+        try:
+            asyncio.run(manage_raw(operation, cbor2.dumps(payload)))
+        except RuntimeError as error:
+            assert str(error) == 'org.freedesktop.DBus.Error.AccessDenied', error
+        else:
+            raise AssertionError('nonmember management request was not denied: ' + operation)
+    print('Nonmember read, settings and migration operations denied by polkit')
+    sys.exit(0)
 
 assert management("show-config") is not None
 

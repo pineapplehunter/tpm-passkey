@@ -1,188 +1,83 @@
-# Credential Storage and Recovery
+# Credential Storage and Migration
 
-## Scope and compatibility
+## Compatibility and persistent state
 
-This experimental authenticator stores TPM-generated P-256 WebAuthn passkeys.
-There is no U2F or software passkey-signing fallback. One daemon and SQLite
-store serve a single-user machine, with no caller-UID filtering.
+This experimental authenticator stores TPM-generated P-256 WebAuthn passkeys. All
+schema changes are new migrations. Migration `20261029090000` is deliberately
+breaking: it deletes credentials and old migration/default-policy configuration
+that cannot be safely transformed to the migration-key format. It preserves
+`client_pin_state`. Users must register replacement passkeys with relying parties;
+deleting local rows does not revoke website registrations. Old backups must not
+be reused.
 
-Every commit/release may invalidate existing credentials. All schema changes
-are recorded in new `migrations/` files; existing migrations must not be edited.
-A migration may deliberately discard credentials. Migration `20261028060000`
-deletes the old credentials and plaintext-equivalent recovery configuration.
-Migration `20261028070000` removes the legacy owner column/indexes and discards
-records using the old owner-dependent metadata MAC. The user must register
-replacement passkeys with their relying parties.
-Deleting local records does not revoke old website registrations; remove those
-registrations if old recovery material may have been exposed.
+The store contains `credentials.sqlite` and `integrity.hmac-key`. SQLite stores
+credential metadata, TPM object blobs, PCR-policy packages, migration-key config,
+encrypted migration-authority values, and client PIN state. The integrity key
+MACs the migration configuration and credential metadata. Credential loading
+fails closed on missing or invalid integrity state. A client PIN is separate from
+the migration passphrase; use `fido2-manage` to manage PINs.
 
-## Files and schema
+`credential_metadata` stores RP/user fields and counters; `credential_keyslots`
+stores the primary and migration authority TPM objects and policy packages;
+`credential_tokens` stores encrypted authority values and use counters;
+`daemon_config` stores the migration-key configuration and default PCR selection.
+TPM private blobs are bound to the original TPM and are not raw private scalars.
 
-The default store is `.tpm-passkey-store/`, overridden by `daemon --store-dir`.
-The NixOS service uses `/var/lib/tpm-passkey`. The directory contains:
+## Migration key and enrollment
 
-- `credentials.sqlite`: metadata, TPM object blobs, policies, encrypted recovery
-  authorization values, Client PIN state, and daemon configuration.
-- `integrity.hmac-key`: the current development metadata-MAC key. This is not
-  the recovery encryption key and cannot decrypt recovery authorization values.
+`tpm-passkey setup` is mandatory before registration.
+Setup interactively selects the PCR default and creates a confirmed migration
+passphrase. The private migration key is passphrase-protected. Its public-key
+integrity is protected by the local config MAC. Per-credential authority secrets
+are encrypted to the configured public key using P-256 ECDH, HKDF, and AES-GCM;
+credential identity and authority data are authenticated as associated data.
+Fresh ephemeral keys, salts, and nonces prevent deterministic envelopes.
 
-The schema is defined by the complete migration history. Current tables are:
+Every new credential, including one with PCR binding disabled, is authorized by
+the migration key. Enrollment uses the public key and does not unlock or prompt
+for the migration passphrase. The PCR default only determines whether the
+credential's authorized policy also binds use to selected PCRs. An unbound
+credential therefore remains TPM-bound and migration-authorized; it is not an
+ordinary TPM auth-value-only key.
 
-- `credential_metadata`: credential/RP/user information and signature counters.
-- `credential_keyslots`: primary and recovery TPM blobs, public keys, and primary
-  PCR-policy authorization packages.
-- `credential_tokens`: an `encrypted_auth` CBOR envelope for each recovery slot,
-  plus nullable `last_used` and nonnegative `used_count` (default zero).
-- `client_pin_state`: PIN verifier and retry state.
-- `daemon_config`: default PCR selection and an encrypted recovery unlock check.
+## PCR policy operations
 
-No local owner UID is stored in credential metadata. All credentials belong to
-the single shared namespace. WebAuthn user handles are still required and are
-not local user IDs.
+`config policy PCR... --yes` updates all existing credentials, including those
+whose PCR binding was disabled, and then changes the default for future
+registrations. `config policy --disable --yes` updates every existing credential
+to the authorized PCR-disabled baseline and clears the default. Both are one
+serialized daemon bulk request. Each credential can succeed or fail
+independently; results report partial success, and the default changes only if
+every selected update succeeds. A zero-credential operation is explicitly
+reported and can still change the default after migration-passphrase
+verification.
 
-Stored TPM key blobs contain only the TPM private/public representations. Their
-Rust storage type has no authorization-value field. A TPM private blob is
-protected under a storage parent on the original TPM, not a raw private scalar.
-The daemon recreates a transient owner-hierarchy parent as needed and loads and
-flushes credential objects for signing.
+`migrate --yes` targets the daemon's current credential set in one bulk request.
+It updates PCR-bound credentials and skips PCR-disabled credentials. It reports
+per-credential outcomes; successful updates are not rolled back if another
+credential fails. Passphrase rotation authenticates and re-encrypts migration
+material atomically without changing passkeys. Registration, configuration
+mutation, and migration serialize against one another; the TPM worker remains
+the sole TPM command channel.
 
-## Persistent-state failures and reset
+Policy changes require the supplied migration passphrase. Credential state and
+policy/token-use metadata are committed atomically per successful update; a
+failed update does not update its token-use history. The global default is stored
+only after full bulk success. Setup writes the authenticated config and initial
+default policy transactionally. PIN state survives the destructive schema
+migration and is unaffected by migration operations.
 
-A stored PIN record must have 32-byte salt/verifier fields, a valid retry count,
-and an authenticated integrity MAC. Unreadable or unverifiable PIN state blocks
-credential/PIN operations with `INTEGRITY_FAILURE`, not an implicit "PIN unset".
-GetInfo conservatively reports PIN protection so discovery and explicit reset
-remain available. Restore a complete valid backup and restart to repair without
-deleting credentials. Legacy PIN rows with no MAC are no longer accepted.
+## PCR security and limits
 
-Credential loads likewise require a valid metadata MAC, the existing integrity
-key, and a primary slot. Load/reload failures block operations rather than
-creating an empty writable namespace. Production registration, assertion, and
-credential-management begin/update/delete operations reload state before use.
-Integrity-key read errors never fall back to unchecked credentials, and a failed
-MAC-key access aborts snapshot writes before deleting rows. Legacy credential
-rows with no MAC are not automatically repaired or accepted. This does not make
-the metadata MAC cover every field or protect against full-store rollback.
+A PCR-bound credential's fixed TPM policy trusts its signed policy authority via
+`PolicyAuthorize`, restricting use to `TPM2_Sign`. Migration approves a new PCR
+state on the original TPM while keeping the registered passkey key/blob intact.
+It cannot recover from TPM loss, replacement, clearing, or loss of credential
+blobs. Users must decide whether a newly measured boot state is trustworthy.
 
-Explicit CTAP reset requires fresh approval within its normal startup window.
-Credential rows (including ones not loaded into memory) and PIN state are deleted
-atomically; a failed transaction leaves both intact. This reset does not change
-the application's PCR enrollment default or recovery-passphrase configuration.
-
-## Optional PCR binding
-
-New credentials are TPM-bound but **not PCR-bound by default**. An absent
-`daemon_config.default_pcr_policy` row means no binding. Explicitly saved PCR
-selections are preserved; an invalid or empty saved selection is an error,
-not an implicit request to disable binding.
-
-Unbound credentials have no stored PCR policy or recovery authority. They use
-the TPM's ordinary auth-value signing path, with no `PolicyPCR` invocation.
-Their `fixedTPM`, `fixedParent`, and `sensitiveDataOrigin` attributes still prevent
-normal private-key export/migration. This is not implemented by passing an empty
-PCR selection into the policy code. It permits use on the original TPM across
-boot-state changes, trading boot-state enforcement for convenience.
-
-Opt in by configuring a recovery phrase, then setting a nonempty PCR selection.
-Each new PCR-bound credential requires recovery enrollment to be unlocked and
-always gets its own recovery authority. A phrase alone never enables binding.
-`config set default-pcr-policy --disable` removes the default selection and
-allows unbound enrollment even while recovery enrollment is locked.
-
-Configuration changes affect future registrations only. Existing policies,
-TPM blobs, and recovery slots are not modified or retrofitted. A previously
-created bound key without recovery remains bound and without recovery. Stored
-PCR-policy updates still require that credential's recovery phrase.
-
-## Recovery policy
-
-For each newly created PCR-bound credential:
-
-1. The TPM creates a separate recovery authority with a random 32-byte auth value.
-2. The authority approves a PCR policy using a credential-specific `policyRef`.
-3. The primary key's fixed policy trusts that authority through `PolicyAuthorize`
-   and restricts use to `TPM2_Sign`.
-4. The daemon password-encrypts the authority's auth value before persistence.
-
-Assertions for PCR-bound credentials verify the existing signed approval
-against the current PCR state. They do not decrypt the auth value or require
-the recovery phrase. Assertions for unbound credentials do not check PCRs.
-
-After a boot-state change, the management command decrypts the auth value using
-its supplied phrase. The original TPM uses the recovery authority to approve
-its current measurements. The passkey and its public key do not change. This
-recovers from PCR changes, not a lost/replaced/cleared TPM or lost object blobs.
-The user is responsible for deciding whether the new boot state is trustworthy.
-
-## Password encryption
-
-Format version 1 uses:
-
-- Argon2id v1.3, 64 MiB memory, three passes, one lane, 32-byte output.
-- A random 32-byte salt per encryption configuration.
-- AES-256-GCM with a fresh random 12-byte nonce per encrypted value and its
-  authentication tag appended to the ciphertext.
-- Associated data binding each authorization value to its credential ID,
-  recovery key's TPM public blob, and credential-specific `policyRef`.
-
-The envelope records its version, KDF parameters, salt, nonce, and ciphertext.
-Version 1 accepts only its defined KDF parameters, bounding work for untrusted
-stored input. Swapping slots or changing authenticated data fails decryption.
-
-The daemon configuration contains an encrypted known check value in a separate
-AAD domain. It does not contain the phrase, Argon2 output, wrapping key, or an
-unencrypted TPM authorization value. The configuration and slots share the
-phrase-derived wrapping key, but each credential has an independent random TPM
-authorization secret and each encryption has an independent nonce.
-
-## Enrollment, unlock, and rotation
-
-Configure recovery before creating credentials that need it:
-
-```sh
-tpm-passkey config set recovery-passphrase
-tpm-passkey config set default-pcr-policy 1 7
-```
-
-This retains a zeroizing wrapping key only in the authenticator worker's memory
-for creating PCR-bound credentials. After a daemon restart, only PCR-bound
-enrollment is locked. Unbound enrollment is unaffected. Unlock explicitly with:
-
-```sh
-tpm-passkey config unlock-recovery
-```
-
-While PCR binding is configured but recovery is missing or locked, registration
-fails rather than silently creating an unrecoverable bound credential. Without
-an explicit default selection, registration creates an unbound TPM key regardless
-of whether a phrase is configured or recovery enrollment is unlocked. Existing
-credentials always retain their individual policies.
-
-Policy-update requests always require their supplied phrase and do not use the
-enrollment unlock cache. Failed decryption happens before any TPM policy update.
-Each successful policy update atomically records `last_used = CURRENT_TIMESTAMP`
-and increments the recovery token's `used_count` with the new policy. Before its
-first use, `last_used` is NULL and `used_count` is zero. Normal passkey assertions,
-enrollment unlock, and passphrase rotation do not count as token uses. Full
-credential saves and rotation preserve the usage history. Failed updates do not
-change it.
-
-Setting a new phrase requires the old phrase when configured. The worker first
-authenticates and decrypts all slots, re-encrypts them under a new salt/key with
-fresh nonces, and atomically commits all ciphertexts and the configuration in
-one SQLite transaction. TPM auth values and keys do not change. Wrong phrases,
-corrupt slots, or failed writes leave the old configuration intact.
-
-## Remaining security limits
-
-- Database disclosure permits offline phrase guessing; use a strong phrase.
-- A live privileged attacker can capture a phrase or the in-memory unlock key.
-- Rotation does not revoke recovery material in old snapshots. Database rollback
-  protection is not implemented.
-- Deleting records is not secure erasure of SQLite free pages, WAL files, SSD
-  storage, or backups. Old insecure stores/backups must not be reused.
-- The current metadata MAC does not authenticate the complete credential record
-  and its key is stored beside the database. Recovery AEAD protects its own
-  authorization value and bindings, not all database metadata.
-- Direct development deployment still depends on file/device permissions; the
-  NixOS service restricts its state directory to `0700`.
+Database disclosure permits offline passphrase guessing; use a strong phrase.
+The metadata/config MAC key is stored beside the database and does not protect
+against root or full-store rollback. Old snapshots may retain migration
+material. Deleting rows is not secure erasure of SQLite free pages, WAL files,
+SSDs, or backups. The NixOS service restricts its state directory; direct
+development deployments must secure files and devices themselves.

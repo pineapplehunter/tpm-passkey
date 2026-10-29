@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT credential_id, created_at, last_used_at FROM credential_metadata",
+  "query": "SELECT credential_id, created_at, last_used_at, local_id FROM credential_metadata",
   "describe": {
     "columns": [
       {
@@ -35,6 +35,17 @@
             "name": "last_used_at"
           }
         }
+      },
+      {
+        "name": "local_id",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "credential_metadata",
+            "name": "local_id"
+          }
+        }
       }
     ],
     "parameters": {
@@ -43,8 +54,9 @@
     "nullable": [
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "e854f6e39d667c54f31ca2fbf83edf2ac247319c0d690259ed7ec6630c5d84d9"
+  "hash": "7f2f476c6f838bfe6591afdb1d55b650ad4872f2e23c7d2e0d946b26f58a67e2"
 }

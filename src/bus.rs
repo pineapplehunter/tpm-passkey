@@ -239,10 +239,13 @@ impl BusApproval {
 
 pub(crate) fn management_action(operation: &str) -> Option<&'static str> {
     match operation {
-        "list-credentials" | "show-config" => Some(wire::ACTION_READ),
-        "update-passphrase" | "unlock-recovery" | "update-pcr-reference" | "update-pcr-policy" => {
-            Some(wire::ACTION_RECOVERY)
-        }
+        "list-credentials" | "credential-info" | "show-config" => Some(wire::ACTION_READ),
+        "setup-migration"
+        | "migrate-credentials"
+        | "update-migration-passphrase"
+        | "verify-migration-passphrase"
+        | "migrate-pcr-reference"
+        | "update-pcr-policy" => Some(wire::ACTION_MIGRATION),
         "set-default-pcr-policy" | "disable-default-pcr-policy" => Some(wire::ACTION_SETTINGS),
         _ => None,
     }
@@ -543,7 +546,7 @@ mod tests {
         assert!(registry.pending.is_some());
         registry.finish("request1");
         assert!(registry.register(2, agent(":1.2")));
-        assert!(invalid.load(Ordering::SeqCst)); // recovery cannot revive consent
+        assert!(invalid.load(Ordering::SeqCst)); // migration cannot revive consent
     }
     #[test]
     fn disconnect_observed_before_registration_commit_invalidates_candidate() {

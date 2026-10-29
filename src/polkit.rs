@@ -88,10 +88,18 @@ mod tests {
         use tpm_passkey_protocol::*;
         assert_eq!(management_action("list-credentials"), Some(ACTION_READ));
         assert_eq!(management_action("show-config"), Some(ACTION_READ));
-        assert_eq!(management_action("unlock-recovery"), Some(ACTION_RECOVERY));
+        assert_eq!(
+            management_action("verify-migration-passphrase"),
+            Some(ACTION_MIGRATION)
+        );
+        assert_eq!(management_action("setup-migration"), Some(ACTION_MIGRATION));
+        assert_eq!(
+            management_action("migrate-credentials"),
+            Some(ACTION_MIGRATION)
+        );
         assert_eq!(
             management_action("update-pcr-policy"),
-            Some(ACTION_RECOVERY)
+            Some(ACTION_MIGRATION)
         );
         assert_eq!(
             management_action("set-default-pcr-policy"),

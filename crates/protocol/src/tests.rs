@@ -37,12 +37,12 @@ fn descriptor(bytes: &[u8], seal: bool) -> OwnedFd {
 
 #[test]
 fn sealed_secret_roundtrip_ignores_shared_file_offset() {
-    let request = ManagementRequest::UnlockRecovery {
+    let request = ManagementRequest::VerifyMigrationPassphrase {
         passphrase: zeroize::Zeroizing::new("test-only-secret".into()),
     };
     let fd = transport::seal_request(&request).unwrap();
     assert!(unsafe { libc::lseek(fd.as_raw_fd(), 9999, libc::SEEK_SET) } >= 0);
-    let ManagementRequest::UnlockRecovery { ref passphrase } =
+    let ManagementRequest::VerifyMigrationPassphrase { ref passphrase } =
         transport::read_request(&fd).unwrap()
     else {
         panic!("wrong operation")
@@ -89,7 +89,7 @@ fn malformed_and_trailing_data_do_not_echo_secret_bytes() {
 
 #[test]
 fn bounded_serialization_and_partial_secret_decoding_fail_closed() {
-    let oversized = ManagementRequest::UpdatePassphrase {
+    let oversized = ManagementRequest::UpdateMigrationPassphrase {
         old_passphrase: Some(zeroize::Zeroizing::new("a".repeat(6000))),
         new_passphrase: zeroize::Zeroizing::new("b".repeat(12000)),
     };
@@ -99,7 +99,7 @@ fn bounded_serialization_and_partial_secret_decoding_fail_closed() {
     );
     // Externally tagged decoding visits secret fields directly; each field is
     // guarded even when a later field fails, rather than waiting for enum Drop.
-    let partial = ciborium::cbor!({"update-passphrase" => {
+    let partial = ciborium::cbor!({"update-migration-passphrase" => {
         "old_passphrase" => "test-only-partially-decoded-secret", "new_passphrase" => 7
     }})
     .unwrap();
@@ -111,7 +111,7 @@ fn bounded_serialization_and_partial_secret_decoding_fail_closed() {
             .to_string(),
         "invalid management request"
     );
-    let valid = ManagementRequest::UpdatePassphrase {
+    let valid = ManagementRequest::UpdateMigrationPassphrase {
         old_passphrase: Some(zeroize::Zeroizing::new("x".repeat(6000))),
         new_passphrase: zeroize::Zeroizing::new("new".into()),
     };
@@ -119,8 +119,44 @@ fn bounded_serialization_and_partial_secret_decoding_fail_closed() {
         transport::read_request(&transport::seal_request(&valid).unwrap())
             .unwrap()
             .operation(),
-        "update-passphrase"
+        "update-migration-passphrase"
     );
+}
+
+#[test]
+fn policy_default_change_preserves_keep_set_and_disable_as_distinct_choices() {
+    for change in [
+        DefaultPcrPolicyChange::Keep,
+        DefaultPcrPolicyChange::Set {
+            pcr_indices: vec![7],
+        },
+        DefaultPcrPolicyChange::Disable,
+    ] {
+        let request = ManagementRequest::UpdatePcrPolicy {
+            passphrase: zeroize::Zeroizing::new("secret".into()),
+            pcr_indices: vec![1],
+            credential_target: CredentialTarget::All { all: true },
+            default_policy_change: change.clone(),
+        };
+        let decoded = transport::read_request(&transport::seal_request(&request).unwrap()).unwrap();
+        let ManagementRequest::UpdatePcrPolicy {
+            default_policy_change,
+            ..
+        } = decoded
+        else {
+            panic!("wrong operation")
+        };
+        match default_policy_change {
+            DefaultPcrPolicyChange::Keep => assert!(matches!(change, DefaultPcrPolicyChange::Keep)),
+            DefaultPcrPolicyChange::Set { pcr_indices } => {
+                assert!(matches!(change, DefaultPcrPolicyChange::Set { .. }));
+                assert_eq!(pcr_indices, vec![7]);
+            }
+            DefaultPcrPolicyChange::Disable => {
+                assert!(matches!(change, DefaultPcrPolicyChange::Disable));
+            }
+        }
+    }
 }
 
 #[test]

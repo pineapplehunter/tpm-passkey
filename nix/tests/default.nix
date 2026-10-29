@@ -35,10 +35,10 @@
               "approval-cancel"
               "approval-lifecycle"
               "gtk-approval"
-              "optional-pcr"
               "signing-sessions"
-              "recovery-rotation"
-              "recovery-reboot"
+              "migration-rebind"
+              "migration-reboot"
+              "migration-upgrade"
             ]
         )
         // {

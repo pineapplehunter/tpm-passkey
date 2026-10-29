@@ -3,6 +3,7 @@
   name = "credential-management";
   reason = "Check Protocol 1-authenticated credential management, successful RP/credential continuations, user updates and interruption of a still-valid enumeration.";
   testScript = ''
+    setup_migration()
     expect_command("fido2-manage -setPIN -device 1",
         'expect "Enter new PIN"; send "1234\\r"; '
         'expect "Enter the same PIN again"; send "1234\\r"; expect eof')

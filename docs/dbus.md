@@ -17,12 +17,11 @@ creates a configurable `tpm-passkey` access group and installs site policy:
 | --- | --- | --- |
 | `register-agent` | Noninteractive eligibility to register | Denied |
 | `read` | Read configuration/credential metadata | Denied |
-| `manage-recovery` | Authenticate as administrator (or explicitly configured self) | Denied |
+| `manage-migration` | Authenticate as administrator (or explicitly configured self) | Denied |
 | `manage-settings` | Authenticate as administrator (or explicitly configured self) | Denied |
 
 All action IDs start with `io.github.pineapplehunter.tpm-passkey.`. There is no
-retained authorization. Root is trusted regardless of group membership. Recovery
-cryptography still requires the appropriate phrase; polkit cannot replace it.
+retained authorization. Root is trusted regardless of group membership. Migration-key operations still require the appropriate phrase; polkit cannot replace it.
 This is access to one shared store, not per-user credential isolation.
 
 ## Agent registration

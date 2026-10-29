@@ -11,7 +11,7 @@ not multi-user credential isolation.
 - Presents a virtual FIDO2 HID authenticator to browsers.
 - Creates TPM-backed P-256 credentials for registration and assertion.
 - Keeps credentials TPM-bound, with optional, explicit PCR boot-state binding.
-- Supports recovery material unlocked by a passphrase and kept TPM-bound.
+- Authorizes migration of PCR policies through a passphrase-protected, TPM-bound migration key.
 - Collects transaction-specific user presence through an unprivileged GTK Allow/Deny agent.
 - Runs management commands as the user, with daemon-side polkit authorization.
 
@@ -52,8 +52,7 @@ as the ordinary user, without `sudo`.
 Both public interfaces use the system bus, at
 `io.github.pineapplehunter.TpmPasskey1`. The former management Unix socket and
 `tpm-passkey daemon` command are retired. The systemd unit remains
-`tpm-passkey.service`; state remains `/var/lib/tpm-passkey`. No migration changes
-credentials, recovery formats or PIN requirements for this binary/API split.
+`tpm-passkey.service`; state remains `/var/lib/tpm-passkey`. The migration-key redesign is a breaking database migration: it deletes stored credentials and prior migration/default-policy configuration, while preserving client PIN state.
 
 ### Desktop setup (NixOS)
 
@@ -104,66 +103,45 @@ Existing state directories are **not moved automatically**. Stop the previously
 installed daemon before moving its complete state directory (database and
 supporting key files) to the new service path, preserving restrictive permissions.
 For development, `--store-dir` can point directly to an existing directory.
-The rename does not change existing keys, policies, or encrypted recovery formats.
+Existing state uses the migration-redesign schema; older credentials are intentionally removed by the breaking migration.
 
-Management examples:
+Management commands (run as the ordinary user):
 
 ```sh
-tpm-passkey list-credentials
+tpm-passkey setup
+tpm-passkey list                 # use --json for machine-readable output
+tpm-passkey info 17               # local numeric ID; use --json for JSON
+tpm-passkey migrate              # asks for confirmation; --yes skips it
 tpm-passkey config show
+tpm-passkey config policy         # show the default policy without scanning credentials
+tpm-passkey config policy 1 7     # asks for confirmation
+tpm-passkey config policy --disable --yes
+tpm-passkey config passphrase
 ```
 
-`list-credentials` prints the base64 credential ID accepted by
-`fido2-manage -credential`, followed by tab-separated RP ID, user name,
-registration time, last-use time, and bound PCR indices (`none` when unbound).
-`config show` prints `default_pcr_policy\tnone` when no selection is configured,
-or the explicit indices, such as `1,7`.
+Setup interactively selects the PCR binding default (empty selection disables
+binding) and creates a confirmed migration passphrase. Every new credential is
+authorized by the migration key regardless of whether PCR binding is enabled;
+enrollment does not require unlocking it. `list` and `info` use sharp tables by
+default, and emit JSON with `--json`. The list has ID, site, account and creation
+date columns; JSON retains the full creation timestamp. IDs are local integer IDs. Use
+`fido2-manage` for PIN management; this CLI has no PIN API.
 
-### Optional PCR binding
+`migrate` confirms the current affected count and trusted boot state, then sends
+one daemon-side bulk request (`--yes` skips confirmation). With no PCR-bound
+credentials it exits without asking for a passphrase. It migrates all PCR-bound
+credentials, skips PCR-disabled credentials, reports per-credential results,
+and permits partial success. `config policy` updates every existing credential
+(including PCR-disabled ones) and the future-enrollment default in one serialized
+request; the default changes only if every credential update succeeds. `--disable`
+clears PCR binding for existing credentials and the default. With zero credentials,
+the default change is still applied and reported explicitly.
 
-**New credentials have no PCR binding by default.** They remain non-exportable
-TPM keys, but can sign on the original TPM after boot measurements change.
-This trades boot-state restrictions for convenience; someone with sufficient
-access to the original TPM can use an unbound key regardless of boot state.
-
-Opt in before registering credentials that should be PCR-bound:
-
-```sh
-tpm-passkey config set recovery-passphrase
-tpm-passkey config set default-pcr-policy 1 7
-# After a daemon restart, unlock before registering new PCR-bound credentials:
-tpm-passkey config unlock-recovery
-```
-
-A passphrase alone does **not** enable PCR binding. Enabling requires configured
-recovery, and new PCR-bound enrollment also requires it to be unlocked. Every
-new PCR-bound credential gets its own recovery authority. Unbound enrollment
-never requires a recovery unlock, even when a phrase is configured.
-
-Disable binding for future registrations explicitly:
-
-```sh
-tpm-passkey config set default-pcr-policy --disable
-```
-
-These settings affect **future registrations only**. Existing credentials are
-not retrofitted or relaxed. Existing explicitly saved PCR selections are
-preserved across upgrades/restarts; only an absent default configuration means
-no binding. Previously created PCR-bound keys without recovery are not upgraded
-by setting a phrase. Existing PCR-policy updates still require the phrase.
-
-Recovery approves new PCR states on the **same TPM**. It cannot recover from
-TPM loss, replacement, clearing, or loss of the necessary credential blobs.
-
-Each PCR-bound credential has its own TPM recovery authority with a random authorization
-secret. Argon2id (64 MiB, three passes) and AES-256-GCM encrypt that secret; the
-database stores neither plaintext authorization values nor derived encryption
-keys. Policy updates require the supplied passphrase, even when registration is
-unlocked. Passphrase rotation atomically re-encrypts all recovery slots without
-changing the passkeys. `update-passphrase` remains an alias for setting/rotating
-the phrase. Recovery tokens track `last_used` and `used_count` for successful
-PCR-policy updates; ordinary assertions and phrase rotation do not count.
-See [`docs/credentials.md`](docs/credentials.md).
+Migration policy authorizes a new PCR state on the same TPM; it cannot recover
+from TPM loss, replacement, clearing, or loss of necessary credential blobs.
+The migration private key is passphrase-protected; config integrity is MACed.
+Passphrase changes preserve credentials and are committed atomically. See
+[`docs/credentials.md`](docs/credentials.md).
 
 Useful flags:
 
@@ -173,7 +151,7 @@ Useful flags:
 ## Features
 
 - TPM-backed signing keys and PCR policy bindings.
-- Recovery slots stored separately from the primary credential metadata.
+- Per-credential TPM migration authorities stored separately from primary key material.
 - Sign counter persistence.
 
 ## Protocol Compliance
@@ -183,7 +161,7 @@ The maintained CTAP 2.2 wire-format checklist and audit status are in
 
 Host approval supplies user presence, not built-in user verification. FIDO
 client PINs (Protocols 2 and 1) provide PIN verification and are separate from
-the PCR recovery phrase. Without a PIN, discoverable enrollment can use presence
+the migration passphrase. Without a PIN, discoverable enrollment can use presence
 alone; after PIN setup, it requires a valid PIN token. PIN-state storage still
 needs TPM-equivalent protection before a full conformance claim is possible.
 
@@ -197,13 +175,12 @@ needs TPM-equivalent protection before a full conformance claim is possible.
 
 - Experimental only. Every commit/release may break credential compatibility.
   Schema changes use new SQL migrations and may delete keys. In particular,
-  migration `20261028060000` deletes old credentials and insecure recovery
-  configuration, and `20261028070000` deletes records using the legacy owner
-  format while removing the owner field. Websites will need new credentials
-  registered.
+  migration `20261029090000` deletes old credentials and old migration/default-policy
+  configuration that cannot safely be converted, while preserving client PIN
+  state. Websites will need replacement credentials registered.
 - Deleted database records are not a secure erase of old files or backups, nor
   do they revoke old registrations at websites. Remove old website credentials
-  if their insecure recovery material may have been exposed. Passphrase rotation
+  if old credential material may have been exposed. Passphrase rotation
   does not provide protection against database rollback.
 - No FIDO certification claims.
 - No production security claims for the development store.

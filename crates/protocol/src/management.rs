@@ -7,20 +7,42 @@ use zeroize::Zeroizing;
 pub enum ManagementRequest {
     #[serde(rename = "list-credentials")]
     ListCredentials,
-    #[serde(rename = "update-passphrase")]
-    UpdatePassphrase {
+    #[serde(rename = "credential-info")]
+    CredentialInfo { local_id: u64 },
+    #[serde(rename = "setup-migration")]
+    SetupMigration {
+        #[serde(deserialize_with = "secret")]
+        passphrase: Zeroizing<String>,
+        /// `None` disables PCR binding; `Some` selects SHA-256 PCRs.
+        pcr_indices: Option<Vec<u32>>,
+    },
+    #[serde(rename = "migrate-credentials")]
+    MigrateCredentials {
+        #[serde(deserialize_with = "secret")]
+        passphrase: Zeroizing<String>,
+        pcr_indices: Option<Vec<u32>>,
+        credential_ids: Vec<String>,
+        /// Select the current credential set on the daemon, not a client snapshot.
+        #[serde(default)]
+        all_credentials: bool,
+        /// Change the default only after every selected credential succeeds.
+        #[serde(default)]
+        default_policy_change: DefaultPcrPolicyChange,
+    },
+    #[serde(rename = "update-migration-passphrase")]
+    UpdateMigrationPassphrase {
         #[serde(default, deserialize_with = "optional_secret")]
         old_passphrase: Option<Zeroizing<String>>,
         #[serde(deserialize_with = "secret")]
         new_passphrase: Zeroizing<String>,
     },
-    #[serde(rename = "unlock-recovery")]
-    UnlockRecovery {
+    #[serde(rename = "verify-migration-passphrase")]
+    VerifyMigrationPassphrase {
         #[serde(deserialize_with = "secret")]
         passphrase: Zeroizing<String>,
     },
-    #[serde(rename = "update-pcr-reference")]
-    UpdatePcrReference {
+    #[serde(rename = "migrate-pcr-reference")]
+    MigratePcrReference {
         #[serde(deserialize_with = "secret")]
         passphrase: Zeroizing<String>,
     },
@@ -31,6 +53,9 @@ pub enum ManagementRequest {
         pcr_indices: Vec<u32>,
         #[serde(flatten)]
         credential_target: CredentialTarget,
+        /// Change the default only after every selected credential succeeds.
+        #[serde(default)]
+        default_policy_change: DefaultPcrPolicyChange,
     },
     #[serde(rename = "set-default-pcr-policy")]
     SetDefaultPcrPolicy { pcr_indices: Vec<u32> },
@@ -88,9 +113,12 @@ impl ManagementRequest {
     pub fn operation(&self) -> &'static str {
         match self {
             Self::ListCredentials => "list-credentials",
-            Self::UpdatePassphrase { .. } => "update-passphrase",
-            Self::UnlockRecovery { .. } => "unlock-recovery",
-            Self::UpdatePcrReference { .. } => "update-pcr-reference",
+            Self::CredentialInfo { .. } => "credential-info",
+            Self::SetupMigration { .. } => "setup-migration",
+            Self::MigrateCredentials { .. } => "migrate-credentials",
+            Self::UpdateMigrationPassphrase { .. } => "update-migration-passphrase",
+            Self::VerifyMigrationPassphrase { .. } => "verify-migration-passphrase",
+            Self::MigratePcrReference { .. } => "migrate-pcr-reference",
             Self::UpdatePcrPolicy { .. } => "update-pcr-policy",
             Self::SetDefaultPcrPolicy { .. } => "set-default-pcr-policy",
             Self::DisableDefaultPcrPolicy => "disable-default-pcr-policy",
@@ -105,6 +133,16 @@ impl std::fmt::Debug for ManagementRequest {
             .field("operation", &self.operation())
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub enum DefaultPcrPolicyChange {
+    #[default]
+    Keep,
+    Set {
+        pcr_indices: Vec<u32>,
+    },
+    Disable,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

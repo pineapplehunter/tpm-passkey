@@ -171,11 +171,11 @@ impl Tpm {
         self.create_credential_key_with_auth(None)
     }
 
-    /// A distinct TPM recovery authority with a random authorization value.
-    /// The caller must encrypt that value before persisting any recovery data.
-    pub fn create_recovery_key(&mut self) -> Result<TpmCredential> {
+    /// A distinct TPM migration authority with a random authorization value.
+    /// The caller must encrypt that value before persisting any migration data.
+    pub fn create_migration_authority(&mut self) -> Result<TpmCredential> {
         let mut auth = Zeroizing::new(vec![0; 32]);
-        getrandom::fill(&mut auth).wrap_err("generating TPM recovery authorization")?;
+        getrandom::fill(&mut auth).wrap_err("generating TPM migration authorization")?;
         self.create_credential_key_with_auth(Some(&auth))
     }
 
@@ -275,7 +275,7 @@ impl Tpm {
         hasher.finalize().to_vec()
     }
 
-    pub fn sign_recovery_policy(
+    pub fn sign_migration_policy(
         &mut self,
         authority: &TpmCredential,
         approved_policy: &[u8],
@@ -319,6 +319,73 @@ impl Tpm {
             .wrap_err("marshalling approved PCR policy signature")
     }
 
+    /// Create a PolicyAuthorize-protected baseline with no PCR constraints.
+    /// The approved policy is the initial (all-zero) policy-session digest; the
+    /// resulting key policy still restricts use to TPM2_Sign.
+    pub fn create_authorized_baseline_policy(
+        &mut self,
+        authority: &TpmCredential,
+        policy_ref: &[u8],
+    ) -> Result<PcrPolicyBinding> {
+        let approved_policy = vec![0u8; 32];
+        let signature_bytes =
+            self.sign_migration_policy(authority, &approved_policy, policy_ref)?;
+        let signature = Signature::unmarshall(&signature_bytes)?;
+        let parent = self.create_storage_parent()?;
+        let key_handle = self.context.execute_with_nullauth_session(|context| {
+            context.load(
+                parent,
+                Private::try_from(authority.private.clone())?,
+                Public::unmarshall(&authority.public)?,
+            )
+        })?;
+        let (_, authority_name, _) = self.context.read_public(key_handle)?;
+        let authority_name_bytes = authority_name.value().to_vec();
+        if let Some(auth_value) = &authority.auth_value {
+            self.context
+                .tr_set_auth(key_handle.into(), Auth::try_from(auth_value.as_slice())?)?;
+        }
+        let to_sign = Self::policy_with_ref_hash(&approved_policy, policy_ref);
+        let ticket = self.context.execute_without_session(|context| {
+            context.verify_signature(key_handle, Digest::try_from(to_sign)?, signature)
+        })?;
+        self.context.flush_context(key_handle.into())?;
+        self.context.flush_context(parent.into())?;
+
+        let session = self
+            .context
+            .start_auth_session(
+                None,
+                None,
+                None,
+                SessionType::Trial,
+                tss_esapi::structures::SymmetricDefinition::AES_256_CFB,
+                HashingAlgorithm::Sha256,
+            )?
+            .ok_or_else(|| eyre!("TPM returned no trial policy session"))?;
+        let session = PolicySession::try_from(session)?;
+        self.context.policy_authorize(
+            session,
+            Digest::try_from(approved_policy)?,
+            Nonce::try_from(policy_ref.to_vec())?,
+            &Name::try_from(authority_name_bytes.clone())?,
+            ticket,
+        )?;
+        self.context
+            .policy_command_code(session, CommandCode::Sign)?;
+        let final_digest = self.context.policy_get_digest(session)?;
+        self.context
+            .flush_context(SessionHandle::from(session).into())?;
+
+        Ok(PcrPolicyBinding {
+            selection: "none".to_owned(),
+            digest: final_digest.value().to_vec(),
+            policy_ref: Some(policy_ref.to_vec()),
+            authority_name: Some(authority_name_bytes),
+            authority_signature: Some(signature_bytes),
+        })
+    }
+
     pub fn create_authorized_policy(
         &mut self,
         approved: &PcrPolicyBinding,
@@ -327,7 +394,7 @@ impl Tpm {
     ) -> Result<PcrPolicyBinding> {
         let policy_digest = &approved.digest;
         let to_sign = Self::policy_with_ref_hash(policy_digest, policy_ref);
-        let signature_bytes = self.sign_recovery_policy(authority, policy_digest, policy_ref)?;
+        let signature_bytes = self.sign_migration_policy(authority, policy_digest, policy_ref)?;
         let signature = Signature::unmarshall(&signature_bytes)?;
         let parent = self.create_storage_parent()?;
         let key_handle = self.context.execute_with_nullauth_session(|context| {
@@ -572,8 +639,13 @@ impl Tpm {
             policy.and_then(|policy| policy.authority_name.as_ref()),
             policy.and_then(|policy| policy.authority_signature.as_ref()),
         ) {
+            let no_pcr = policy.is_some_and(|binding| binding.selection == "none");
             let selection_list = self.pcr_selection_list.clone();
-            let current_digest = self.current_pcr_digest(&selection_list)?;
+            let current_digest = if no_pcr {
+                None
+            } else {
+                Some(self.current_pcr_digest(&selection_list)?)
+            };
             let policy_session = self
                 .context
                 .start_auth_session(
@@ -590,11 +662,13 @@ impl Tpm {
                 context: &mut self.context as *mut Context,
                 session: policy_session,
             };
-            self.context.policy_pcr(
-                policy_session,
-                Digest::try_from(current_digest.clone())?,
-                selection_list,
-            )?;
+            if let Some(current_digest) = current_digest {
+                self.context.policy_pcr(
+                    policy_session,
+                    Digest::try_from(current_digest)?,
+                    selection_list,
+                )?;
+            }
             let approved_policy = self.context.policy_get_digest(policy_session)?;
             let authority_handle = self.context.execute_with_nullauth_session(|context| {
                 context.load(
@@ -609,7 +683,7 @@ impl Tpm {
             };
             let (_, actual_name, _) = self.context.read_public(authority_handle)?;
             if actual_name.value() != authority_name.as_slice() {
-                color_eyre::eyre::bail!("recovery authority name does not match the credential");
+                color_eyre::eyre::bail!("migration authority name does not match the credential");
             }
             log::debug!(
                 "policy_authorize: approved_policy={} hex={}, policy_ref={} bytes, key_name={} bytes, key_name_hex={}",
@@ -634,7 +708,7 @@ impl Tpm {
                         Signature::unmarshall(authority_signature)?,
                     )
                 })
-                .wrap_err("verifying PCR policy authority signature")?;
+                .wrap_err("verifying PolicyAuthorize authority signature")?;
             log::debug!(
                 "verify_signature ticket: tag={:?} hierarchy={:?} digest={} hex={}",
                 ticket.tag(),
@@ -661,6 +735,10 @@ impl Tpm {
                         validation.try_into()?,
                     )
                 })
+        } else if policy.is_some_and(|binding| binding.selection == "none") {
+            color_eyre::eyre::bail!(
+                "PCR-disabled policy binding is missing PolicyAuthorize authority metadata"
+            );
         } else if policy.is_some() {
             let selection_list = self.pcr_selection_list.clone();
             let current_digest = self.current_pcr_digest(&selection_list)?;
@@ -808,7 +886,7 @@ fn signing_key_public(policy: Option<&PcrPolicyBinding>) -> Result<Public> {
         .with_fixed_parent(true)
         .with_sensitive_data_origin(true)
         // Without a policy, allow the ordinary auth-value path (empty for
-        // unbound passkeys, random for recovery authorities). Policy-bound
+        // unbound passkeys, random for migration authorities). Policy-bound
         // passkeys must NOT have an auth-value bypass.
         .with_user_with_auth(policy.is_none())
         .with_decrypt(false)
@@ -956,6 +1034,20 @@ mod tests {
             assert_eq!(attributes.user_with_auth(), binding.is_none());
             assert_eq!(public.auth_policy().value().is_empty(), binding.is_none());
         }
+    }
+
+    #[test]
+    fn pcr_disabled_authorized_binding_has_policy_and_no_auth_bypass() {
+        let binding = PcrPolicyBinding {
+            selection: "none".into(),
+            digest: vec![0x42; 32],
+            policy_ref: Some(vec![1]),
+            authority_name: Some(vec![2]),
+            authority_signature: Some(vec![3]),
+        };
+        let public = signing_key_public(Some(&binding)).unwrap();
+        assert!(!public.object_attributes().user_with_auth());
+        assert_eq!(public.auth_policy().value(), binding.digest.as_slice());
     }
 
     #[test]

@@ -56,20 +56,16 @@ def mgmt_expect(command, script):
     return expect_command("tpm-passkey " + command, script)
 
 
-def set_recovery_phrase(new, old=""):
+def setup_migration(passphrase="test migration phrase", pcr_indices=None):
+    selection = " ".join(str(index) for index in (pcr_indices or []))
     return mgmt_expect(
-        "config set recovery-passphrase",
-        'expect "Enter current daemon passphrase (leave empty if not set yet): "; '
-        f'send "{old}\\r"; '
-        'expect "Enter new daemon passphrase: "; '
-        f'send "{new}\\r"; expect "Confirm passphrase: "; send "{new}\\r"; expect eof',
-    )
-
-
-def recover(phrase, command="update-pcr-reference"):
-    return mgmt_expect(
-        command,
-        f'expect "Enter recovery passphrase: "; send "{phrase}\\r"; expect eof',
+        "setup",
+        'expect "Choose PCR binding"; '
+        f'send "{selection}\\r"; '
+        'expect "Create migration passphrase: "; '
+        f'send "{passphrase}\\r"; '
+        'expect "Confirm passphrase: "; '
+        f'send "{passphrase}\\r"; expect eof',
     )
 
 

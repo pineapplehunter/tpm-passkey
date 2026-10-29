@@ -14,9 +14,9 @@
     <message>Read TPM-backed passkey configuration and credential metadata.</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>no</allow_active></defaults>
   </action>
-  <action id="io.github.pineapplehunter.tpm-passkey.manage-recovery">
-    <description>Manage passkey recovery</description>
-    <message>Authentication is required to change or unlock TPM-backed passkey recovery.</message>
+  <action id="io.github.pineapplehunter.tpm-passkey.manage-migration">
+    <description>Manage passkey migration</description>
+    <message>Authentication is required to change TPM-backed passkey migration configuration.</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>no</allow_active></defaults>
   </action>
   <action id="io.github.pineapplehunter.tpm-passkey.manage-settings">

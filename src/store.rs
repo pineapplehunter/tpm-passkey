@@ -4,6 +4,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Mutex, MutexGuard},
 };
 
 use color_eyre::{
@@ -22,7 +23,8 @@ use p256::PublicKey;
 use p256::elliptic_curve::sec1::ToSec1Point;
 
 use crate::{
-    recovery::{self, EncryptedSecret},
+    management::ManagementError,
+    migration_crypto::{self, MigrationConfig, MigrationEnvelope},
     tpm,
 };
 
@@ -31,9 +33,45 @@ type HmacSha256 = Hmac<Sha256>;
 pub const DEV_STORE_DIR: &str = ".tpm-passkey-store";
 const CREDENTIALS_DATABASE_FILE: &str = "credentials.sqlite";
 const HMAC_KEY_FILE: &str = "integrity.hmac-key";
+static CREDENTIAL_MUTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize configuration and registration without outliving a request's
+/// deadline while another management operation owns the lock.
+pub fn credential_mutation_guard_until(
+    deadline: std::time::Instant,
+) -> Result<MutexGuard<'static, ()>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ManagementError::Timeout.into());
+        }
+        match CREDENTIAL_MUTATION_LOCK.try_lock() {
+            Ok(guard) if std::time::Instant::now() < deadline => return Ok(guard),
+            Ok(_) => return Err(ManagementError::Timeout.into()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(eyre!("credential mutation lock poisoned"));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+            }
+        }
+    }
+}
+
+/// The TPM owner thread must never block on this lock: management may hold it
+/// while waiting for a command on that same thread.
+pub fn try_credential_mutation_guard() -> Result<MutexGuard<'static, ()>> {
+    CREDENTIAL_MUTATION_LOCK
+        .try_lock()
+        .map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => eyre!("credential mutation already in progress"),
+            std::sync::TryLockError::Poisoned(_) => eyre!("credential mutation lock poisoned"),
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCredentialSummary {
+    pub local_id: i64,
     pub id: Vec<u8>,
     pub rp_id: String,
     pub user_name: Option<String>,
@@ -52,7 +90,7 @@ pub struct StoredCtap2Credential {
     pub user_display_name: Option<String>,
     pub key: StoredTpmKey,
     pub policy: Option<StoredPcrPolicy>,
-    pub recovery: Option<StoredRecoverySlot>,
+    pub migration_authority: Option<StoredMigrationAuthority>,
     pub sign_count: u32,
     pub integrity_mac: Option<Vec<u8>>,
 }
@@ -79,9 +117,9 @@ impl StoredPcrPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredRecoverySlot {
+pub struct StoredMigrationAuthority {
     pub label: Option<String>,
-    pub encrypted_auth: EncryptedSecret,
+    pub encrypted_auth: MigrationEnvelope,
     pub key: StoredTpmKey,
     pub last_used: Option<String>,
     pub used_count: u64,
@@ -95,7 +133,7 @@ pub struct StoredTpmKey {
     pub public_key_y: Vec<u8>,
 }
 
-impl StoredRecoverySlot {
+impl StoredMigrationAuthority {
     pub fn authority(&self) -> tpm::TpmCredential {
         tpm::TpmCredential {
             private: self.key.private.clone(),
@@ -110,13 +148,14 @@ impl StoredRecoverySlot {
         &self,
         credential_id: &[u8],
         policy_ref: &[u8],
+        config: &MigrationConfig,
         passphrase: &str,
     ) -> Result<tpm::TpmCredential> {
-        let aad = recovery::credential_aad(credential_id, &self.key.public, policy_ref);
-        let auth = self.encrypted_auth.decrypt(passphrase, &aad)?;
-        if auth.len() != 32 {
-            return Err(eyre!("invalid recovery authorization length"));
-        }
+        let context =
+            migration_crypto::authorization_context(credential_id, &self.key.public, policy_ref)
+                .map_err(|error| eyre!("invalid migration authorization context: {error}"))?;
+        let auth = migration_crypto::decrypt(config, passphrase, &self.encrypted_auth, &context)
+            .map_err(|_| ManagementError::Authentication)?;
         let mut authority = self.authority();
         authority.auth_value = Some(auth);
         Ok(authority)
@@ -225,7 +264,7 @@ pub fn update_ctap2_sign_count_in_dir(
     ))
 }
 
-/// Commit a recovery-approved policy and its token usage together.
+/// Commit a migration-authorized policy and its token usage together.
 pub fn update_ctap2_policy_in_dir(
     dir: impl AsRef<Path>,
     credential_id: &[u8],
@@ -334,62 +373,121 @@ pub fn clear_default_pcr_policy(dir: impl AsRef<Path>) -> Result<()> {
     })
 }
 
-pub fn load_recovery_config(dir: impl AsRef<Path>) -> Result<Option<EncryptedSecret>> {
+/// Persisted passphrase-encrypted migration key plus a same-host integrity MAC.
+/// The MAC detects config-only edits while `integrity.hmac-key` remains trusted;
+/// it does not defend against root or simultaneous database/key replacement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthenticatedMigrationConfig {
+    config: MigrationConfig,
+    mac: Vec<u8>,
+}
+
+pub fn load_migration_config(dir: impl AsRef<Path>) -> Result<Option<MigrationConfig>> {
     block_on_store(async {
         let pool = open_database(dir.as_ref()).await?;
-        let row = sqlx::query!("SELECT value FROM daemon_config WHERE key = 'recovery_encryption'")
+        let row = sqlx::query("SELECT value FROM daemon_config WHERE key = 'migration_encryption'")
             .fetch_optional(&pool)
             .await?;
-        row.map(|row| {
-            ciborium::from_reader(row.value.as_slice())
-                .wrap_err("decoding recovery encryption configuration")
-        })
-        .transpose()
+        let Some(row) = row else { return Ok(None) };
+        let bytes: Vec<u8> = row.try_get("value")?;
+        if bytes.len() > 8192 {
+            return Err(ManagementError::Integrity.into());
+        }
+        let stored: AuthenticatedMigrationConfig =
+            ciborium::from_reader(bytes.as_slice()).map_err(|_| ManagementError::Integrity)?;
+        let hmac_key = read_hmac_key(dir.as_ref()).map_err(|_| ManagementError::Integrity)?;
+        let expected = migration_config_mac(&hmac_key, &stored.config)?;
+        if !constant_time_equal(&expected, &stored.mac) {
+            return Err(ManagementError::Integrity.into());
+        }
+        Ok(Some(stored.config))
     })
+}
+
+pub fn save_migration_config(dir: impl AsRef<Path>, config: &MigrationConfig) -> Result<()> {
+    block_on_store(save_migration_setup_async(
+        dir.as_ref(),
+        config,
+        None,
+        false,
+    ))
+}
+
+pub fn save_migration_setup(
+    dir: impl AsRef<Path>,
+    config: &MigrationConfig,
+    pcr_indices: Option<&[u32]>,
+) -> Result<()> {
+    if let Some(indices) = pcr_indices {
+        tpm::pcr_selection_for_indices(indices)?;
+    }
+    block_on_store(save_migration_setup_async(
+        dir.as_ref(),
+        config,
+        pcr_indices,
+        true,
+    ))
+}
+
+async fn save_migration_setup_async(
+    dir: &Path,
+    config: &MigrationConfig,
+    pcr_indices: Option<&[u32]>,
+    update_default: bool,
+) -> Result<()> {
+    let pool = open_database(dir).await?;
+    let hmac_key = load_or_generate_hmac_key(dir)?;
+    let stored = AuthenticatedMigrationConfig {
+        config: config.clone(),
+        mac: migration_config_mac(&hmac_key, config)?,
+    };
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&stored, &mut bytes).wrap_err("encoding migration key configuration")?;
+    let mut tx = pool.begin().await?;
+    if update_default {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM daemon_config WHERE key = 'migration_encryption'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if exists != 0 {
+            return Err(ManagementError::AlreadyConfigured.into());
+        }
+    }
+    sqlx::query("INSERT INTO daemon_config (key, value) VALUES ('migration_encryption', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP")
+        .bind(bytes)
+        .execute(&mut *tx)
+        .await?;
+    if update_default {
+        if let Some(indices) = pcr_indices {
+            let mut blob = Vec::new();
+            ciborium::into_writer(indices, &mut blob)?;
+            sqlx::query("INSERT INTO daemon_config (key, value) VALUES ('default_pcr_policy', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP")
+                .bind(blob)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM daemon_config WHERE key = 'default_pcr_policy'")
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+fn migration_config_mac(key: &[u8; 32], config: &MigrationConfig) -> Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(config, &mut encoded).wrap_err("encoding migration config for MAC")?;
+    let mut mac = HmacSha256::new_from_slice(key).wrap_err("creating migration config MAC")?;
+    mac.update(b"tpm-passkey/migration-config-integrity/v1\0");
+    mac.update(&(encoded.len() as u64).to_be_bytes());
+    mac.update(&encoded);
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 /// Rotate all encrypted authorization values and their unlock configuration
 /// together. A missing slot or failed write rolls back the entire change.
-pub fn save_recovery_configuration(
-    dir: impl AsRef<Path>,
-    config: &EncryptedSecret,
-    slots: &[(Vec<u8>, EncryptedSecret)],
-) -> Result<()> {
-    block_on_store(async {
-        let pool = open_database(dir.as_ref()).await?;
-        let mut tx = pool.begin().await?;
-        for (id, encrypted) in slots {
-            let mut blob = Vec::new();
-            ciborium::into_writer(encrypted, &mut blob)
-                .wrap_err("encoding recovery authorization")?;
-            let result = sqlx::query!(
-                "UPDATE credential_tokens SET encrypted_auth = ?1, updated_at = CURRENT_TIMESTAMP \
-                 WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots \
-                                    WHERE credential_id = ?2 AND slot_kind = 'recovery') \
-                   AND token_type = 'passphrase'",
-                blob,
-                id,
-            )
-            .execute(&mut *tx)
-            .await?;
-            if result.rows_affected() != 1 {
-                return Err(eyre!("recovery slot not found during passphrase rotation"));
-            }
-        }
-        let mut blob = Vec::new();
-        ciborium::into_writer(config, &mut blob).wrap_err("encoding recovery configuration")?;
-        sqlx::query!(
-            "INSERT INTO daemon_config (key, value) VALUES ('recovery_encryption', ?1) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
-            blob,
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    })
-}
-
 async fn load_credential_summaries_async(dir: &Path) -> Result<Vec<StoredCredentialSummary>> {
     let database_path = credentials_database_path_in_dir(dir);
     if !database_path.exists() {
@@ -398,7 +496,7 @@ async fn load_credential_summaries_async(dir: &Path) -> Result<Vec<StoredCredent
 
     let pool = open_database(dir).await?;
     let rows = sqlx::query!(
-        "SELECT m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, \
+        "SELECT m.local_id, m.credential_id, m.rp_id, m.user_name, m.created_at, m.last_used_at, \
                 p.policy_selection \
          FROM credential_metadata m \
          JOIN credential_keyslots p \
@@ -417,6 +515,7 @@ async fn load_credential_summaries_async(dir: &Path) -> Result<Vec<StoredCredent
     Ok(rows
         .into_iter()
         .map(|row| StoredCredentialSummary {
+            local_id: row.local_id,
             id: row.credential_id,
             rp_id: row.rp_id,
             user_name: row.user_name,
@@ -439,14 +538,14 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                 m.sign_count, m.integrity_mac, \
                  p.policy_selection, p.policy_digest, p.policy_ref, p.authority_name, p.authority_signature, p.policy_version, \
                 p.tpm_key AS primary_tpm_key, p.public_key AS primary_public_key, \
-                r.slot_label AS recovery_label, \
-                r.tpm_key AS recovery_tpm_key, r.public_key AS recovery_public_key, \
+                r.slot_label AS migration_label, \
+                r.tpm_key AS migration_tpm_key, r.public_key AS migration_public_key, \
                  t.encrypted_auth, t.last_used AS token_last_used, t.used_count AS token_used_count \
          FROM credential_metadata m \
          LEFT JOIN credential_keyslots p \
            ON p.credential_id = m.credential_id AND p.slot_kind = 'primary' \
          LEFT JOIN credential_keyslots r \
-           ON r.credential_id = m.credential_id AND r.slot_kind = 'recovery' \
+           ON r.credential_id = m.credential_id AND r.slot_kind = 'migration' \
          LEFT JOIN credential_tokens t ON t.keyslot_id = r.keyslot_id \
          ORDER BY m.rp_id, m.credential_id",
     )
@@ -466,37 +565,40 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                 .try_get::<i64, _>("policy_version")?
                 .try_into()
                 .wrap_err("invalid policy_version")?;
-            let recovery_label: Option<String> = row.try_get("recovery_label")?;
+            let migration_label: Option<String> = row.try_get("migration_label")?;
             let primary_tpm_key: Vec<u8> = row.try_get("primary_tpm_key")?;
             let primary_public_key: String = row.try_get("primary_public_key")?;
-            let recovery_tpm_key: Option<Vec<u8>> = row.try_get("recovery_tpm_key")?;
-            let recovery_public_key: Option<String> = row.try_get("recovery_public_key")?;
+            let migration_tpm_key: Option<Vec<u8>> = row.try_get("migration_tpm_key")?;
+            let migration_public_key: Option<String> = row.try_get("migration_public_key")?;
             let encrypted_auth: Option<Vec<u8>> = row.try_get("encrypted_auth")?;
             let integrity_mac: Option<Vec<u8>> = row.try_get("integrity_mac")?;
 
             let primary_key = tpm_key_from_blob(&primary_tpm_key, &primary_public_key)?;
 
-            let recovery = match (
-                recovery_label,
-                recovery_tpm_key,
-                recovery_public_key,
+            let migration_authority = match (
+                migration_label,
+                migration_tpm_key,
+                migration_public_key,
                 encrypted_auth,
             ) {
                 (label, Some(tpm_key_data), Some(pub_key_data), Some(encrypted)) => {
+                    if encrypted.len() > 4096 {
+                        return Err(eyre!("migration envelope exceeds size limit"));
+                    }
                     let encrypted_auth = ciborium::from_reader(encrypted.as_slice())
-                        .wrap_err("decoding encrypted recovery authorization")?;
+                        .wrap_err("decoding encrypted migration authorization")?;
                     let key = tpm_key_from_blob(&tpm_key_data, &pub_key_data)?;
-                    Some(StoredRecoverySlot {
+                    Some(StoredMigrationAuthority {
                         label,
                         encrypted_auth,
                         key,
                         last_used: row.try_get("token_last_used")?,
                         used_count: u64::try_from(row.try_get::<i64, _>("token_used_count")?)
-                            .wrap_err("invalid recovery token use count")?,
+                            .wrap_err("invalid migration token use count")?,
                     })
                 }
                 (None, None, None, None) => None,
-                _ => return Err(eyre!("incomplete recovery slot")),
+                _ => return Err(eyre!("incomplete migration slot")),
             };
 
             let stored = StoredCtap2Credential {
@@ -518,7 +620,7 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
                     }),
                     _ => None,
                 },
-                recovery,
+                migration_authority,
                 sign_count: u32::try_from(sign_count)
                     .wrap_err_with(|| format!("invalid sign_count {}", sign_count))?,
                 integrity_mac,
@@ -527,11 +629,11 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
             let expected_mac = stored
                 .integrity_mac
                 .as_ref()
-                .ok_or_else(|| eyre!("credential is missing its integrity MAC"))?;
-            let key = read_hmac_key(dir)?;
+                .ok_or(ManagementError::Integrity)?;
+            let key = read_hmac_key(dir).map_err(|_| ManagementError::Integrity)?;
             let computed = compute_credential_mac(&key, &stored)?;
             if !constant_time_equal(&computed, expected_mac) {
-                return Err(eyre!("credential integrity check failed"));
+                return Err(ManagementError::Integrity.into());
             }
 
             Ok(stored)
@@ -546,33 +648,53 @@ async fn save_ctap2_credentials_async(
     let pool = open_database(dir).await?;
     let integrity_key = load_or_generate_hmac_key(dir)?;
     let mut tx = pool.begin().await.wrap_err("beginning store transaction")?;
-    let existing_timestamps: HashMap<Vec<u8>, (String, Option<String>)> =
-        sqlx::query!("SELECT credential_id, created_at, last_used_at FROM credential_metadata")
-            .fetch_all(&mut *tx)
-            .await
-            .wrap_err("loading existing credential timestamps")?
-            .into_iter()
-            .map(|row| (row.credential_id, (row.created_at, row.last_used_at)))
-            .collect();
+    let existing_timestamps: HashMap<Vec<u8>, (String, Option<String>, i64)> = sqlx::query!(
+        "SELECT credential_id, created_at, last_used_at, local_id FROM credential_metadata"
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .wrap_err("loading existing credential timestamps")?
+    .into_iter()
+    .map(|row| {
+        (
+            row.credential_id,
+            (row.created_at, row.last_used_at, row.local_id),
+        )
+    })
+    .collect();
 
     sqlx::query!("DELETE FROM credential_metadata")
         .execute(&mut *tx)
         .await
         .wrap_err("clearing credential rows")?;
 
+    let mut next_local_id = existing_timestamps
+        .values()
+        .map(|(_, _, local_id)| *local_id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
     for credential in credentials {
         let key = Some(compute_credential_mac(&integrity_key, credential)?);
 
-        let (registered_at, last_used_at) = existing_timestamps
+        let (registered_at, last_used_at, local_id) = existing_timestamps
             .get(&credential.id)
-            .map(|(registered_at, last_used_at)| {
-                (Some(registered_at.as_str()), last_used_at.as_deref())
+            .map(|(registered_at, last_used_at, local_id)| {
+                (
+                    Some(registered_at.as_str()),
+                    last_used_at.as_deref(),
+                    *local_id,
+                )
             })
-            .unwrap_or((None, None));
+            .unwrap_or_else(|| {
+                let id = next_local_id;
+                next_local_id = next_local_id.saturating_add(1);
+                (None, None, id)
+            });
         sqlx::query!(
             "INSERT INTO credential_metadata \
-             (credential_id, rp_id, discoverable, user_handle, user_name, user_display_name, sign_count, integrity_mac, created_at, last_used_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, CURRENT_TIMESTAMP), ?10)",
+             (credential_id, rp_id, discoverable, user_handle, user_name, user_display_name, sign_count, integrity_mac, created_at, last_used_at, local_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, CURRENT_TIMESTAMP), ?10, ?11)",
             &credential.id,
             &credential.rp_id,
             i64::from(credential.discoverable),
@@ -583,6 +705,7 @@ async fn save_ctap2_credentials_async(
             key.as_deref(),
             registered_at,
             last_used_at,
+            local_id,
         )
         .execute(&mut *tx)
         .await
@@ -608,41 +731,43 @@ async fn save_ctap2_credentials_async(
         .await
         .wrap_err_with(|| format!("saving primary keyslot for rp_id={}", credential.rp_id))?;
 
-        if let Some(recovery) = &credential.recovery {
-            let recovery_tpm_key_blob = tpm_key_to_blob(&recovery.key);
-            let recovery_public_key_blob =
-                sec1_encode_point(&recovery.key.public_key_x, &recovery.key.public_key_y);
-            let recovery_keyslot_id = sqlx::query(
+        if let Some(migration_authority) = &credential.migration_authority {
+            let migration_tpm_key_blob = tpm_key_to_blob(&migration_authority.key);
+            let migration_public_key_blob = sec1_encode_point(
+                &migration_authority.key.public_key_x,
+                &migration_authority.key.public_key_y,
+            );
+            let migration_keyslot_id = sqlx::query(
                 "INSERT INTO credential_keyslots \
                  (credential_id, slot_kind, slot_label, policy_selection, policy_digest, tpm_key, public_key) \
-                 VALUES (?1, 'recovery', ?2, NULL, NULL, ?3, ?4)",
+                 VALUES (?1, 'migration', ?2, NULL, NULL, ?3, ?4)",
             )
             .bind(&credential.id)
-            .bind(recovery.label.as_deref())
-            .bind(recovery_tpm_key_blob)
-            .bind(recovery_public_key_blob)
+            .bind(migration_authority.label.as_deref())
+            .bind(migration_tpm_key_blob)
+            .bind(migration_public_key_blob)
             .execute(&mut *tx)
             .await
-            .wrap_err_with(|| format!("saving recovery keyslot for rp_id={}", credential.rp_id))?
+            .wrap_err_with(|| format!("saving migration keyslot for rp_id={}", credential.rp_id))?
             .last_insert_rowid();
 
             let mut encrypted_auth = Vec::new();
-            ciborium::into_writer(&recovery.encrypted_auth, &mut encrypted_auth)
-                .wrap_err("encoding encrypted recovery authorization")?;
+            ciborium::into_writer(&migration_authority.encrypted_auth, &mut encrypted_auth)
+                .wrap_err("encoding encrypted migration authorization")?;
             sqlx::query!(
                 "INSERT INTO credential_tokens \
                  (keyslot_id, token_type, label, encrypted_auth, last_used, used_count) \
                  VALUES (?1, 'passphrase', ?2, ?3, ?4, ?5)",
-                recovery_keyslot_id,
-                recovery.label,
+                migration_keyslot_id,
+                migration_authority.label,
                 encrypted_auth,
-                recovery.last_used,
-                i64::try_from(recovery.used_count)
-                    .wrap_err("recovery token count exceeds SQLite range")?,
+                migration_authority.last_used,
+                i64::try_from(migration_authority.used_count)
+                    .wrap_err("migration token count exceeds SQLite range")?,
             )
             .execute(&mut *tx)
             .await
-            .wrap_err_with(|| format!("saving recovery token for rp_id={}", credential.rp_id))?;
+            .wrap_err_with(|| format!("saving migration token for rp_id={}", credential.rp_id))?;
         }
     }
 
@@ -710,16 +835,16 @@ async fn update_ctap2_policy_async(
         "UPDATE credential_tokens \
          SET last_used = CURRENT_TIMESTAMP, used_count = used_count + 1, updated_at = CURRENT_TIMESTAMP \
          WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots \
-                            WHERE credential_id = ?1 AND slot_kind = 'recovery') \
+                            WHERE credential_id = ?1 AND slot_kind = 'migration') \
            AND token_type = 'passphrase' AND used_count < 9223372036854775807 \
          RETURNING last_used, used_count",
         credential_id,
     ).fetch_optional(&mut *tx).await?
-        .ok_or_else(|| eyre!("recovery token missing or use count exhausted"))?;
+        .ok_or_else(|| eyre!("migration token missing or use count exhausted"))?;
     let last_used = usage
         .last_used
-        .ok_or_else(|| eyre!("missing recovery use timestamp"))?;
-    let used_count = u64::try_from(usage.used_count).wrap_err("invalid recovery use count")?;
+        .ok_or_else(|| eyre!("missing migration use timestamp"))?;
+    let used_count = u64::try_from(usage.used_count).wrap_err("invalid migration use count")?;
     tx.commit().await?;
     Ok((last_used, used_count))
 }
@@ -842,6 +967,24 @@ async fn open_database(dir: &Path) -> Result<SqlitePool> {
             )
         })?;
 
+    // This introspects migration metadata, which does not exist in a fresh DB.
+    let has_history: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    if has_history {
+        let upgraded: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = 20261029090000 AND success = 1)",
+        )
+        .fetch_one(&pool)
+        .await?;
+        if !upgraded {
+            log::warn!(
+                "applying destructive migration-key upgrade: existing credentials and migration/default-policy configuration will be deleted; client PIN state is preserved. Run tpm-passkey setup and re-register passkeys with sites afterward"
+            );
+        }
+    }
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -1111,6 +1254,51 @@ mod tests {
     }
 
     #[test]
+    fn local_integer_ids_are_persistent_and_monotonic() {
+        let dir = test_store_dir("local-credential-ids");
+        let first = test_credential(vec![1], "first.example", 0);
+        let second = test_credential(vec![2], "second.example", 0);
+        save_ctap2_credentials_to_dir(&dir, &[first.clone(), second.clone()]).unwrap();
+        let summaries = load_credential_summaries_from_dir(&dir).unwrap();
+        let first_id = summaries
+            .iter()
+            .find(|item| item.id == first.id)
+            .unwrap()
+            .local_id;
+        let second_id = summaries
+            .iter()
+            .find(|item| item.id == second.id)
+            .unwrap()
+            .local_id;
+        assert_ne!(first_id, second_id);
+
+        save_ctap2_credentials_to_dir(&dir, std::slice::from_ref(&second)).unwrap();
+        save_ctap2_credentials_to_dir(
+            &dir,
+            &[second, test_credential(vec![3], "third.example", 0)],
+        )
+        .unwrap();
+        let summaries = load_credential_summaries_from_dir(&dir).unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|item| item.id == vec![2])
+                .unwrap()
+                .local_id,
+            second_id
+        );
+        assert!(
+            summaries
+                .iter()
+                .find(|item| item.id == vec![3])
+                .unwrap()
+                .local_id
+                > second_id
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn missing_store_loads_empty_credentials() {
         let dir = test_store_dir("missing");
 
@@ -1143,14 +1331,21 @@ mod tests {
                 authority_signature: None,
                 policy_version: 1,
             }),
-            recovery: Some(StoredRecoverySlot {
+            migration_authority: Some(StoredMigrationAuthority {
                 label: Some("backup".to_owned()),
                 last_used: None,
                 used_count: 0,
-                encrypted_auth: recovery::UnlockedRecovery::new("round trip test phrase")
-                    .unwrap()
-                    .encrypt(&[17; 32], b"round-trip")
-                    .unwrap(),
+                encrypted_auth: {
+                    let config =
+                        migration_crypto::create_configuration("round trip phrase").unwrap();
+                    let context = migration_crypto::authorization_context(
+                        &[1, 2, 3, 4],
+                        &[20, 21],
+                        b"round-trip",
+                    )
+                    .unwrap();
+                    migration_crypto::encrypt(config.public_key(), &context, &[17; 32]).unwrap()
+                },
                 key: StoredTpmKey {
                     private: vec![18, 19],
                     public: vec![20, 21],
@@ -1195,7 +1390,7 @@ mod tests {
                 public_key_y: point_3().1,
             },
             policy: None,
-            recovery: None,
+            migration_authority: None,
             sign_count: 1,
             integrity_mac: None,
         };
@@ -1213,7 +1408,7 @@ mod tests {
                 public_key_y: point_4().1,
             },
             policy: None,
-            recovery: None,
+            migration_authority: None,
             sign_count: 2,
             integrity_mac: None,
         };
@@ -1307,120 +1502,115 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rotation_is_atomic_and_stores_only_ciphertext() {
-        let dir = test_store_dir("encrypted-recovery");
-        let old = recovery::UnlockedRecovery::new("old recovery phrase").unwrap();
-        let old_config = old.configuration().unwrap();
-        let new = recovery::UnlockedRecovery::new("new recovery phrase").unwrap();
-        let new_config = new.configuration().unwrap();
-        let secret = [0xa5; 32];
-        let mut credential = test_credential(vec![1], "example.com", 1);
+    fn migration_config_authentication_and_envelope_storage_fail_closed() {
+        let dir = test_store_dir("migration-config-auth");
+        let config = migration_crypto::create_configuration("migration test phrase").unwrap();
+        save_migration_config(&dir, &config).unwrap();
+        assert_eq!(load_migration_config(&dir).unwrap(), Some(config.clone()));
+        let credential = test_credential(vec![1, 2], "example.test", 0);
         let key = StoredTpmKey {
             private: vec![3],
             public: vec![4],
             public_key_x: point_5().0,
             public_key_y: point_5().1,
         };
-        let aad = recovery::credential_aad(&credential.id, &key.public, b"policy-ref");
-        let old_encrypted = old.encrypt(&secret, &aad).unwrap();
-        credential.recovery = Some(StoredRecoverySlot {
-            label: None,
-            key: key.clone(),
-            encrypted_auth: old_encrypted.clone(),
-            last_used: None,
-            used_count: 0,
-        });
-        save_ctap2_credentials_to_dir(
-            &dir,
-            &[
-                credential.clone(),
-                test_credential(vec![2], "example.com", 0),
-            ],
-        )
-        .unwrap();
-        save_recovery_configuration(&dir, &old_config, &[]).unwrap();
-        let new_encrypted = new.encrypt(&secret, &aad).unwrap();
-        // Updating one valid slot followed by a missing slot must roll back both
-        // the first slot and the configuration change.
-        assert!(
-            save_recovery_configuration(
-                &dir,
-                &new_config,
-                &[
-                    (credential.id.clone(), new_encrypted.clone()),
-                    (vec![99], new_encrypted.clone()),
-                ]
-            )
-            .is_err()
-        );
-        assert_eq!(load_recovery_config(&dir).unwrap(), Some(old_config));
-        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
-        assert_eq!(
-            loaded[0].recovery.as_ref().unwrap().encrypted_auth,
-            old_encrypted
-        );
-        assert_eq!(loaded[0].recovery.as_ref().unwrap().last_used, None);
-        assert_eq!(loaded[0].recovery.as_ref().unwrap().used_count, 0);
-        let policy = StoredPcrPolicy {
-            selection: "sha256:7".into(),
+        let context =
+            migration_crypto::authorization_context(&credential.id, &key.public, b"ref").unwrap();
+        let envelope =
+            migration_crypto::encrypt(config.public_key(), &context, &[0xa5; 32]).unwrap();
+        let mut stored = credential;
+        stored.policy = Some(StoredPcrPolicy {
+            selection: "none".into(),
             digest: vec![9; 32],
-            policy_ref: Some(b"policy-ref".to_vec()),
+            policy_ref: Some(b"ref".to_vec()),
             authority_name: Some(vec![8]),
             authority_signature: Some(vec![7]),
             policy_version: 1,
-        };
-        let (last_used, used_count) =
-            update_ctap2_policy_in_dir(&dir, &credential.id, &policy).unwrap();
-        assert!(!last_used.is_empty());
-        assert_eq!(used_count, 1);
-        let (_, used_count) = update_ctap2_policy_in_dir(&dir, &credential.id, &policy).unwrap();
-        assert_eq!(used_count, 2);
-        // A primary-slot write must roll back if its recovery token is missing.
-        assert!(update_ctap2_policy_in_dir(&dir, &[2], &policy).is_err());
+        });
+        stored.migration_authority = Some(StoredMigrationAuthority {
+            label: None,
+            key,
+            encrypted_auth: envelope,
+            last_used: None,
+            used_count: 0,
+        });
+        save_ctap2_credentials_to_dir(&dir, &[stored]).unwrap();
         let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
-        assert_eq!(loaded[1].policy, None);
-        // Normal assertions, full saves, and phrase rotation must not add uses
-        // or reset existing usage history.
-        update_ctap2_sign_count_in_dir(&dir, &credential.id, 3).unwrap();
-        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
-        save_ctap2_credentials_to_dir(&dir, &loaded).unwrap();
-        save_recovery_configuration(&dir, &new_config, &[(credential.id.clone(), new_encrypted)])
-            .unwrap();
-        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
-        let slot = loaded[0].recovery.as_ref().unwrap();
-        assert_eq!(slot.used_count, 2);
-        assert!(slot.last_used.is_some());
-        assert_eq!(slot.key, key);
-        assert!(
-            slot.unlock(&credential.id, b"policy-ref", "old recovery phrase")
-                .is_err()
-        );
         assert_eq!(
-            slot.unlock(&credential.id, b"policy-ref", "new recovery phrase")
+            loaded[0]
+                .migration_authority
+                .as_ref()
                 .unwrap()
-                .auth_value
-                .unwrap()
-                .as_slice(),
-            secret
+                .encrypted_auth
+                .ciphertext
+                .len(),
+            48
         );
-        assert_eq!(load_recovery_config(&dir).unwrap(), Some(new_config));
-        let serialized = tpm_key_to_blob(&slot.key);
-        let fields: ciborium::value::Value = ciborium::from_reader(serialized.as_slice()).unwrap();
-        let fields = fields.as_map().unwrap();
-        assert_eq!(fields.len(), 2);
+
+        block_on_store(async {
+            let pool = open_database(&dir).await?;
+            let row =
+                sqlx::query("SELECT value FROM daemon_config WHERE key = 'migration_encryption'")
+                    .fetch_one(&pool)
+                    .await?;
+            let bytes: Vec<u8> = row.try_get("value")?;
+            let mut tampered: AuthenticatedMigrationConfig =
+                ciborium::from_reader(bytes.as_slice())?;
+            tampered.config.public_key =
+                migration_crypto::create_configuration("other phrase")?.public_key;
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&tampered, &mut bytes)?;
+            sqlx::query("UPDATE daemon_config SET value = ?1 WHERE key = 'migration_encryption'")
+                .bind(bytes)
+                .execute(&pool)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
         assert!(
-            fields
-                .iter()
-                .all(|(key, _)| key.as_text() != Some("auth_value"))
+            load_migration_config(&dir)
+                .unwrap_err()
+                .to_string()
+                .contains("integrity validation")
         );
-        let database = fs::read(credentials_database_path_in_dir(&dir)).unwrap();
-        assert!(!database.windows(secret.len()).any(|bytes| bytes == secret));
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn encrypted_recovery_migration_discards_insecure_records() {
-        let dir = test_store_dir("legacy-recovery-migration");
+    fn migration_passphrase_rotation_preserves_public_key_and_authorization_envelopes() {
+        let dir = test_store_dir("migration-passphrase-rotation");
+        let old = migration_crypto::create_configuration("old migration phrase").unwrap();
+        save_migration_config(&dir, &old).unwrap();
+        let credential = test_credential(vec![1, 2], "example.test", 0);
+        let context =
+            migration_crypto::authorization_context(&credential.id, b"authority", b"ref").unwrap();
+        let envelope = migration_crypto::encrypt(old.public_key(), &context, &[0xa5; 32]).unwrap();
+        let rotated = migration_crypto::change_passphrase(
+            &old,
+            "old migration phrase",
+            "new migration phrase",
+        )
+        .unwrap();
+        assert_eq!(old.public_key, rotated.public_key);
+        save_migration_config(&dir, &rotated).unwrap();
+        let stored = load_migration_config(&dir).unwrap().unwrap();
+        assert_eq!(stored.public_key, old.public_key);
+        assert!(
+            migration_crypto::decrypt(&stored, "old migration phrase", &envelope, &context)
+                .is_err()
+        );
+        assert_eq!(
+            migration_crypto::decrypt(&stored, "new migration phrase", &envelope, &context)
+                .unwrap()
+                .as_slice(),
+            &[0xa5; 32]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn destructive_migration_discards_credentials_and_preserves_client_pin() {
+        let dir = test_store_dir("migration-redesign");
         fs::create_dir_all(&dir).unwrap();
         block_on_store(async {
             let options = SqliteConnectOptions::new()
@@ -1448,7 +1638,9 @@ mod tests {
                  INSERT INTO credential_tokens (keyslot_id, token_type, kdf_params) \
                  VALUES (1, 'passphrase', 'plaintext-equivalent-secret'); \
                  INSERT INTO daemon_config (key, value) VALUES ('daemon_passphrase', X'04'); \
-                 INSERT INTO daemon_config (key, value) VALUES ('default_pcr_policy', X'8107');",
+                 INSERT INTO daemon_config (key, value) VALUES ('default_pcr_policy', X'8107'); \
+                 INSERT INTO client_pin_state (state_id, pin_salt, pin_verifier, retries) \
+                 VALUES (1, zeroblob(32), zeroblob(32), 4);",
             )
             .execute(&pool)
             .await?;
@@ -1475,12 +1667,18 @@ mod tests {
                 "SELECT count(*) FROM sqlite_schema WHERE name IN ('credential_metadata_user_id_idx', 'credential_metadata_owner_rp_discoverable_idx')",
             ).fetch_one(&pool).await?;
             assert_eq!(owner_indexes, 0);
-            let default_policy: Vec<u8> = sqlx::query_scalar(
-                "SELECT value FROM daemon_config WHERE key = 'default_pcr_policy'",
+            let default_policy: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM daemon_config WHERE key = 'default_pcr_policy'",
             )
             .fetch_one(&pool)
             .await?;
-            assert_eq!(default_policy, vec![0x81, 7]);
+            assert_eq!(default_policy, 0);
+            let pin_retries: i64 = sqlx::query_scalar(
+                "SELECT retries FROM client_pin_state WHERE state_id = 1",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(pin_retries, 4, "migration must preserve client PIN state");
             // Migrations are recorded and can be safely checked again.
             migrations.run(&pool).await?;
             pool.close().await;
@@ -1488,6 +1686,57 @@ mod tests {
         })
         .unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migration_slot_label_rename_preserves_existing_authority_and_token_state() {
+        let dir = test_store_dir("migration-slot-label-rename");
+        fs::create_dir_all(&dir).unwrap();
+        block_on_store(async {
+            let options = SqliteConnectOptions::new()
+                .filename(credentials_database_path_in_dir(&dir))
+                .create_if_missing(true)
+                .foreign_keys(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await?;
+            let all = sqlx::migrate!("./migrations");
+            let prior = sqlx::migrate::Migrator::with_migrations(
+                all.iter()
+                    .filter(|migration| migration.version < 20261029100000)
+                    .cloned()
+                    .collect(),
+            );
+            prior.run(&pool).await?;
+            sqlx::raw_sql(
+                "INSERT INTO credential_metadata (credential_id, rp_id, user_handle, sign_count) \
+                 VALUES (X'01', 'migration.example', X'02', 0); \
+                 INSERT INTO credential_keyslots (credential_id, slot_kind, tpm_key, public_key) \
+                 VALUES (X'01', 'recovery', X'03', 'authority-public'); \
+                 INSERT INTO credential_tokens (keyslot_id, token_type, encrypted_auth, used_count) \
+                 VALUES (1, 'passphrase', X'0405', 3);",
+            )
+            .execute(&pool)
+            .await?;
+            all.run(&pool).await?;
+            let slot = sqlx::query("SELECT slot_kind FROM credential_keyslots WHERE credential_id = X'01'")
+                .fetch_one(&pool)
+                .await?;
+            let slot_kind: String = slot.try_get("slot_kind")?;
+            assert_eq!(slot_kind, "migration");
+            let token = sqlx::query("SELECT encrypted_auth, used_count FROM credential_tokens WHERE keyslot_id = 1")
+                .fetch_one(&pool)
+                .await?;
+            let encrypted_auth: Vec<u8> = token.try_get("encrypted_auth")?;
+            let used_count: i64 = token.try_get("used_count")?;
+            assert_eq!(encrypted_auth, vec![4, 5]);
+            assert_eq!(used_count, 3);
+            pool.close().await;
+            Ok(())
+        })
+        .unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1515,7 +1764,7 @@ mod tests {
                 public_key_y: point_4().1,
             },
             policy: None,
-            recovery: None,
+            migration_authority: None,
             sign_count,
             integrity_mac: None,
         }

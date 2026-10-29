@@ -3,6 +3,9 @@
 Each test directory contains `default.nix`, its `reason`, and any case-specific
 assets. Each is a separate `nixosTest` with a fresh VM/state directory; no case
 requires another case to have run first. The root `default.nix` registers them.
+Every enrollment scenario explicitly completes mandatory migration setup (the
+upgrade scenario first verifies that enrollment without setup fails). Transport-
+only discovery and approval tests that do not enroll need no migration key.
 
 | Directory / check suffix | Purpose |
 | --- | --- |
@@ -14,13 +17,14 @@ requires another case to have run first. The root `default.nix` registers them.
 | `pin-management` | libfido2 PIN setup/change/storage/deletion |
 | `factory-reset` | Credential invalidation and fresh PIN setup after reset |
 | `state-integrity` | Corrupt state, fail-closed loading, backup repair |
-| `approval-cancel` | Dialog cancellation and worker recovery |
+| `approval-cancel` | Dialog cancellation and worker restart |
 | `approval-lifecycle` | Fresh decisions and missing helper behavior |
 | `gtk-approval` | Real unprivileged GTK dialog and Escape denial on headless X11 |
-| `optional-pcr` | Opt-in binding, no retrofit, future-only disable |
+| `migration-rebind` | swtpm PolicyAuthorize baseline, passphrase rotation, disable/enable/rebind through serialized management |
+| `migration-reboot` | Persist a passkey and migration authority through reboot, then rebind changed PCR state |
+| `migration-upgrade` | Destructive legacy-format upgrade, exact PIN retention, mandatory fresh setup |
 | `signing-sessions` | Repeated policy signing without TPM handle exhaustion |
-| `recovery-rotation` | Multi-key phrase rotation, PCR update, token accounting |
-| `recovery-reboot` | Changed boot PCRs, persistent keys, explicit re-unlock |
+
 
 Shared files stay here:
 
@@ -29,7 +33,7 @@ Shared files stay here:
 - `approval-options.nix`: pure module-evaluation check for default enablement,
   systemd startup, opt-out, XDG autostart and manual startup. Protocol VMs
   explicitly disable automatic startup and select their own test agent.
-- `driver.py`: bounded login/startup, management/expect and recovery helpers.
+- `driver.py`: bounded login/startup, management/expect helpers.
 - `register.py`, `assert.py`: credential fixture creation and signature checks.
 - `agent.py`: **test-only** auto-answering agent with a simulated desktop session.
 - `tpm_test_bus.py`: sealed-FD management transport and agent readiness helpers.

@@ -167,9 +167,9 @@ impl PacketHandler {
                     }
                     WorkerCommand::CancelState => authenticator.cancel_pending(),
                     WorkerCommand::Tpm { command, response } => {
-                        let result = authenticator
-                            .handle_tpm_command(command)
-                            .map_err(|error| format!("{error}"));
+                        let result = authenticator.handle_tpm_command(command).map_err(|error| {
+                            crate::management::ManagementError::from_report(&error)
+                        });
                         let _ = response.send(result);
                     }
                 }

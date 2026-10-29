@@ -14,10 +14,7 @@ use color_eyre::eyre::WrapErr;
 use zeroize::Zeroizing;
 
 use crate::{
-    approval,
-    credential::Credential,
-    recovery::{self, UnlockedRecovery},
-    store, tpm,
+    approval, credential::Credential, management::ManagementError, migration_crypto, store, tpm,
 };
 use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, BlockModeEncrypt};
@@ -69,7 +66,6 @@ pub struct Authenticator {
     tpm_path: Option<PathBuf>,
     tpm: Option<tpm::Tpm>,
     approval: Box<dyn approval::UserApproval>,
-    recovery_unlock: Option<UnlockedRecovery>,
     credentials: Vec<Credential>,
     credential_load_failed: bool,
     pending_assertion: Option<PendingAssertion>,
@@ -174,7 +170,6 @@ impl Authenticator {
             tpm_path,
             tpm,
             approval,
-            recovery_unlock: None,
             credentials,
             credential_load_failed,
             pending_assertion: None,
@@ -350,7 +345,6 @@ impl Authenticator {
         })?;
         self.credentials.clear();
         self.credential_load_failed = false;
-        self.recovery_unlock = None;
         self.client_pin = None;
         self.client_pin_load_failed = false;
         self.consecutive_pin_mismatches = 0;
@@ -493,32 +487,37 @@ impl Authenticator {
             return Err(ErrorStatus::OperationDenied);
         }
 
-        let binding = self.pcr_enrollment()?;
+        let _mutation_guard = store::try_credential_mutation_guard().map_err(|error| {
+            log::warn!("failed to serialize registration with management updates: {error:?}");
+            ErrorStatus::OperationDenied
+        })?;
+        let (pcr_indices, migration_config) = self.pcr_enrollment()?;
         let Some(tpm) = self.ensure_tpm() else {
             log::warn!("cannot create CTAP2 credential without TPM context");
             return Err(ErrorStatus::OperationDenied);
         };
         let mut credential_id = vec![0u8; 32];
         fill_random(&mut credential_id);
-        // No configured selection means no PolicyPCR/PolicyAuthorize at all,
-        // not an empty selection passed through the PCR-policy machinery.
-        let (policy, recovery_key) = if let Some((indices, _)) = &binding {
-            let result = (|| -> color_eyre::Result<_> {
+        // Every credential is protected by PolicyAuthorize, including the
+        // PCR-disabled baseline. Enrollment never unlocks a passphrase: only
+        // the persistent public migration key is needed for the envelope.
+        let (policy, authority) = (|| -> color_eyre::Result<_> {
+            let authority = tpm.create_migration_authority()?;
+            let policy_ref = tpm::credential_policy_ref(&credential_id);
+            let policy = if let Some(indices) = &pcr_indices {
                 tpm.set_pcr_indices(indices)?;
-                let authority = tpm.create_recovery_key()?;
-                let pcr_policy = tpm.create_secure_boot_policy()?;
-                let policy_ref = tpm::credential_policy_ref(&credential_id);
-                let policy = tpm.create_authorized_policy(&pcr_policy, &authority, &policy_ref)?;
-                Ok((Some(policy), Some(authority)))
-            })();
-            result.map_err(|error| {
-                log::warn!("failed to create recoverable PCR policy: {error:?}");
-                ErrorStatus::OperationDenied
-            })?
-        } else {
-            (None, None)
-        };
-        let key = match tpm.create_credential_key_with_policy(policy.as_ref()) {
+                let approved = tpm.create_secure_boot_policy()?;
+                tpm.create_authorized_policy(&approved, &authority, &policy_ref)?
+            } else {
+                tpm.create_authorized_baseline_policy(&authority, &policy_ref)?
+            };
+            Ok((policy, authority))
+        })()
+        .map_err(|error| {
+            log::warn!("failed to create policy-authorized credential: {error:?}");
+            ErrorStatus::OperationDenied
+        })?;
+        let key = match tpm.create_credential_key_with_policy(Some(&policy)) {
             Ok(credential) => credential,
             Err(error) => {
                 log::warn!("failed to create TPM-backed CTAP2 credential key: {error:?}");
@@ -526,40 +525,37 @@ impl Authenticator {
             }
         };
         log::info!("created TPM-backed CTAP2 credential key");
-        let recovery = match (recovery_key, binding) {
-            (Some(authority), Some((_, unlocked))) => {
-                let aad = recovery::credential_aad(
-                    &credential_id,
-                    &authority.public,
-                    policy
-                        .as_ref()
-                        .and_then(|policy| policy.policy_ref.as_deref())
-                        .expect("authorized policyRef"),
-                );
-                let encrypted_auth = unlocked
-                    .encrypt(
-                        authority.auth_value.as_ref().expect("random recovery auth"),
-                        &aad,
-                    )
-                    .map_err(|error| {
-                        log::warn!("failed to encrypt recovery authorization: {error:?}");
-                        ErrorStatus::OperationDenied
-                    })?;
-                Some(store::StoredRecoverySlot {
-                    label: None,
-                    encrypted_auth,
-                    last_used: None,
-                    used_count: 0,
-                    key: store::StoredTpmKey {
-                        private: authority.private,
-                        public: authority.public,
-                        public_key_x: authority.public_key_x,
-                        public_key_y: authority.public_key_y,
-                    },
-                })
-            }
-            _ => None,
-        };
+        let policy_ref = policy.policy_ref.as_deref().expect("authorized policyRef");
+        let context =
+            migration_crypto::authorization_context(&credential_id, &authority.public, policy_ref)
+                .map_err(|error| {
+                    log::warn!("invalid migration envelope context: {error}");
+                    ErrorStatus::OperationDenied
+                })?;
+        let encrypted_auth = migration_crypto::encrypt(
+            migration_config.public_key(),
+            &context,
+            authority
+                .auth_value
+                .as_ref()
+                .expect("random migration authorization"),
+        )
+        .map_err(|error| {
+            log::warn!("failed to encrypt migration authorization: {error}");
+            ErrorStatus::OperationDenied
+        })?;
+        let migration_authority = Some(store::StoredMigrationAuthority {
+            label: None,
+            encrypted_auth,
+            last_used: None,
+            used_count: 0,
+            key: store::StoredTpmKey {
+                private: authority.private,
+                public: authority.public,
+                public_key_x: authority.public_key_x,
+                public_key_y: authority.public_key_y,
+            },
+        });
         let public_key = cose_credential_public_key(&key);
 
         let auth_data = make_auth_data(
@@ -586,7 +582,7 @@ impl Authenticator {
             user_name: user_name.map(str::to_owned),
             user_display_name: user_display_name.map(str::to_owned),
             key,
-            policy: policy.map(|policy| store::StoredPcrPolicy {
+            policy: Some(store::StoredPcrPolicy {
                 selection: policy.selection,
                 digest: policy.digest,
                 policy_ref: policy.policy_ref,
@@ -594,7 +590,7 @@ impl Authenticator {
                 authority_signature: policy.authority_signature,
                 policy_version: store::StoredPcrPolicy::current_version(),
             }),
-            recovery,
+            migration_authority,
             sign_count: 0,
         });
         if self.operation_is_cancelled() {
@@ -656,7 +652,7 @@ impl Authenticator {
         validate_credential_descriptor_list(allow_list, true)?;
 
         // Reload credentials from disk when running as daemon (tpm_path is set)
-        // to pick up management-side modifications (e.g., update-pcr-reference).
+        // to pick up management-side modifications (e.g., migrate-pcr-reference).
         if self.tpm_path.is_some() {
             self.reload_credentials()?;
         }
@@ -693,7 +689,7 @@ impl Authenticator {
                 credential.id.clone(),
                 credential.key.clone(),
                 credential.policy.clone(),
-                credential.recovery.clone(),
+                credential.migration_authority.clone(),
                 credential.rp_id.clone(),
                 sign_count,
             )
@@ -812,7 +808,7 @@ impl Authenticator {
         let rp_log = credential.rp_id.clone();
         let credential_key = credential.key.clone();
         let credential_policy = credential.policy.clone();
-        let credential_authority = credential.recovery.clone();
+        let credential_authority = credential.migration_authority.clone();
         let user = credential_user_entity(credential, pending.user_verified);
 
         let mut signed_data = auth_data.clone();
@@ -1421,32 +1417,23 @@ impl Authenticator {
 
     /// Snapshot only the defaults for this new credential. Existing credential
     /// policies are never inferred from or rewritten by enrollment settings.
-    fn pcr_enrollment(&self) -> Result<Option<(Vec<u32>, UnlockedRecovery)>, ErrorStatus> {
+    fn pcr_enrollment(
+        &self,
+    ) -> Result<(Option<Vec<u32>>, migration_crypto::MigrationConfig), ErrorStatus> {
         let indices = store::load_default_pcr_policy(&self.store_dir).map_err(|error| {
-            log::warn!("failed to load default PCR policy: {error:?}");
+            log::warn!("failed to load default migration policy: {error:?}");
             ErrorStatus::OperationDenied
         })?;
-        let Some(indices) = indices else {
-            return Ok(None);
-        };
-        let config = store::load_recovery_config(&self.store_dir)
+        let config = store::load_migration_config(&self.store_dir)
             .map_err(|error| {
-                log::warn!("failed to load recovery configuration: {error:?}");
+                log::warn!("migration configuration authentication failed closed: {error:?}");
                 ErrorStatus::OperationDenied
             })?
             .ok_or_else(|| {
-                log::warn!("PCR binding requires a configured recovery passphrase");
+                log::warn!("migration setup is required before credential registration");
                 ErrorStatus::OperationDenied
             })?;
-        let unlocked = self
-            .recovery_unlock
-            .as_ref()
-            .filter(|unlocked| unlocked.matches_configuration(&config))
-            .ok_or_else(|| {
-                log::warn!("PCR-bound enrollment is locked; run config unlock-recovery");
-                ErrorStatus::OperationDenied
-            })?;
-        Ok(Some((indices, unlocked.clone())))
+        Ok((indices, config))
     }
 
     fn ensure_tpm(&mut self) -> Option<&mut tpm::Tpm> {
@@ -1624,49 +1611,19 @@ impl Authenticator {
         Ok(true)
     }
 
-    fn set_recovery_passphrase(
+    fn set_migration_passphrase(
         &mut self,
         old_passphrase: Option<&str>,
         new_passphrase: &str,
     ) -> color_eyre::Result<()> {
-        let config = store::load_recovery_config(&self.store_dir)?;
-        let old_unlock = config
-            .as_ref()
-            .map(|config| {
-                let passphrase = old_passphrase.ok_or_else(|| {
-                    color_eyre::eyre::eyre!("provide the current recovery passphrase to change it")
-                })?;
-                UnlockedRecovery::unlock(config, passphrase)
-            })
-            .transpose()?;
-        let new_unlock = UnlockedRecovery::new(new_passphrase)?;
-        let mut credentials = store::load_ctap2_credentials_from_dir(&self.store_dir)?;
-        let mut slots = Vec::new();
-        for credential in &mut credentials {
-            let Some(slot) = &mut credential.recovery else {
-                continue;
-            };
-            let old_unlock = old_unlock.as_ref().ok_or_else(|| {
-                color_eyre::eyre::eyre!("recovery slot exists without encryption configuration")
-            })?;
-            let policy_ref = credential
-                .policy
-                .as_ref()
-                .and_then(|policy| policy.policy_ref.as_deref())
-                .ok_or_else(|| color_eyre::eyre::eyre!("recovery credential has no policyRef"))?;
-            let aad = recovery::credential_aad(&credential.id, &slot.key.public, policy_ref);
-            let secret = old_unlock.decrypt(&slot.encrypted_auth, &aad)?;
-            if secret.len() != 32 {
-                color_eyre::eyre::bail!("invalid recovery authorization length");
-            }
-            slot.encrypted_auth = new_unlock.encrypt(&secret, &aad)?;
-            slots.push((credential.id.clone(), slot.encrypted_auth.clone()));
-        }
-        store::save_recovery_configuration(&self.store_dir, &new_unlock.configuration()?, &slots)?;
-        self.recovery_unlock = Some(new_unlock);
-        // Registration uses this snapshot too; do not let a later save restore
-        // pre-rotation ciphertext from stale in-memory credentials.
-        self.credentials = credentials.into_iter().map(Credential::from).collect();
+        let config =
+            store::load_migration_config(&self.store_dir)?.ok_or(ManagementError::SetupRequired)?;
+        let old_passphrase = old_passphrase.ok_or(ManagementError::Authentication)?;
+        let changed = migration_crypto::change_passphrase(&config, old_passphrase, new_passphrase)
+            .map_err(|_| ManagementError::Authentication)?;
+        // Envelopes encrypt only the random authorization values to the public
+        // key, so rotating the private-key wrapping phrase leaves them intact.
+        store::save_migration_config(&self.store_dir, &changed)?;
         self.cancel_pending();
         Ok(())
     }
@@ -1677,9 +1634,7 @@ impl Authenticator {
         match command {
             TpmCommand::BeforeDeadline { deadline, command } => {
                 if Instant::now() >= deadline {
-                    return Err(color_eyre::eyre::eyre!(
-                        "management operation expired before execution"
-                    ));
+                    return Err(ManagementError::Timeout.into());
                 }
                 self.handle_tpm_command(*command)
             }
@@ -1698,22 +1653,29 @@ impl Authenticator {
                     .as_deref()
                     .ok_or_else(|| color_eyre::eyre::eyre!("credential has no policyRef"))?;
                 let authority_name = policy.authority_name.as_deref().ok_or_else(|| {
-                    color_eyre::eyre::eyre!("credential has no recovery authority")
+                    color_eyre::eyre::eyre!("credential has no migration authority")
                 })?;
-                let recovery = credential
-                    .recovery
+                let migration = credential
+                    .migration_authority
                     .as_ref()
-                    .ok_or_else(|| color_eyre::eyre::eyre!("credential has no recovery slot"))?;
+                    .ok_or_else(|| color_eyre::eyre::eyre!("credential has no migration slot"))?;
                 // Never use the enrollment unlock cache for policy changes.
-                let authority = recovery.unlock(&credential.id, policy_ref, &cmd.passphrase)?;
+                let config = store::load_migration_config(&self.store_dir)?
+                    .ok_or(ManagementError::SetupRequired)?;
+                let authority =
+                    migration.unlock(&credential.id, policy_ref, &config, &cmd.passphrase)?;
                 let tpm = self
                     .ensure_tpm()
                     .ok_or_else(|| color_eyre::eyre::eyre!("TPM not available"))?;
-                tpm.set_pcr_indices(&cmd.pcr_indices)
-                    .wrap_err("selecting PCRs for policy update")?;
-                let new_policy = tpm
-                    .update_authorized_policy(&authority, authority_name, policy_ref)
-                    .wrap_err("updating PCR policy via management TPM command")?;
+                let new_policy = if let Some(indices) = &cmd.pcr_indices {
+                    tpm.set_pcr_indices(indices)
+                        .wrap_err("selecting PCRs for policy update")?;
+                    tpm.update_authorized_policy(&authority, authority_name, policy_ref)
+                        .wrap_err("updating PCR policy via management TPM command")?
+                } else {
+                    tpm.create_authorized_baseline_policy(&authority, policy_ref)
+                        .wrap_err("disabling PCR binding via authorized baseline")?
+                };
                 let stored_policy = store::StoredPcrPolicy {
                     selection: new_policy.selection,
                     digest: new_policy.digest,
@@ -1729,14 +1691,14 @@ impl Authenticator {
                 )
                 .wrap_err("saving PCR policy after TPM command")?;
                 // A later full credential save must not restore the old policy
-                // or erase token usage from this successful recovery.
+                // or erase token usage from this successful migration.
                 if let Some(cached) = self
                     .credentials
                     .iter_mut()
                     .find(|c| c.id == cmd.credential_id)
                 {
                     cached.policy = Some(stored_policy);
-                    if let Some(slot) = &mut cached.recovery {
+                    if let Some(slot) = &mut cached.migration_authority {
                         slot.last_used = Some(last_used);
                         slot.used_count = used_count;
                     }
@@ -1747,20 +1709,20 @@ impl Authenticator {
                 );
                 Ok(())
             }
-            TpmCommand::SetRecoveryPassphrase {
+            TpmCommand::SetMigrationPassphrase {
                 old_passphrase,
                 new_passphrase,
-            } => self.set_recovery_passphrase(
+            } => self.set_migration_passphrase(
                 old_passphrase.as_deref().map(String::as_str),
                 &new_passphrase,
             ),
-            TpmCommand::UnlockRecovery { passphrase } => {
-                let config = store::load_recovery_config(&self.store_dir)?.ok_or_else(|| {
-                    color_eyre::eyre::eyre!("recovery passphrase is not configured")
-                })?;
-                // Clear an earlier unlock on failure, rather than retaining stale state.
-                self.recovery_unlock = None;
-                self.recovery_unlock = Some(UnlockedRecovery::unlock(&config, &passphrase)?);
+            TpmCommand::VerifyMigrationPassphrase { passphrase } => {
+                let config = store::load_migration_config(&self.store_dir)?
+                    .ok_or(ManagementError::SetupRequired)?;
+                migration_crypto::change_passphrase(&config, &passphrase, &passphrase)
+                    .map_err(|_| ManagementError::Authentication)?;
+                // Public-key enrollment does not require retaining an unlocked
+                // private key in the authenticator process.
                 Ok(())
             }
             TpmCommand::PcrDigestCheck(cmd) => {
@@ -1793,11 +1755,11 @@ pub enum TpmCommand {
         command: Box<TpmCommand>,
     },
     PcrPolicyUpdate(PcrPolicyUpdateCommand),
-    SetRecoveryPassphrase {
+    SetMigrationPassphrase {
         old_passphrase: Option<Zeroizing<String>>,
         new_passphrase: Zeroizing<String>,
     },
-    UnlockRecovery {
+    VerifyMigrationPassphrase {
         passphrase: Zeroizing<String>,
     },
     PcrDigestCheck(PcrDigestCheckCommand),
@@ -1806,7 +1768,7 @@ pub enum TpmCommand {
 /// Data needed to update a credential's PCR policy via `policy_authorize`.
 pub struct PcrPolicyUpdateCommand {
     pub credential_id: Vec<u8>,
-    pub pcr_indices: Vec<u32>,
+    pub pcr_indices: Option<Vec<u32>>,
     pub passphrase: Zeroizing<String>,
 }
 
@@ -1817,7 +1779,7 @@ pub struct PcrDigestCheckCommand {
 }
 
 /// Result type for a TPM command sent across threads.
-pub type TpmCmdResult = std::result::Result<(), String>;
+pub type TpmCmdResult = std::result::Result<(), ManagementError>;
 
 /// Channel sender for dispatching TPM commands from the management thread
 /// to the main daemon thread.  Each command carries a one-shot reply channel.
@@ -2434,7 +2396,7 @@ fn sign_credential(
     authenticator: &mut Authenticator,
     key: &tpm::TpmCredential,
     policy: Option<&store::StoredPcrPolicy>,
-    authority: Option<&store::StoredRecoverySlot>,
+    authority: Option<&store::StoredMigrationAuthority>,
     signed_data: &[u8],
 ) -> color_eyre::Result<Vec<u8>> {
     if let Some(policy) = policy
@@ -2445,10 +2407,7 @@ fn sign_credential(
             policy.policy_version
         ));
     }
-    let pcr_indices = policy
-        .map(|policy| tpm::pcr_indices_from_selection(&policy.selection))
-        .transpose()
-        .wrap_err("parsing stored PCR selection")?;
+    let pcr_indices = credential_pcr_indices(policy).wrap_err("parsing stored PCR selection")?;
     let Some(tpm) = authenticator.ensure_tpm() else {
         #[cfg(test)]
         {
@@ -2473,13 +2432,25 @@ fn sign_credential(
         authority_name: policy.authority_name.clone(),
         authority_signature: policy.authority_signature.clone(),
     });
-    let authority_key = authority.map(store::StoredRecoverySlot::authority);
+    let authority_key = authority.map(store::StoredMigrationAuthority::authority);
     tpm.sign_digest_with_policy(
         key,
         policy_binding.as_ref(),
         authority_key.as_ref(),
         &digest,
     )
+}
+
+fn credential_pcr_indices(
+    policy: Option<&store::StoredPcrPolicy>,
+) -> color_eyre::Result<Option<Vec<u32>>> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    if policy.selection == "none" {
+        return Ok(None);
+    }
+    tpm::pcr_indices_from_selection(&policy.selection).map(Some)
 }
 
 fn fill_random(bytes: &mut [u8]) {

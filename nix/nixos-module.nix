@@ -87,7 +87,7 @@ in
         var actions = [
           "io.github.pineapplehunter.tpm-passkey.register-agent",
           "io.github.pineapplehunter.tpm-passkey.read",
-          "io.github.pineapplehunter.tpm-passkey.manage-recovery",
+          "io.github.pineapplehunter.tpm-passkey.manage-migration",
           "io.github.pineapplehunter.tpm-passkey.manage-settings"
         ];
         if (actions.indexOf(action.id) < 0) return polkit.Result.NOT_HANDLED;

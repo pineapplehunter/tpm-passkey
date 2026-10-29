@@ -14,7 +14,7 @@ pub(crate) struct Credential {
     pub user_display_name: Option<String>,
     pub key: tpm::TpmCredential,
     pub policy: Option<store::StoredPcrPolicy>,
-    pub recovery: Option<store::StoredRecoverySlot>,
+    pub migration_authority: Option<store::StoredMigrationAuthority>,
     pub sign_count: u32,
 }
 
@@ -35,7 +35,7 @@ impl From<store::StoredCtap2Credential> for Credential {
                 auth_value: None,
             },
             policy: stored.policy,
-            recovery: stored.recovery,
+            migration_authority: stored.migration_authority,
             sign_count: stored.sign_count,
         }
     }
@@ -57,7 +57,7 @@ impl From<&Credential> for store::StoredCtap2Credential {
                 public_key_y: credential.key.public_key_y.clone(),
             },
             policy: credential.policy.clone(),
-            recovery: credential.recovery.clone(),
+            migration_authority: credential.migration_authority.clone(),
             sign_count: credential.sign_count,
             integrity_mac: None,
         }
@@ -84,7 +84,7 @@ mod tests {
                 public_key_y: vec![9; 32],
             },
             policy: None,
-            recovery: None,
+            migration_authority: None,
             sign_count: 42,
             integrity_mac: Some(vec![11; 32]),
         };

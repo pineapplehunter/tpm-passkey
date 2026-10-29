@@ -3,7 +3,9 @@ pub mod management;
 #[cfg(test)]
 mod tests;
 pub mod transport;
-pub use management::{CredentialTarget, ManagementRequest, ManagementResponse, value_get};
+pub use management::{
+    CredentialTarget, DefaultPcrPolicyChange, ManagementRequest, ManagementResponse, value_get,
+};
 pub use transport::send_request;
 
 pub const BUS_NAME: &str = "io.github.pineapplehunter.TpmPasskey1";
@@ -13,7 +15,7 @@ pub const AGENT_IFACE: &str = "io.github.pineapplehunter.TpmPasskey1.ApprovalAge
 pub const AGENT_PATH: &str = "/io/github/pineapplehunter/TpmPasskey1/ApprovalAgent";
 pub const ACTION_REGISTER: &str = "io.github.pineapplehunter.tpm-passkey.register-agent";
 pub const ACTION_READ: &str = "io.github.pineapplehunter.tpm-passkey.read";
-pub const ACTION_RECOVERY: &str = "io.github.pineapplehunter.tpm-passkey.manage-recovery";
+pub const ACTION_MIGRATION: &str = "io.github.pineapplehunter.tpm-passkey.manage-migration";
 pub const ACTION_SETTINGS: &str = "io.github.pineapplehunter.tpm-passkey.manage-settings";
 
 /// All strings are untrusted plain text, never markup. Empty strings mean absent.

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "UPDATE credential_tokens SET last_used = CURRENT_TIMESTAMP, used_count = used_count + 1, updated_at = CURRENT_TIMESTAMP WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots WHERE credential_id = ?1 AND slot_kind = 'recovery') AND token_type = 'passphrase' AND used_count < 9223372036854775807 RETURNING last_used, used_count",
+  "query": "UPDATE credential_tokens SET last_used = CURRENT_TIMESTAMP, used_count = used_count + 1, updated_at = CURRENT_TIMESTAMP WHERE keyslot_id = (SELECT keyslot_id FROM credential_keyslots WHERE credential_id = ?1 AND slot_kind = 'migration') AND token_type = 'passphrase' AND used_count < 9223372036854775807 RETURNING last_used, used_count",
   "describe": {
     "columns": [
       {
@@ -34,5 +34,5 @@
       false
     ]
   },
-  "hash": "469c1354a007b15c74c58680c5a606acb5c1c1a9ca39270eb37f797df608bba1"
+  "hash": "46f22847ae4b6ff1051c84795be256923137b8f311f43921de4384b8702f6062"
 }

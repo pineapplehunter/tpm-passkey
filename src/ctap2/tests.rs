@@ -6,6 +6,27 @@ use std::sync::{
 };
 
 #[test]
+fn disabled_credential_policy_has_no_pcr_selection_but_invalid_values_fail_closed() {
+    let mut policy = store::StoredPcrPolicy {
+        selection: "none".into(),
+        digest: vec![0; 32],
+        policy_ref: Some(vec![1]),
+        authority_name: Some(vec![2]),
+        authority_signature: Some(vec![3]),
+        policy_version: 1,
+    };
+    assert_eq!(credential_pcr_indices(Some(&policy)).unwrap(), None);
+    policy.selection = "sha256:7".into();
+    assert_eq!(
+        credential_pcr_indices(Some(&policy)).unwrap(),
+        Some(vec![7])
+    );
+    policy.selection = "none:7".into();
+    assert!(credential_pcr_indices(Some(&policy)).is_err());
+    assert_eq!(credential_pcr_indices(None).unwrap(), None);
+}
+
+#[test]
 fn get_info_uses_project_aaguid_and_algorithm_metadata() {
     let response = Authenticator::default().handle_cbor(&[Ctap2Command::GetInfo.into()]);
     let Value::Map(map) = ciborium::from_reader::<Value, _>(&response[1..]).expect("CBOR") else {
@@ -151,23 +172,66 @@ fn approval_outcomes_use_command_specific_ctap_statuses() {
 }
 
 #[test]
-fn expired_management_command_cannot_mutate_recovery_configuration() {
+fn expired_management_command_cannot_mutate_migration_configuration() {
     let mut auth = authenticator_with_credential("example.test", vec![1]);
     let error = auth
         .handle_tpm_command(TpmCommand::BeforeDeadline {
             deadline: Instant::now() - Duration::from_millis(1),
-            command: Box::new(TpmCommand::SetRecoveryPassphrase {
+            command: Box::new(TpmCommand::SetMigrationPassphrase {
                 old_passphrase: None,
                 new_passphrase: Zeroizing::new("must not be applied".into()),
             }),
         })
         .unwrap_err();
-    assert!(error.to_string().contains("expired"));
-    assert!(
-        store::load_recovery_config(&auth.store_dir)
-            .unwrap()
-            .is_none()
+    assert_eq!(
+        error.downcast_ref::<ManagementError>(),
+        Some(&ManagementError::Timeout)
     );
+    std::fs::remove_dir_all(auth.store_dir).unwrap();
+}
+
+#[test]
+fn migration_worker_authentication_errors_are_safe_and_rotation_retains_the_key() {
+    let mut auth = authenticator_with_credential("example.test", vec![1]);
+    let verify = |phrase: &str| TpmCommand::VerifyMigrationPassphrase {
+        passphrase: Zeroizing::new(phrase.to_owned()),
+    };
+    let error = auth
+        .handle_tpm_command(verify("missing setup"))
+        .unwrap_err();
+    assert_eq!(
+        ManagementError::from_report(&error),
+        ManagementError::SetupRequired
+    );
+    let config = migration_crypto::create_configuration("original phrase").unwrap();
+    store::save_migration_config(&auth.store_dir, &config).unwrap();
+    let error = auth
+        .handle_tpm_command(verify("PRIVATE WRONG PHRASE"))
+        .unwrap_err();
+    assert_eq!(
+        ManagementError::from_report(&error),
+        ManagementError::Authentication
+    );
+    assert!(!error.to_string().contains("PRIVATE WRONG PHRASE"));
+    auth.handle_tpm_command(TpmCommand::SetMigrationPassphrase {
+        old_passphrase: Some(Zeroizing::new("original phrase".into())),
+        new_passphrase: Zeroizing::new("rotated phrase".into()),
+    })
+    .unwrap();
+    let rotated = store::load_migration_config(&auth.store_dir)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.public_key, config.public_key);
+    assert_ne!(rotated.encrypted_scalar, config.encrypted_scalar);
+    assert_eq!(
+        ManagementError::from_report(
+            &auth
+                .handle_tpm_command(verify("original phrase"))
+                .unwrap_err()
+        ),
+        ManagementError::Authentication
+    );
+    auth.handle_tpm_command(verify("rotated phrase")).unwrap();
     std::fs::remove_dir_all(auth.store_dir).unwrap();
 }
 
@@ -1729,177 +1793,19 @@ fn credential_metadata_update_rolls_back_when_storage_fails() {
 }
 
 #[test]
-fn pcr_binding_is_explicit_requires_recovery_and_never_retrofits_credentials() {
-    let mut authenticator = authenticator_with_credential("example.com", vec![1]);
-    let dir = authenticator.store_dir.clone();
-    let mut existing = store::load_ctap2_credentials_from_dir(&dir).unwrap();
-    // A pre-existing bound credential may lack recovery. Keep it unchanged;
-    // only new bound enrollment must satisfy the new recovery requirement.
-    existing[0].policy = Some(store::StoredPcrPolicy {
-        selection: "sha256:7".into(),
-        digest: vec![1; 32],
-        policy_ref: None,
-        authority_name: None,
-        authority_signature: None,
-        policy_version: 1,
-    });
-    store::save_ctap2_credentials_to_dir(&dir, &existing).unwrap();
-    assert!(authenticator.pcr_enrollment().unwrap().is_none());
-    store::save_default_pcr_policy(&dir, &[7]).unwrap();
+fn registration_configuration_uses_public_key_without_unlocking_passphrase() {
+    let authenticator = authenticator_with_credential("example.com", vec![1]);
     assert!(matches!(
         authenticator.pcr_enrollment(),
         Err(ErrorStatus::OperationDenied)
     ));
-    assert_eq!(store::load_default_pcr_policy(&dir).unwrap(), Some(vec![7]));
-    store::clear_default_pcr_policy(&dir).unwrap();
-    authenticator
-        .set_recovery_passphrase(None, "optional PCR test phrase")
-        .unwrap();
-    assert!(
-        authenticator.pcr_enrollment().unwrap().is_none(),
-        "a phrase alone must not bind new keys"
-    );
-    store::save_default_pcr_policy(&dir, &[1, 7]).unwrap();
-    assert_eq!(
-        authenticator.pcr_enrollment().unwrap().unwrap().0,
-        vec![1, 7]
-    );
-    let restarted = Authenticator::new_with_approval(dir.clone(), None, Box::new(AlwaysApprove));
-    assert_eq!(
-        store::load_default_pcr_policy(&dir).unwrap(),
-        Some(vec![1, 7])
-    );
-    assert!(matches!(
-        restarted.pcr_enrollment(),
-        Err(ErrorStatus::OperationDenied)
-    ));
-    store::clear_default_pcr_policy(&dir).unwrap();
-    assert!(
-        restarted.pcr_enrollment().unwrap().is_none(),
-        "unbound enrollment must not need recovery unlock"
-    );
-    let unchanged = store::load_ctap2_credentials_from_dir(&dir).unwrap();
-    assert_eq!(unchanged[0].policy, existing[0].policy);
-    assert_eq!(unchanged[0].key, existing[0].key);
-    assert!(unchanged[0].recovery.is_none());
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn recovery_unlock_rotation_and_policy_updates_require_the_phrase() {
-    let mut authenticator = authenticator_with_credentials(
-        "example.com",
-        vec![
-            test_credential(vec![1], "example.com", 0),
-            test_credential(vec![2], "example.com", 0),
-        ],
-    );
-    authenticator
-        .set_recovery_passphrase(None, "first recovery phrase")
-        .unwrap();
-    let unlocked = authenticator.recovery_unlock.as_ref().unwrap();
-    let mut stored = store::load_ctap2_credentials_from_dir(&authenticator.store_dir).unwrap();
-    for credential in &mut stored {
-        let aad = recovery::credential_aad(&credential.id, &credential.key.public, b"policy-ref");
-        credential.recovery = Some(store::StoredRecoverySlot {
-            label: None,
-            last_used: None,
-            used_count: 0,
-            key: credential.key.clone(),
-            encrypted_auth: unlocked.encrypt(&[credential.id[0]; 32], &aad).unwrap(),
-        });
-        credential.policy = Some(store::StoredPcrPolicy {
-            selection: "sha256:7".to_owned(),
-            digest: vec![0; 32],
-            policy_ref: Some(b"policy-ref".to_vec()),
-            authority_name: Some(vec![1]),
-            authority_signature: Some(vec![2]),
-            policy_version: 1,
-        });
-    }
-    store::save_ctap2_credentials_to_dir(&authenticator.store_dir, &stored).unwrap();
-    let first_config = store::load_recovery_config(&authenticator.store_dir).unwrap();
-    assert!(
-        authenticator
-            .set_recovery_passphrase(Some("wrong"), "second recovery phrase")
-            .is_err()
-    );
-    assert_eq!(
-        store::load_recovery_config(&authenticator.store_dir).unwrap(),
-        first_config
-    );
-    authenticator
-        .handle_tpm_command(TpmCommand::SetRecoveryPassphrase {
-            old_passphrase: Some(Zeroizing::new("first recovery phrase".into())),
-            new_passphrase: Zeroizing::new("second recovery phrase".into()),
-        })
-        .unwrap();
-    for credential in store::load_ctap2_credentials_from_dir(&authenticator.store_dir).unwrap() {
-        let slot = credential.recovery.as_ref().unwrap();
-        assert_eq!(slot.used_count, 0);
-        assert_eq!(slot.last_used, None);
-        assert!(
-            slot.unlock(&credential.id, b"policy-ref", "first recovery phrase")
-                .is_err()
-        );
-        assert_eq!(
-            slot.unlock(&credential.id, b"policy-ref", "second recovery phrase")
-                .unwrap()
-                .auth_value
-                .unwrap()
-                .as_slice(),
-            [credential.id[0]; 32]
-        );
-    }
-    // A later registration save cannot restore old encrypted slots from memory.
-    authenticator.save_credentials().expect("save credentials");
-    let config = store::load_recovery_config(&authenticator.store_dir)
-        .unwrap()
-        .unwrap();
-    assert!(UnlockedRecovery::unlock(&config, "second recovery phrase").is_ok());
-    let mut restarted = Authenticator::new_with_approval(
-        authenticator.store_dir.clone(),
-        None,
-        Box::new(AlwaysApprove),
-    );
-    assert!(restarted.recovery_unlock.is_none());
-    assert!(
-        restarted
-            .handle_tpm_command(TpmCommand::UnlockRecovery {
-                passphrase: Zeroizing::new("wrong".into()),
-            })
-            .is_err()
-    );
-    assert!(restarted.recovery_unlock.is_none());
-    restarted
-        .handle_tpm_command(TpmCommand::UnlockRecovery {
-            passphrase: Zeroizing::new("second recovery phrase".into()),
-        })
-        .unwrap();
-    // Even with enrollment unlocked, policy updates must authenticate their own
-    // request phrase before touching a TPM.
-    let error = restarted
-        .handle_tpm_command(TpmCommand::PcrPolicyUpdate(PcrPolicyUpdateCommand {
-            credential_id: vec![1],
-            pcr_indices: vec![7],
-            passphrase: Zeroizing::new("wrong".into()),
-        }))
-        .unwrap_err();
-    assert!(error.to_string().contains("incorrect recovery passphrase"));
-    assert!(restarted.tpm.is_none());
-    let stored = store::load_ctap2_credentials_from_dir(&authenticator.store_dir).unwrap();
-    assert!(stored.iter().all(|credential| {
-        let slot = credential.recovery.as_ref().unwrap();
-        slot.used_count == 0 && slot.last_used.is_none()
-    }));
-    assert!(
-        restarted
-            .handle_tpm_command(TpmCommand::UnlockRecovery {
-                passphrase: Zeroizing::new("wrong".into()),
-            })
-            .is_err()
-    );
-    assert!(restarted.recovery_unlock.is_none());
+    let config = crate::migration_crypto::create_configuration("setup test passphrase").unwrap();
+    store::save_migration_setup(&authenticator.store_dir, &config, None).unwrap();
+    let (indices, loaded) = authenticator.pcr_enrollment().unwrap();
+    assert_eq!(indices, None);
+    assert_eq!(loaded, config);
+    store::save_default_pcr_policy(&authenticator.store_dir, &[7]).unwrap();
+    assert_eq!(authenticator.pcr_enrollment().unwrap().0, Some(vec![7]));
     std::fs::remove_dir_all(&authenticator.store_dir).unwrap();
 }
 
@@ -1970,7 +1876,7 @@ fn authenticator_with_credentials(
                 public_key_y: credential.key.public_key_y.clone(),
             },
             policy: None,
-            recovery: None,
+            migration_authority: None,
             sign_count: credential.sign_count,
             integrity_mac: None,
         })
@@ -1982,7 +1888,6 @@ fn authenticator_with_credentials(
         tpm_path: None,
         tpm: None,
         approval: Box::new(AlwaysApprove),
-        recovery_unlock: None,
         credentials: credentials
             .into_iter()
             .map(|credential| Credential {
@@ -1994,7 +1899,7 @@ fn authenticator_with_credentials(
                 user_display_name: credential.user_display_name,
                 key: credential.key,
                 policy: None,
-                recovery: None,
+                migration_authority: None,
                 sign_count: credential.sign_count,
             })
             .collect(),

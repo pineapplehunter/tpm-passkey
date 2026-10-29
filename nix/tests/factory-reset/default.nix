@@ -3,6 +3,7 @@
   name = "factory-reset";
   reason = "Reset must invalidate a resident passkey, clear the old client PIN and allow fresh PIN setup, independently of PIN-management workflows.";
   testScript = ''
+    setup_migration()
     expect_command("fido2-manage -setPIN -device 1",
         'expect "Enter new PIN"; send "1234\\r"; '
         'expect "Enter the same PIN again"; send "1234\\r"; expect eof')
@@ -13,7 +14,7 @@
     wait_for_agent()
     expect_command("fido2-manage -reset -device 1",
         'expect "Are you sure you want to proceed?"; send "Y\\r"; expect eof')
-    assert mgmt("list-credentials").strip() == ""
+    assert mgmt("list --json").strip() == "[]"
     machine.fail("python3 ${../assert.py} /tmp/credential reset.example.test after-reset")
     expect_command("fido2-manage -setPIN -device 1",
         'expect "Enter new PIN"; send "5678\\r"; '

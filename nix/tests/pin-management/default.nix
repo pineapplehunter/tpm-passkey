@@ -3,6 +3,7 @@
   name = "pin-management";
   reason = "Check libfido2 PIN setup/change, PIN-authenticated resident enrollment/storage/deletion, without relying on another test's PIN state.";
   testScript = ''
+    setup_migration()
     expect_command("fido2-manage -setPIN -device 1",
         'expect "Enter new PIN"; send "1234\\r"; '
         'expect "Enter the same PIN again"; send "1234\\r"; expect eof')
@@ -15,11 +16,11 @@
         'expect "Enter current PIN"; send "1234\\r"; '
         'expect "Enter new PIN"; send "5678\\r"; '
         'expect "Enter the same PIN again"; send "5678\\r"; expect eof')
-    first = next(row.split("\t") for row in mgmt("list-credentials").splitlines() if "\tfirst\t" in row)
-    expect_command(f"fido2-manage -delete -device 1 -credential {first[0]}",
+    first = machine.succeed("python3 -c 'import base64,sqlite3; db=sqlite3.connect(\"/var/lib/tpm-passkey/credentials.sqlite\"); print(base64.b64encode(db.execute(\"SELECT credential_id FROM credential_metadata WHERE user_name=\\\"first\\\"\").fetchone()[0]).decode())'").strip()
+    expect_command(f"fido2-manage -delete -device 1 -credential {first}",
         'expect "Are you sure you want to proceed?"; send "Y\\r"; '
         'expect "Enter PIN"; send "5678\\r"; expect eof')
-    assert len(mgmt("list-credentials").strip().splitlines()) == 1
+    assert mgmt("list --json").count('"local_id"') == 1
     machine.fail("python3 ${../assert.py} /tmp/first pin.example.test deleted")
     machine.succeed("python3 ${../assert.py} /tmp/second pin.example.test retained")
 
