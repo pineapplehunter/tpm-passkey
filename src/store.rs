@@ -533,6 +533,8 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
     }
 
     let pool = open_database(dir).await?;
+    // The assertion path reverses this oldest-first order (§6.2.2). Local IDs
+    // preserve registration order even when timestamps tie or rows are rewritten.
     let rows = sqlx::query(
         "SELECT m.credential_id, m.rp_id, m.discoverable, m.user_handle, m.user_name, m.user_display_name, \
                 m.sign_count, m.integrity_mac, \
@@ -547,7 +549,7 @@ async fn load_ctap2_credentials_async(dir: &Path) -> Result<Vec<StoredCtap2Crede
          LEFT JOIN credential_keyslots r \
            ON r.credential_id = m.credential_id AND r.slot_kind = 'migration' \
          LEFT JOIN credential_tokens t ON t.keyslot_id = r.keyslot_id \
-         ORDER BY m.rp_id, m.credential_id",
+         ORDER BY m.local_id",
     )
     .fetch_all(&pool)
     .await
@@ -1294,6 +1296,27 @@ mod tests {
                 .unwrap()
                 .local_id
                 > second_id
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_reload_preserves_creation_order_not_credential_id_order() {
+        let dir = test_store_dir("credential-creation-order");
+        // IDs and RP names deliberately sort opposite to creation order. Local
+        // IDs break ties even when registrations share SQLite's timestamp.
+        let oldest = test_credential(vec![3], "z.example", 0);
+        let middle = test_credential(vec![2], "a.example", 0);
+        let newest = test_credential(vec![1], "a.example", 0);
+        save_ctap2_credentials_to_dir(&dir, &[oldest.clone(), middle.clone()]).unwrap();
+        save_ctap2_credentials_to_dir(&dir, &[middle, oldest, newest]).unwrap();
+        let loaded = load_ctap2_credentials_from_dir(&dir).unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|credential| credential.id.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![3], vec![2], vec![1]],
         );
         fs::remove_dir_all(dir).unwrap();
     }

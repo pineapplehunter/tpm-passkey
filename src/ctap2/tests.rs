@@ -436,7 +436,7 @@ fn client_pin_rejects_known_wrong_types_and_out_of_range_integers() {
             vec![u8::from(ErrorStatus::CborUnexpectedType)]
         );
     }
-    for protocol in [-1, 0, 3, 256] {
+    for protocol in [0, 3, 256] {
         assert_eq!(
             auth.handle_cbor(&ctap_request(
                 Ctap2Command::ClientPin,
@@ -445,13 +445,14 @@ fn client_pin_rejects_known_wrong_types_and_out_of_range_integers() {
             vec![u8::from(ErrorStatus::InvalidParameter)]
         );
     }
-    for permissions in [-1, 256] {
+    for request in [
+        cbor!({1 => -1, 2 => 2}).unwrap(),
+        cbor!({2 => -1}).unwrap(),
+        cbor!({1 => 2, 2 => 9, 6 => bytes([0;32]), 9 => -1}).unwrap(),
+    ] {
         assert_eq!(
-            auth.handle_cbor(&ctap_request(
-                Ctap2Command::ClientPin,
-                cbor!({1 => 2, 2 => 9, 6 => bytes([0;32]), 9 => permissions}).unwrap()
-            )),
-            vec![u8::from(ErrorStatus::InvalidParameter)]
+            auth.handle_cbor(&ctap_request(Ctap2Command::ClientPin, request)),
+            vec![u8::from(ErrorStatus::CborUnexpectedType)]
         );
     }
     let _ = std::fs::remove_dir_all(dir);
@@ -766,7 +767,7 @@ fn unsupported_builtin_uv_subcommands_do_not_mint_tokens() {
         ] {
             assert_eq!(
                 authenticator.handle_cbor(&ctap_request(Ctap2Command::ClientPin, request)),
-                vec![u8::from(ErrorStatus::InvalidCommand)]
+                vec![u8::from(ErrorStatus::InvalidSubcommand)]
             );
         }
     }
@@ -1526,7 +1527,7 @@ fn multiple_matching_credentials_include_number_of_credentials_and_support_next_
 }
 
 #[test]
-fn allow_list_omits_user_count_and_next_assertion_state() {
+fn allow_list_returns_discoverable_user_handle_without_count_or_continuation() {
     let mut authenticator = authenticator_with_credentials(
         "example.com",
         vec![
@@ -1549,12 +1550,37 @@ fn allow_list_omits_user_count_and_next_assertion_state() {
     else {
         panic!("expected assertion response");
     };
-    assert!(map_value(&response, 4).is_none());
+    let user = map_value(&response, 4)
+        .and_then(Value::as_map)
+        .expect("user handle");
+    assert_eq!(user.len(), 1, "identifying names must not be disclosed");
+    assert!(map_bytes(user, "id").is_some());
     assert!(map_value(&response, 5).is_none());
     assert_eq!(
         authenticator.handle_cbor(&[Ctap2Command::GetNextAssertion.into()]),
         vec![u8::from(ErrorStatus::NotAllowed)]
     );
+}
+
+#[test]
+fn allow_list_may_omit_user_for_non_discoverable_credentials() {
+    let credential = test_credential(vec![1], "example.com", 1);
+    let mut authenticator = authenticator_with_credentials("example.com", vec![credential]);
+    authenticator.credentials[0].discoverable = false;
+    let response = authenticator.handle_cbor(&ctap_request(
+        Ctap2Command::GetAssertion,
+        cbor!({
+            1 => "example.com", 2 => bytes([0xaa; 32]),
+            3 => [credential_descriptor(vec![1])], 5 => { "up" => false },
+        })
+        .unwrap(),
+    ));
+    assert_eq!(response[0], 0);
+    let Value::Map(response) = ciborium::from_reader::<Value, _>(&response[1..]).unwrap() else {
+        panic!("expected assertion response");
+    };
+    assert!(map_value(&response, 4).is_none());
+    assert!(map_value(&response, 5).is_none());
 }
 
 #[test]
@@ -1907,7 +1933,7 @@ fn authenticator_with_credentials(
         pending_assertion: None,
         client_pin: None,
         client_pin_load_failed: false,
-        key_agreement: None,
+        key_agreement: Some(EphemeralSecret::generate()),
         pin_uv_auth_token: None,
         consecutive_pin_mismatches: 0,
         management: None,
@@ -2121,6 +2147,225 @@ fn options_map(options: &[(&str, bool)]) -> Vec<(Value, Value)> {
             )
         })
         .collect()
+}
+
+fn pin_attempt_fixture(protocol: u64) -> (Authenticator, Value, [u8; 32], [u8; 32]) {
+    let mut auth = Authenticator::new(test_store_dir("pin-attempt-order"), None);
+    let salt = vec![0x31; 32];
+    let hash = Sha256::digest(b"1234");
+    auth.client_pin = Some(ClientPinState {
+        pin_verifier: pin_verifier(&salt, &hash[..16]),
+        pin_salt: salt,
+        retries: PIN_RETRIES,
+    });
+    auth.persist_client_pin(auth.client_pin.as_ref().unwrap())
+        .unwrap();
+    let server_key = parse_key_agreement(&client_pin_key_agreement(&mut auth)).unwrap();
+    let client_secret = EphemeralSecret::generate();
+    let shared = client_secret.diffie_hellman(&server_key);
+    let (aes, hmac) = derive_pin_uv_keys(protocol, shared.raw_secret_bytes().as_slice()).unwrap();
+    (auth, client_key_agreement(&client_secret), aes, hmac)
+}
+
+fn protocol_pin_mac(protocol: u64, key: &[u8; 32], message: &[u8]) -> Vec<u8> {
+    let mut mac = pin_auth_param(key, message);
+    if protocol == 1 {
+        mac.truncate(16);
+    }
+    mac
+}
+
+#[test]
+fn client_pin_key_agreement_is_initialized_stable_and_regenerated_on_mismatch() {
+    for protocol in [1, 2] {
+        let (mut auth, client_key, aes, _) = pin_attempt_fixture(protocol);
+        let original = client_pin_key_agreement(&mut auth);
+        assert_eq!(original, client_pin_key_agreement(&mut auth));
+        let key = client_key.as_map().unwrap();
+        let wrong = encrypt_aes_protocol(protocol, &aes, &[0; 16]).unwrap();
+        assert_eq!(
+            auth.get_pin_uv_auth_token(protocol, Some(key), &wrong, 4, None, false),
+            Err(ErrorStatus::PinInvalid)
+        );
+        let regenerated = client_pin_key_agreement(&mut auth);
+        assert_ne!(original, regenerated);
+        assert_eq!(regenerated, client_pin_key_agreement(&mut auth));
+        // A stale platform key is decapsulated, not rejected as INVALID_COMMAND.
+        let old_correct =
+            encrypt_aes_protocol(protocol, &aes, &Sha256::digest(b"1234")[..16]).unwrap();
+        assert_eq!(
+            auth.get_pin_uv_auth_token(protocol, Some(key), &old_correct, 4, None, false),
+            Err(ErrorStatus::PinInvalid)
+        );
+        let server = parse_key_agreement(&client_pin_key_agreement(&mut auth)).unwrap();
+        let client = EphemeralSecret::generate();
+        let shared = client.diffie_hellman(&server);
+        let (aes, _) = derive_pin_uv_keys(protocol, shared.raw_secret_bytes().as_slice()).unwrap();
+        let correct = encrypt_aes_protocol(protocol, &aes, &Sha256::digest(b"1234")[..16]).unwrap();
+        let client_key = client_key_agreement(&client);
+        assert!(
+            auth.get_pin_uv_auth_token(
+                protocol,
+                client_key.as_map().map(Vec::as_slice),
+                &correct,
+                4,
+                None,
+                false
+            )
+            .is_ok()
+        );
+        assert_eq!(auth.client_pin.as_ref().unwrap().retries, PIN_RETRIES);
+        auth.cancel_pending();
+        assert!(auth.key_agreement.is_some());
+        assert_eq!(
+            client_pin_key_agreement(&mut auth),
+            client_pin_key_agreement(&mut auth)
+        );
+        std::fs::remove_dir_all(auth.store_dir).unwrap();
+    }
+}
+
+#[test]
+fn client_pin_malformed_hashes_charge_retries_and_regenerate_for_all_pin_operations() {
+    for protocol in [1, 2] {
+        for subcommand in [4, 5, 9] {
+            let (mut auth, key, aes, hmac) = pin_attempt_fixture(protocol);
+            let original = client_pin_key_agreement(&mut auth);
+            let malformed = vec![0; 1];
+            let new_pin = encrypt_aes_protocol(protocol, &aes, &[0; 64]).unwrap();
+            let mut message = new_pin.clone();
+            message.extend_from_slice(&malformed);
+            let mac = protocol_pin_mac(protocol, &hmac, &message);
+            let request = match subcommand {
+                4 => cbor!({1 => protocol, 2 => 4, 3 => key, 4 => bytes(mac), 5 => bytes(new_pin), 6 => bytes(malformed)}).unwrap(),
+                5 => cbor!({1 => protocol, 2 => 5, 3 => key, 6 => bytes(malformed)}).unwrap(),
+                9 => cbor!({1 => protocol, 2 => 9, 3 => key, 6 => bytes(malformed), 9 => 4}).unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                auth.handle_cbor(&ctap_request(Ctap2Command::ClientPin, request)),
+                error_response(ErrorStatus::PinInvalid)
+            );
+            assert_eq!(auth.client_pin.as_ref().unwrap().retries, 7);
+            assert_ne!(original, client_pin_key_agreement(&mut auth));
+            let stored = store::load_client_pin_state_from_dir(&auth.store_dir)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.retries, 7);
+            std::fs::remove_dir_all(auth.store_dir).unwrap();
+        }
+    }
+}
+
+#[test]
+fn client_pin_blocked_status_precedes_key_mac_and_ciphertext_errors() {
+    for blocked in [ErrorStatus::PinBlocked, ErrorStatus::PinAuthBlocked] {
+        let (mut auth, _, _, _) = pin_attempt_fixture(2);
+        if blocked == ErrorStatus::PinBlocked {
+            auth.client_pin.as_mut().unwrap().retries = 0;
+        } else {
+            auth.consecutive_pin_mismatches = 3;
+        }
+        for subcommand in [4, 5, 9] {
+            let mut request =
+                cbor_map(cbor!({1 => 2, 2 => subcommand, 3 => {}, 6 => bytes([0])}).unwrap());
+            if subcommand == 4 {
+                request.extend(cbor_map(cbor!({4 => bytes([0]), 5 => bytes([0])}).unwrap()));
+            }
+            if subcommand == 9 {
+                request.push((cbor!(9).unwrap(), cbor!(4).unwrap()));
+            }
+            assert_eq!(
+                auth.handle_cbor(&ctap_request(Ctap2Command::ClientPin, Value::Map(request))),
+                error_response(blocked)
+            );
+        }
+        assert!(auth.pin_uv_auth_token.is_none());
+        std::fs::remove_dir_all(auth.store_dir).unwrap();
+    }
+}
+
+#[test]
+fn client_pin_attempt_is_persisted_before_decryption_and_success_restores_retries() {
+    let (mut auth, _, _, _) = pin_attempt_fixture(2);
+    let dir = auth.store_dir.clone();
+    auth.client_pin.as_mut().unwrap().retries = 1;
+    let correct = Sha256::digest(b"1234");
+    assert_eq!(
+        auth.authenticate_pin_attempt(|| {
+            assert_eq!(
+                store::load_client_pin_state_from_dir(&dir)
+                    .unwrap()
+                    .unwrap()
+                    .retries,
+                0
+            );
+            Ok(correct[..16].to_vec())
+        }),
+        Ok(())
+    );
+    assert_eq!(
+        store::load_client_pin_state_from_dir(&dir)
+            .unwrap()
+            .unwrap()
+            .retries,
+        PIN_RETRIES
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn client_pin_change_checks_mac_then_old_pin_before_new_pin_ciphertext() {
+    for protocol in [1, 2] {
+        let (mut auth, key, aes, hmac) = pin_attempt_fixture(protocol);
+        let key = key.as_map().unwrap();
+        let correct = encrypt_aes_protocol(protocol, &aes, &Sha256::digest(b"1234")[..16]).unwrap();
+        let malformed = [0];
+        assert_eq!(
+            auth.change_pin(protocol, Some(key), &malformed, &correct, &[0]),
+            Err(ErrorStatus::PinAuthInvalid)
+        );
+        assert_eq!(auth.client_pin.as_ref().unwrap().retries, PIN_RETRIES);
+        let mut message = malformed.to_vec();
+        message.extend_from_slice(&correct);
+        let mac = protocol_pin_mac(protocol, &hmac, &message);
+        auth.client_pin.as_mut().unwrap().retries = 6;
+        assert_eq!(
+            auth.change_pin(protocol, Some(key), &malformed, &correct, &mac),
+            Err(ErrorStatus::PinAuthInvalid)
+        );
+        assert_eq!(auth.client_pin.as_ref().unwrap().retries, PIN_RETRIES);
+        std::fs::remove_dir_all(auth.store_dir).unwrap();
+    }
+}
+
+#[test]
+fn client_pin_unsigned_permissions_ignore_high_bits_without_granting_them() {
+    let (mut auth, key, aes, _) = pin_attempt_fixture(2);
+    let correct = encrypt_aes_protocol(2, &aes, &Sha256::digest(b"1234")[..16]).unwrap();
+    for permissions in [0x104_u64, (1_u64 << 63) | 4, 1_u64 << 63] {
+        let response = auth.handle_cbor(&ctap_request(Ctap2Command::ClientPin,
+            cbor!({1 => 2, 2 => 9, 3 => key.clone(), 6 => bytes(correct.clone()), 9 => permissions}).unwrap()));
+        assert_eq!(response[0], 0);
+        assert_eq!(
+            auth.pin_uv_auth_token.as_ref().unwrap().permissions.bits(),
+            (permissions & 0x7f) as u8
+        );
+    }
+    for subcommand in [1, 2, 3, 4, 5, 9] {
+        assert_eq!(
+            auth.handle_cbor(&ctap_request(
+                Ctap2Command::ClientPin,
+                cbor!({1 => 2, 2 => subcommand, 9 => 0}).unwrap()
+            )),
+            error_response(ErrorStatus::InvalidParameter)
+        );
+    }
+    assert_eq!(
+        validate_token_permissions((1_u64 << 63) | 8, None, false),
+        Err(ErrorStatus::UnauthorizedPermission)
+    );
+    std::fs::remove_dir_all(auth.store_dir).unwrap();
 }
 
 fn options_text_map(options: &[(&str, &str)]) -> Vec<(Value, Value)> {

@@ -1,10 +1,19 @@
 import os
 
+from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2
 from fido2.hid import CTAPHID, CtapHidDevice
 
 device = next(CtapHidDevice.list_devices())
 try:
+    # No visible/audible WINK implementation: do not claim that capability.
+    assert not device.capabilities & 0x01
+    try:
+        device.call(CTAPHID.CBOR, b"")
+    except CtapError as error:
+        assert error.code == CtapError.ERR.INVALID_LENGTH, error
+    else:
+        raise AssertionError("empty CBOR transport request was accepted")
     for size in (0, 1, 57, 58, 116, 117, 200, 1024, 1200):
         payload = os.urandom(size)
         assert device.call(CTAPHID.PING, payload) == payload

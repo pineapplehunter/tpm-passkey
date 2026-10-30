@@ -53,12 +53,19 @@ def main():
     device = next(CtapHidDevice.list_devices())
 
     ctap = Ctap2(device)
+    if "--reload-order" in sys.argv:
+        assertions = ctap.get_assertions(rp_id, challenge("reloaded-order"))
+        assert [assertion.user["id"] for assertion in assertions] == [
+            b"resident-user-2", b"resident-user-1",
+        ]
+        device.close()
+        return
     assert ctap.info.options.get("clientPin") is False
 
     # Host approval is UP only. Unsupported built-in UV cannot mint tokens.
     for subcommand in (6, 7):
         expect_ctap_error(
-            CtapError.ERR.INVALID_COMMAND,
+            CtapError.ERR.INVALID_SUBCOMMAND,
             lambda subcommand=subcommand: ctap.client_pin(2, subcommand),
         )
     expect_ctap_error(
@@ -140,10 +147,10 @@ def main():
     keys = {
         credential.credential_id: credential.public_key for credential in credentials
     }
-    assert {assertion.user["id"] for assertion in assertions} == {
-        b"resident-user-1",
+    assert [assertion.user["id"] for assertion in assertions] == [
         b"resident-user-2",
-    }
+        b"resident-user-1",
+    ]
     for assertion in assertions:
         assert assertion.auth_data.rp_id_hash == hashlib.sha256(rp_id.encode()).digest()
         assert assertion.auth_data.flags & AuthenticatorData.FLAG.UP
@@ -163,6 +170,7 @@ def main():
     )
     assert verified.auth_data.flags & AuthenticatorData.FLAG.UV
     assert verified.auth_data.flags & AuthenticatorData.FLAG.UP
+    assert verified.user == {"id": b"resident-user-1"}
     verified.verify(verified_challenge, credentials[0].public_key)
 
     # A credential is scoped to its RP, even when its ID is supplied explicitly.
@@ -185,6 +193,7 @@ def main():
         options={"up": False, "uv": False},
     )
     assert not silent.auth_data.flags & AuthenticatorData.FLAG.UP
+    assert silent.user == {"id": b"resident-user-1"}
     silent.verify(silent_challenge, credentials[0].public_key)
 
     # CTAP requires a 32-byte clientDataHash.

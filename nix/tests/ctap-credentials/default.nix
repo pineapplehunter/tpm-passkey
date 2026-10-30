@@ -6,5 +6,8 @@
     setup_migration()
     machine.succeed("python3 ${./scenario.py} credentials.example.test", timeout=90)
     assert mgmt("list --json").count("credentials.example.test") == 2
+    machine.succeed("systemctl stop tpm-passkey")
+    start_daemon()
+    machine.succeed("python3 ${./scenario.py} credentials.example.test --reload-order", timeout=30)
   '';
 }

@@ -161,12 +161,7 @@ pub(super) fn map_bool<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<bool
     map_value(map, key).and_then(Value::as_bool)
 }
 
-pub(super) fn map_array<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&[Value]> {
-    map_value(map, key)
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-}
-
+#[cfg(test)]
 pub(super) fn map_map<K: MapKey>(map: &[(Value, Value)], key: K) -> Option<&[(Value, Value)]> {
     map_value(map, key)
         .and_then(Value::as_map)

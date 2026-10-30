@@ -14,8 +14,13 @@ path = Path("/run/user/1000/tpm-passkey-test-events")
 before = len(path.read_text().splitlines()) if path.exists() else 0
 
 def events():
+    # A status-change keepalive may precede the agent's first recorded message.
+    try:
+        lines = path.read_text().splitlines()[before:]
+    except FileNotFoundError:
+        return []
     rows = []
-    for line in path.read_text().splitlines()[before:]:
+    for line in lines:
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError:

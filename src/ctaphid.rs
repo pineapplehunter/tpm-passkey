@@ -59,7 +59,6 @@ enum CtapHidError {
     Other = 0x7f,
 }
 
-const CAPABILITY_WINK: u8 = 0x01;
 const CAPABILITY_CBOR: u8 = 0x04;
 const CAPABILITY_NMSG: u8 = 0x08;
 
@@ -100,6 +99,7 @@ struct ProcessingRequest {
     cancelled: Arc<AtomicBool>,
     status: Arc<AtomicU8>,
     last_keepalive: Instant,
+    last_keepalive_status: u8,
 }
 
 enum WorkerCommand {
@@ -239,15 +239,20 @@ impl PacketHandler {
         if cid == 0 || !channel_is_valid {
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Channel)));
         }
+        if command == CtapHidCommand::Init && payload_len != 8 {
+            return Some(PacketOutcome::Response(error(cid, CtapHidError::Length)));
+        }
         if payload_len > MAX_PAYLOAD_SIZE {
             self.abort_incomplete(cid);
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Length)));
         }
-
         if command == CtapHidCommand::Init && self.active_cid() == Some(cid) {
             self.abort_transaction();
         } else if self.active_cid().is_some() {
             return Some(PacketOutcome::Response(error(cid, CtapHidError::Busy)));
+        } else if command == CtapHidCommand::Init && cid != BROADCAST_CID {
+            // INIT also discards buffered authenticator state on an idle CID.
+            self.abort_transaction();
         }
 
         let first_len = payload_len.min(REPORT_SIZE - 7);
@@ -275,9 +280,8 @@ impl PacketHandler {
         sequence: u8,
         report: &[u8],
     ) -> Option<PacketOutcome> {
-        if !self.allocated_channels.contains(&cid) {
-            return Some(PacketOutcome::Response(error(cid, CtapHidError::Channel)));
-        }
+        // Continuations without a matching initialization packet are spurious,
+        // even if their CID was never allocated (CTAP §11.2.5.4).
         let Some(pending) = self.pending.as_mut() else {
             return Some(PacketOutcome::Ignored);
         };
@@ -331,12 +335,9 @@ impl PacketHandler {
                 command: CtapHidCommand::Ping,
                 payload: payload.to_vec(),
             },
-            CtapHidCommand::Wink if payload.is_empty() => Response {
-                cid,
-                command: CtapHidCommand::Wink,
-                payload: Vec::new(),
-            },
-            CtapHidCommand::Wink => error(cid, CtapHidError::Length),
+            // There is no visible/audible identification mechanism. Do not
+            // advertise or acknowledge this optional command as implemented.
+            CtapHidCommand::Wink => error(cid, CtapHidError::Command),
             CtapHidCommand::Cbor => return self.queue_cbor(cid, payload),
             CtapHidCommand::Cancel => return self.cancel(cid, payload.len()),
             CtapHidCommand::Keepalive | CtapHidCommand::Error => error(cid, CtapHidError::Command),
@@ -370,8 +371,18 @@ impl PacketHandler {
     }
 
     fn cancel(&mut self, cid: u32, payload_len: usize) -> PacketOutcome {
+        // CANCEL on an inactive CID must be ignored, not answered, regardless
+        // of whether a different channel has a transaction in progress.
+        if !self
+            .processing
+            .as_ref()
+            .is_some_and(|request| request.cid == cid)
+        {
+            return PacketOutcome::Ignored;
+        }
         if payload_len != 0 {
-            return PacketOutcome::Response(error(cid, CtapHidError::Length));
+            // Even malformed CANCEL messages must not receive a direct reply.
+            return PacketOutcome::Ignored;
         }
         if let Some(processing) = self
             .processing
@@ -385,6 +396,10 @@ impl PacketHandler {
     }
 
     fn queue_cbor(&mut self, cid: u32, payload: &[u8]) -> PacketOutcome {
+        // A CBOR transport request includes at least the CTAP command byte.
+        if payload.is_empty() {
+            return PacketOutcome::Response(error(cid, CtapHidError::Length));
+        }
         let id = self.next_transaction_id;
         self.next_transaction_id = self.next_transaction_id.wrapping_add(1).max(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -408,6 +423,7 @@ impl PacketHandler {
             cancelled,
             status,
             last_keepalive: Instant::now(),
+            last_keepalive_status: KEEPALIVE_PROCESSING,
         });
         PacketOutcome::Processing
     }
@@ -443,12 +459,16 @@ impl PacketHandler {
         }
 
         let processing = self.processing.as_mut()?;
-        if processing.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+        let status = processing.status.load(Ordering::SeqCst);
+        if status != processing.last_keepalive_status
+            || processing.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL
+        {
             processing.last_keepalive = Instant::now();
+            processing.last_keepalive_status = status;
             return Some(PacketOutcome::Response(Response {
                 cid: processing.cid,
                 command: CtapHidCommand::Keepalive,
-                payload: vec![processing.status.load(Ordering::SeqCst)],
+                payload: vec![status],
             }));
         }
         None
@@ -518,7 +538,7 @@ fn handle_init(cid: u32, allocated_cid: u32, payload: &[u8]) -> Response {
     response.extend_from_slice(&allocated_cid.to_be_bytes());
     response.push(2); // CTAPHID protocol version.
     response.extend_from_slice(&[0, 1, 0]);
-    response.push(CAPABILITY_WINK | CAPABILITY_CBOR | CAPABILITY_NMSG);
+    response.push(CAPABILITY_CBOR | CAPABILITY_NMSG);
 
     Response {
         cid,
@@ -604,10 +624,7 @@ mod tests {
         assert_eq!(&response.payload[0..8], b"12345678");
         assert_eq!(&response.payload[8..12], &1u32.to_be_bytes());
         assert_eq!(response.payload[12], 2);
-        assert_eq!(
-            response.payload[16],
-            CAPABILITY_WINK | CAPABILITY_CBOR | CAPABILITY_NMSG
-        );
+        assert_eq!(response.payload[16], CAPABILITY_CBOR | CAPABILITY_NMSG);
     }
 
     #[test]
@@ -859,6 +876,132 @@ mod tests {
         );
         assert_eq!(wait_cbor(&mut handler).payload[0], 0);
         let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn wink_is_not_advertised_or_acknowledged_without_identification() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let packet = command_packet(cid, CtapHidCommand::Wink, &[]);
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected unsupported command error");
+        };
+        assert_error(response, cid, CtapHidError::Command);
+    }
+
+    #[test]
+    fn keepalive_reports_status_changes_without_waiting_for_the_interval() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let status = Arc::new(AtomicU8::new(KEEPALIVE_PROCESSING));
+        handler.processing = Some(ProcessingRequest {
+            id: 1,
+            cid,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            status: status.clone(),
+            last_keepalive: Instant::now(),
+            last_keepalive_status: KEEPALIVE_PROCESSING,
+        });
+        assert!(handler.poll().is_none());
+        status.store(2, Ordering::SeqCst);
+        let Some(PacketOutcome::Response(response)) = handler.poll() else {
+            panic!("expected status-change keepalive");
+        };
+        assert_eq!(response.command, CtapHidCommand::Keepalive);
+        assert_eq!(response.payload, vec![2]);
+        assert!(handler.poll().is_none());
+        status.store(KEEPALIVE_PROCESSING, Ordering::SeqCst);
+        let Some(PacketOutcome::Response(response)) = handler.poll() else {
+            panic!("expected return-to-processing keepalive");
+        };
+        assert_eq!(response.payload, vec![KEEPALIVE_PROCESSING]);
+    }
+
+    #[test]
+    fn empty_cbor_is_a_transport_length_error() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let packet = command_packet(cid, CtapHidCommand::Cbor, &[]);
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected transport error");
+        };
+        assert_error(response, cid, CtapHidError::Length);
+        assert!(handler.processing.is_none());
+    }
+
+    #[test]
+    fn spurious_continuations_are_ignored_on_every_channel() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        for spurious_cid in [0, 42, BROADCAST_CID, cid] {
+            let mut packet = [0; REPORT_SIZE];
+            packet[..4].copy_from_slice(&spurious_cid.to_be_bytes());
+            assert_eq!(handler.handle_packet(&packet), Some(PacketOutcome::Ignored));
+        }
+    }
+
+    #[test]
+    fn inactive_cancel_is_ignored_even_with_invalid_length() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let packet = command_packet(cid, CtapHidCommand::Cancel, b"invalid");
+        assert_eq!(handler.handle_packet(&packet), Some(PacketOutcome::Ignored));
+    }
+
+    #[test]
+    fn malformed_active_cancel_has_no_reply_and_does_not_cancel() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        handler.processing = Some(ProcessingRequest {
+            id: 1,
+            cid,
+            cancelled: cancelled.clone(),
+            status: Arc::new(AtomicU8::new(KEEPALIVE_PROCESSING)),
+            last_keepalive: Instant::now(),
+            last_keepalive_status: KEEPALIVE_PROCESSING,
+        });
+        let packet = command_packet(cid, CtapHidCommand::Cancel, b"invalid");
+        assert_eq!(handler.handle_packet(&packet), Some(PacketOutcome::Ignored));
+        assert!(!cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn idle_init_discards_authenticator_state() {
+        let mut handler = PacketHandler::default();
+        let cid = allocate_channel(&mut handler);
+        let (tx, rx) = mpsc::channel();
+        handler.worker_tx = tx;
+        let packet = command_packet(cid, CtapHidCommand::Init, b"12345678");
+        let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+            panic!("expected INIT response");
+        };
+        assert_eq!(response.command, CtapHidCommand::Init);
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::CancelState)));
+    }
+
+    #[test]
+    fn malformed_init_does_not_allocate_a_channel_or_abort_a_request() {
+        let mut handler = PacketHandler::default();
+        for len in [5, MAX_PAYLOAD_SIZE + 1] {
+            let packet = command_packet(BROADCAST_CID, CtapHidCommand::Init, &vec![0; len]);
+            handler.handle_packet(&packet);
+            assert!(handler.allocated_channels.is_empty());
+        }
+        let cid = allocate_channel(&mut handler);
+        let partial = command_packet(cid, CtapHidCommand::Ping, &[0; REPORT_SIZE]);
+        assert_eq!(
+            handler.handle_packet(&partial),
+            Some(PacketOutcome::NeedMore)
+        );
+        for len in [5, MAX_PAYLOAD_SIZE + 1] {
+            let packet = command_packet(cid, CtapHidCommand::Init, &vec![0; len]);
+            let Some(PacketOutcome::Response(response)) = handler.handle_packet(&packet) else {
+                panic!("expected length error");
+            };
+            assert_error(response, cid, CtapHidError::Length);
+            assert!(handler.pending.is_some());
+        }
     }
 
     #[test]
