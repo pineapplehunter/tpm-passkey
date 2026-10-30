@@ -1,8 +1,13 @@
 { pkgs, package }:
-(import ../common.nix { inherit pkgs package; }) {
-  name = "migration-rebind";
-  reason = "Exercise PolicyAuthorize signing and rebinding one credential from a PCR-disabled baseline to PCR-bound and back using the management protocol.";
+pkgs.testers.runNixOSTest {
+  extraPythonPackages = ps: [ (ps.callPackage ../python-package.nix { }) ];
+  name = "tpm-passkey-migration-rebind";
+  nodes.machine.imports = [ (import ../machine.nix { inherit pkgs package; }) ];
   testScript = ''
-    scenario("${./scenario.py}", timeout=180)
+    from tpm_passkey_test import TestEnv
+    env = TestEnv(machine)
+    env.start()
+
+    env.scenario("${./scenario.py}", timeout=180)
   '';
 }

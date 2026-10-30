@@ -48,6 +48,7 @@
       ps.cbor2
       ps.fido2
       ps.dbus-next
+      (ps.callPackage ./python-package.nix { })
     ]))
   ];
 }

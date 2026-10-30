@@ -1,8 +1,13 @@
 # NixOS tests
 
-Each test directory contains `default.nix`, its `reason`, and any case-specific
-assets. Each is a separate `nixosTest` with a fresh VM/state directory; no case
-requires another case to have run first. The root `default.nix` registers them.
+Each test directory contains a `README.md` with its name and a short explanation
+of what it checks, a `default.nix` declaring the complete NixOS test derivation,
+and any case-specific assets. Every derivation imports `../machine.nix` directly
+for the common NixOS configuration. Shared Python helpers are installed through
+`extraPythonPackages`; each script imports `TestEnv` and explicitly starts its VM
+fixture.
+Each has a fresh VM/state directory; no case requires another case to have run
+first. The root `default.nix` registers them.
 Every enrollment scenario explicitly completes mandatory migration setup (the
 upgrade scenario first verifies that enrollment without setup fails). Transport-
 only discovery and approval tests that do not enroll need no migration key.
@@ -29,14 +34,15 @@ only discovery and approval tests that do not enroll need no migration key.
 Shared files stay here:
 
 - `machine.nix`: software TPM, daemon package, user, polkit and tools.
-- `common.nix`: test constructor; requires a reason and prints it in the log.
 - `approval-options.nix`: pure module-evaluation check for default enablement,
   systemd startup, opt-out, XDG autostart and manual startup. Protocol VMs
   explicitly disable automatic startup and select their own test agent.
-- `driver.py`: bounded login/startup, management/expect helpers.
+- `python-package.nix`, `python/`: importable test library. `tpm_passkey_test.TestEnv`
+  provides bounded login/startup and management helpers; `tpm_test_bus` provides
+  the guest-side sealed-FD transport and agent readiness helpers. The package is
+  installed in both the test driver and the guest Python environment.
 - `register.py`, `assert.py`: credential fixture creation and signature checks.
 - `agent.py`: **test-only** auto-answering agent with a simulated desktop session.
-- `tpm_test_bus.py`: sealed-FD management transport and agent readiness helpers.
 
 Protocol fixtures are not proof of real desktop UX. The GTK smoke test runs the
 actual GUI on headless X11, not manual Firefox/Wayland flows. Session activation,

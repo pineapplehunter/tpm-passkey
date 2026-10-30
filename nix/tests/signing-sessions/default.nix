@@ -1,9 +1,14 @@
 { pkgs, package }:
-(import ../common.nix { inherit pkgs package; }) {
-  name = "signing-sessions";
-  reason = "Repeated PCR-bound assertions must flush transient TPM objects and policy sessions instead of exhausting the TPM's small handle/session limits.";
+pkgs.testers.runNixOSTest {
+  extraPythonPackages = ps: [ (ps.callPackage ../python-package.nix { }) ];
+  name = "tpm-passkey-signing-sessions";
+  nodes.machine.imports = [ (import ../machine.nix { inherit pkgs package; }) ];
   testScript = ''
-    mgmt_expect(
+    from tpm_passkey_test import TestEnv
+    env = TestEnv(machine)
+    env.start()
+
+    env.mgmt_expect(
         "setup",
         'expect "Choose PCR binding"; send "7\\r"; '
         'expect "Create migration passphrase: "; send "signing-session-phrase\\r"; '

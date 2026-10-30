@@ -13,6 +13,11 @@ on:
 permissions:
   id-token: write
 
+# Serialize CI runs as well as the Nix builds within each run.
+concurrency:
+  group: ci-build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-26.04
@@ -21,6 +26,8 @@ jobs:
       - uses: cachix/install-nix-action@a49548c11d9846ad46ecc0115273879b045f001c # v31.10.7
         with:
           extra_nix_config: |
+            max-jobs = 1
+            cores = 1
             extra-substituters = https://niks3.gweb.ihavenojob.work
             extra-trusted-public-keys = niks3-cache:RW+9UW/AgeDvEawJndPbzNVYQcDPjXA4J23srAi5+sE=
       - uses: Mic92/niks3-action@12d3e320b2a99b7938f9634bd337cd9fec104609 # v1.1.0

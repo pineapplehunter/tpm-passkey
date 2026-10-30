@@ -1,10 +1,15 @@
 { pkgs, package }:
-(import ../common.nix { inherit pkgs package; }) {
-  name = "credential-management";
-  reason = "Check Protocol 1-authenticated credential management, successful RP/credential continuations, user updates and interruption of a still-valid enumeration.";
+pkgs.testers.runNixOSTest {
+  extraPythonPackages = ps: [ (ps.callPackage ../python-package.nix { }) ];
+  name = "tpm-passkey-credential-management";
+  nodes.machine.imports = [ (import ../machine.nix { inherit pkgs package; }) ];
   testScript = ''
-    setup_migration()
-    expect_command("fido2-manage -setPIN -device 1",
+    from tpm_passkey_test import TestEnv
+    env = TestEnv(machine)
+    env.start()
+
+    env.setup_migration()
+    env.expect_command("fido2-manage -setPIN -device 1",
         'expect "Enter new PIN"; send "1234\\r"; '
         'expect "Enter the same PIN again"; send "1234\\r"; expect eof')
     for user, rp in [("first", "manage.example.test"), ("second", "manage.example.test"), ("third", "other.example.test")]:

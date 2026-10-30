@@ -1,8 +1,13 @@
 { pkgs, package }:
-(import ../common.nix { inherit pkgs package; }) {
-  name = "ctap-transport";
-  reason = "Check HID fragmentation/echo and truthful GetInfo capabilities independently of credential setup, and reject unimplemented CTAP commands.";
+pkgs.testers.runNixOSTest {
+  extraPythonPackages = ps: [ (ps.callPackage ../python-package.nix { }) ];
+  name = "tpm-passkey-ctap-transport";
+  nodes.machine.imports = [ (import ../machine.nix { inherit pkgs package; }) ];
   testScript = ''
+    from tpm_passkey_test import TestEnv
+    env = TestEnv(machine)
+    env.start()
+
     machine.succeed("python3 ${./transport.py}", timeout=30)
   '';
 }

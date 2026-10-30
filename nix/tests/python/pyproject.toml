@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpm-passkey-test"
+version = "0.1.0"
+description = "Shared helpers for tpm-passkey NixOS tests"
+dependencies = ["cbor2", "dbus-next"]
+
+[tool.setuptools]
+py-modules = ["tpm_passkey_test", "tpm_test_bus"]

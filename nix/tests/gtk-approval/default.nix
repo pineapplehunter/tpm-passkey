@@ -1,8 +1,9 @@
 { pkgs, package }:
-(import ../common.nix { inherit pkgs package; }) {
-  name = "gtk-approval";
-  reason = "Run the real GTK/libadwaita binary as Alice on headless X11; show a real registration dialog and verify Escape denies it. This is not a manual Firefox/Wayland UX test.";
-  extraMachineConfig = {
+pkgs.testers.runNixOSTest {
+  extraPythonPackages = ps: [ (ps.callPackage ../python-package.nix { }) ];
+  name = "tpm-passkey-gtk-approval";
+  nodes.machine = {
+    imports = [ (import ../machine.nix { inherit pkgs package; }) ];
     environment.systemPackages = [
       package.gtk
       pkgs.xdotool
@@ -34,7 +35,11 @@
     };
   };
   testScript = ''
-    setup_migration()
+    from tpm_passkey_test import TestEnv
+    env = TestEnv(machine)
+    env.start()
+
+    env.setup_migration()
     machine.succeed("systemctl stop tpm-passkey-test-agent")
     machine.succeed("systemctl start tpm-passkey-test-session tpm-passkey-test-xvfb")
     machine.wait_until_succeeds("test -S /tmp/.X11-unix/X99", timeout=15)
@@ -49,7 +54,7 @@
     machine.succeed(f"DISPLAY=:99 xdotool windowfocus {window} key Escape")
     machine.wait_until_succeeds("! kill -0 $(cat /tmp/gtk-client-pid)", timeout=10)
     assert "OPERATION_DENIED" in machine.succeed("cat /tmp/gtk-result")
-    assert mgmt("list --json").strip() == "[]"
+    assert env.mgmt("list --json").strip() == "[]"
     machine.succeed("test $(systemctl show tpm-passkey-test-gtk -p User --value) = alice")
   '';
 }
