@@ -99,6 +99,11 @@ Flake packages are `daemon`, `cli` (also `default`), `approval-gtk`, and an opti
 runtime closure. `cargo run -p tpm-passkey-daemon -- --dry-run` checks daemon
 configuration without opening devices.
 
+The root `Cargo.toml` defines the workspace and shared dependency versions. Crates
+live in `daemon/`, `approval/`, `cli/`, and `protocol/`; database migrations belong
+to `daemon/migrations/`. Plain `cargo check` and `cargo test` default to the daemon;
+use `--workspace` to include all crates.
+
 Existing state directories are **not moved automatically**. Stop the previously
 installed daemon before moving its complete state directory (database and
 supporting key files) to the new service path, preserving restrictive permissions.

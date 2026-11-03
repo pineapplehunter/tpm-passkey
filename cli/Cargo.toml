@@ -1,0 +1,19 @@
+[package]
+name = "tpm-passkey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+ciborium.workspace = true
+clap.workspace = true
+color-eyre.workspace = true
+env_logger.workspace = true
+hex.workspace = true
+rpassword.workspace = true
+serde_json.workspace = true
+unicode-general-category.workspace = true
+tpm-passkey-protocol.workspace = true
+zeroize.workspace = true
+tabled.workspace = true

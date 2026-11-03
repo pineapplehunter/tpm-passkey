@@ -72,13 +72,13 @@ clears credentials and PIN state, but is separate from schema-upgrade behavior.
 
 ## Source map
 
-- `src/ctap2.rs`, `src/ctaphid.rs`, `src/hid.rs`: CTAP and virtual HID.
-- `src/tpm.rs`: TPM policy/key commands and sole TPM implementation.
-- `src/migration_crypto.rs`: migration key encryption and per-credential envelopes.
-- `src/store.rs`, `migrations/`: database schema, persistence, MACs, and PIN state.
-- `src/management/`: serialized management dispatch and bulk results.
-- `src/bus.rs`, `src/polkit.rs`: system-bus authorization and approval-agent lifecycle.
-- `crates/protocol/`: shared bus protocol and sealed-FD transport.
-- `crates/cli/`: unprivileged table/JSON management interface.
-- `crates/approval-gtk/`: separate user-presence frontend.
+- `daemon/src/ctap2.rs`, `daemon/src/ctaphid.rs`, `daemon/src/hid.rs`: CTAP and virtual HID.
+- `daemon/src/tpm.rs`: TPM policy/key commands and sole TPM implementation.
+- `daemon/src/migration_crypto.rs`: migration key encryption and per-credential envelopes.
+- `daemon/src/store.rs`, `daemon/migrations/`: database schema, persistence, MACs, and PIN state.
+- `daemon/src/management/`: serialized management dispatch and bulk results.
+- `daemon/src/bus.rs`, `daemon/src/polkit.rs`: system-bus authorization and approval-agent lifecycle.
+- `protocol/`: shared bus protocol and sealed-FD transport.
+- `cli/`: unprivileged table/JSON management interface.
+- `approval/`: separate GTK user-presence frontend.
 - `nix/`, `nix/tests/`: NixOS packaging and software-TPM integration tests.

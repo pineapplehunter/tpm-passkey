@@ -12,7 +12,7 @@ pkgs.testers.runNixOSTest {
         'expect "Enter new PIN"; send "1234\\r"; '
         'expect "Enter the same PIN again"; send "1234\\r"; expect eof')
     machine.succeed("systemctl stop tpm-passkey")
-    machine.succeed("python3 ${./legacy.py} prepare ${../../../migrations}")
+    machine.succeed("python3 ${./legacy.py} prepare ${../../../daemon/migrations}")
     env.start_daemon()
     machine.succeed("python3 ${./legacy.py} check")
     assert env.mgmt("list --json").strip() == "[]"

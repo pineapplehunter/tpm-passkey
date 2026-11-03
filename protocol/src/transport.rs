@@ -13,7 +13,7 @@ use std::{
     },
     time::Duration,
 };
-use zbus::{Connection, zvariant::OwnedFd};
+use zbus::{Connection, OwnedFd};
 use zeroize::Zeroizing;
 
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -84,7 +84,7 @@ pub async fn connect_system_bus() -> zbus::Result<Connection> {
         _ => return Err(zbus::Error::Unsupported),
     };
     let stream = tokio::net::UnixStream::connect_addr(&socket_address.into()).await?;
-    let connection = zbus::connection::Builder::unix_stream(stream)
+    let connection = zbus::connection::Builder::unix_stream(stream.into_std()?)
         .build()
         .await?;
     if let Some(guid) = address.guid()

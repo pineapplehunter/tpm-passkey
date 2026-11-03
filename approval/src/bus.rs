@@ -137,7 +137,7 @@ async fn register(connection: &Connection, shared: &Shared) {
             continue;
         }
         let result = tokio::time::timeout(Duration::from_secs(3), async {
-            let path = zbus::zvariant::ObjectPath::try_from(AGENT_PATH)?;
+            let path = zbus::ObjectPath::try_from(AGENT_PATH)?;
             let reply = connection
                 .call_method(
                     Some(owner.as_str()),

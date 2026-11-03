@@ -19,7 +19,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = name;
-  version = (lib.fromTOML (lib.readFile ../Cargo.toml)).package.version;
+  version = (lib.fromTOML (lib.readFile ../Cargo.toml)).workspace.package.version;
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -27,9 +27,10 @@ rustPlatform.buildRustPackage {
       ../Cargo.lock
       ../Cargo.toml
       ../assets
-      ../crates
-      ../migrations
-      ../src
+      ../approval
+      ../cli
+      ../daemon
+      ../protocol
     ];
   };
   _structuredAttrs = true;

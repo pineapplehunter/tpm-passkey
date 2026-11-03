@@ -13,11 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tpm_passkey_protocol::{self as wire, ApprovalContext};
-use zbus::{
-    Connection, MessageStream,
-    export::futures_core::Stream,
-    zvariant::{OwnedFd, OwnedObjectPath},
-};
+use zbus::{Connection, MessageStream, OwnedFd, OwnedObjectPath, export::futures_core::Stream};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Agent {
@@ -432,9 +428,13 @@ pub fn start(store_dir: std::path::PathBuf, tpm: ctap2::TpmCmdSender) -> Result<
                         // Subscribe before any registration, including startup races.
                         let rule = zbus::MatchRule::builder()
                             .msg_type(zbus::message::Type::Signal)
-                            .build();
-                        let signals =
-                            MessageStream::for_match_rule(rule, &connection, Some(1024)).await?;
+                            .build()?;
+                        let signals = MessageStream::for_match_rule(
+                            rule,
+                            &connection,
+                            std::num::NonZeroUsize::new(1024),
+                        )
+                        .await?;
                         let (barrier, barriers) = tokio::sync::mpsc::channel(16);
                         let approval = BusApproval {
                             connection: connection.clone(),

@@ -1,20 +1,19 @@
-[package]
-name = "tpm-passkey-daemon"
-version = "0.1.0"
-edition = "2024"
-license = "GPL3"
-
 [workspace]
-members = ["crates/protocol", "crates/cli", "crates/approval-gtk"]
+members = ["daemon", "protocol", "cli", "approval"]
+default-members = ["daemon"]
 resolver = "2"
 
-[lib]
-name = "tpm_passkey"
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
 
-[dependencies]
+[workspace.dependencies]
+adw = { version = "0.9", package = "libadwaita", features = ["v1_5"] }
 aes = "0.9"
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
-argon2 = "0.5"
+argon2 = "0.6"
+async-channel = "2.5"
 base64 = "0.23"
 bitflags = { version = "2.13.1", features = ["std"] }
 cbc = "0.2"
@@ -23,7 +22,9 @@ ciborium-ll = "0.2.2"
 clap = { version = "4.5.53", features = ["derive"] }
 color-eyre = "0.6.5"
 env_logger = "0.11.8"
+futures-util = "0.3"
 getrandom = "0.4.3"
+gtk = { package = "gtk4", version = "0.11", default-features = false }
 hex = "0.4"
 hkdf = "0.13"
 hmac = "0.13"
@@ -32,7 +33,9 @@ log = "0.4.27"
 p256 = { version = "0.14", features = ["ecdh", "ecdsa", "getrandom", "pem"] }
 pbkdf2 = "0.13"
 rcgen = { version = "0.14.8", features = ["ring"] }
+rpassword = "7.4"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.11"
 sqlx = { version = "0.9.0", features = [
   "runtime-tokio",
@@ -40,15 +43,16 @@ sqlx = { version = "0.9.0", features = [
   "macros",
   "migrate",
 ] }
-tokio = { version = "1.52.3", features = [
-  "macros",
-  "net",
-  "rt",
-  "sync",
-  "time",
-] }
-tpm-passkey-protocol = { version = "0.1.0", path = "crates/protocol" }
+tabled = "0.22"
+tokio = { version = "1.52.3", features = ["macros", "rt", "time"] }
+tpm-passkey-protocol = { version = "0.1.0", path = "protocol" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tss-esapi = "7.7.0"
 uhid-virt = "0.0.8"
-zbus = { version = "5", features = ["tokio"], default-features = false }
+unicode-general-category = "1.1.0"
+zbus = { version = "6", features = [
+  "tokio",
+  "proxy",
+], default-features = false }
 zeroize = "1.8"

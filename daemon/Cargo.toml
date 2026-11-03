@@ -1,0 +1,39 @@
+[package]
+name = "tpm-passkey-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tpm_passkey"
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
+base64.workspace = true
+bitflags.workspace = true
+cbc.workspace = true
+ciborium.workspace = true
+ciborium-ll.workspace = true
+clap.workspace = true
+color-eyre.workspace = true
+env_logger.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+libc.workspace = true
+log.workspace = true
+p256.workspace = true
+pbkdf2.workspace = true
+rcgen.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["net", "sync"] }
+tpm-passkey-protocol.workspace = true
+tss-esapi.workspace = true
+uhid-virt.workspace = true
+zbus = { workspace = true, features = ["service"] }
+zeroize.workspace = true

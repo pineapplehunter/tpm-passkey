@@ -104,8 +104,8 @@
                 trap "rm -rf $TMP" EXIT
                 export SQLX_OFFLINE=false
                 export DATABASE_URL=sqlite://$TMP
-                cargo sqlx migrate run
-                cargo sqlx prepare
+                cargo sqlx migrate run --source daemon/migrations
+                cargo sqlx prepare --workspace
               '';
             in
             pkgs.mkShell {

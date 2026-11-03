@@ -80,7 +80,7 @@ asynchronously preempted.
 
 The FD contains a CBOR externally tagged `ManagementRequest`: a string for unit
 operations (for example `"show-config"`), or a one-entry map from operation name
-to its parameter map. See `crates/protocol/src/management.rs` for exact variants.
+to its parameter map. See `protocol/src/management.rs` for exact variants.
 The reply is CBOR `ManagementResponse` (`ok`, optional `error`, optional `result`),
 at most 1 MiB. There is no legacy Unix-socket bypass.
 

@@ -183,7 +183,9 @@ async fn terminal_approval_on(terminal: std::fs::File, prompt: &str) -> Approval
 async fn terminal_answer(terminal: std::fs::File, prompt: &str) -> io::Result<bool> {
     use tokio::io::{Interest, unix::AsyncFd};
 
-    let terminal = AsyncFd::new(terminal)?;
+    // SAFETY: AsyncFd owns the File; its descriptor stays open and unchanged
+    // until AsyncFd is dropped. The I/O closures only borrow it for reads/writes.
+    let terminal = unsafe { AsyncFd::register(terminal) }?;
     let prompt = format!("{prompt}? [y/N] ");
     let mut remaining = prompt.as_bytes();
     while !remaining.is_empty() {

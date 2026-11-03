@@ -5,7 +5,7 @@ use std::{
     io::Write,
     os::fd::{AsRawFd, FromRawFd},
 };
-use zbus::zvariant::OwnedFd;
+use zbus::OwnedFd;
 
 fn descriptor(bytes: &[u8], seal: bool) -> OwnedFd {
     let raw = unsafe {

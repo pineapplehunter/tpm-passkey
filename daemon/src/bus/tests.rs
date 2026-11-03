@@ -5,7 +5,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::atomic::AtomicUsize,
 };
-use zbus::zvariant::OwnedValue;
+use zbus::OwnedVariant;
 
 struct PrivateBus {
     child: Child,
@@ -37,7 +37,6 @@ impl PrivateBus {
     }
     async fn connect(&self) -> Connection {
         zbus::connection::Builder::address(self.address.as_str())
-            .unwrap()
             .build()
             .await
             .unwrap()
@@ -74,7 +73,7 @@ impl Default for Authority {
 impl Authority {
     async fn check_authorization(
         &self,
-        subject: (String, HashMap<String, OwnedValue>),
+        subject: (String, HashMap<String, OwnedVariant>),
         _action: String,
         _details: HashMap<String, String>,
         _flags: u32,
@@ -239,10 +238,12 @@ async fn install(bus: &PrivateBus) -> (BusApproval, tokio::task::JoinHandle<()>)
     let connection = bus.connect().await;
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .build();
-    let signals = MessageStream::for_match_rule(rule, &connection, Some(1024))
-        .await
+        .build()
         .unwrap();
+    let signals =
+        MessageStream::for_match_rule(rule, &connection, std::num::NonZeroUsize::new(1024))
+            .await
+            .unwrap();
     let (barrier, barriers) = tokio::sync::mpsc::channel(16);
     let approval = BusApproval {
         connection: connection.clone(),
@@ -492,7 +493,7 @@ fn unrelated_lock_signals_do_not_cancel_pending_consent() {
         assert!(register(&caller).await.is_err());
         for locked in [true, false] {
             let mut changed = HashMap::new();
-            changed.insert("LockedHint", zbus::zvariant::Value::from(locked));
+            changed.insert("LockedHint", zbus::Variant::from(locked));
             logind
                 .emit_signal(
                     None::<&str>,

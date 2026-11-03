@@ -1,0 +1,18 @@
+[package]
+name = "tpm-passkey-approval-gtk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw.workspace = true
+async-channel.workspace = true
+color-eyre.workspace = true
+futures-util.workspace = true
+gtk.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tpm-passkey-protocol.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-general-category.workspace = true
+zbus = { workspace = true, features = ["service"] }

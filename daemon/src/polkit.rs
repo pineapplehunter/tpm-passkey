@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
-use zbus::{Connection, zvariant::Value};
+use zbus::{Connection, Variant};
 
 const AUTHORITY: &str = "org.freedesktop.PolicyKit1";
 const PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
@@ -31,7 +31,7 @@ pub(crate) async fn authorize(
     let result = control.run(async {
         if !caller_alive(connection, sender).await { return false; }
         let mut subject = HashMap::new();
-        subject.insert("name", Value::from(sender));
+        subject.insert("name", Variant::from(sender));
         let details: HashMap<&str, &str> = HashMap::new();
         let body = (("system-bus-name", subject), action, details, u32::from(interaction), &id);
         let call = connection.call_method(Some(AUTHORITY), PATH, Some(IFACE), "CheckAuthorization", &body);

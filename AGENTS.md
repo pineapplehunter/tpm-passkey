@@ -5,7 +5,7 @@
 - Product/status: `README.md`
 - Architecture and TPM command-channel constraint: `docs/architecture.md`
 - Threat model: `docs/security.md`
-- Storage model: `docs/credentials.md`, `migrations/`
+- Storage model: `docs/credentials.md`, `daemon/migrations/`
 - CTAP 2.2: https://fidoalliance.org/specs/fido-v2.2-ps-20250714/fido-client-to-authenticator-protocol-v2.2-ps-20250714.html
 - Build/dev environment: `flake.nix`; CI: `.github/workflows/ci.yml`
 - Current behavior and support: source and tests
